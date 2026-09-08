@@ -6,6 +6,7 @@
  */
 
 export const PROTOCOL_V = 1;
+import { containsLoneSurrogateDeep } from "./normalize.js";
 /** Max raw stdin request size in UTF-8 bytes (fixed by spec, not config). */
 export const RAW_MAX_BYTES = 32768;
 /** Allowed idempotencyKey characters: ASCII A-Za-z0-9_- , length 1..128. */
@@ -124,6 +125,10 @@ export function validateRequest(
   }
   const params = parsed["params"];
   if (!isPlainObject(params)) return { ok: false, res: fail("BAD_REQUEST") };
+  // Strict well-formedness: any unpaired surrogate (including an escaped
+  // "\ud800" that JSON.parse turns into a lone half) is BAD_REQUEST.
+  // Valid astral pairs pass. No mutation happens on this path.
+  if (containsLoneSurrogateDeep(parsed)) return { ok: false, res: fail("BAD_REQUEST") };
 
   const req: ValidRequest = { v: 1, op, params };
   if (hasKey) req.idempotencyKey = key as string;

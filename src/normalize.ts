@@ -164,3 +164,41 @@ export function hasControl(s: string): boolean {
   // eslint-disable-next-line no-control-regex
   return /[\u0000-\u001F\u007F-\u009F]/.test(s);
 }
+
+/**
+ * Strict well-formedness: reject unpaired surrogates (lone lead/trail).
+ * Valid astral pairs (e.g. emoji) pass; only unpaired halves fail.
+ * Used at the protocol envelope AND at direct create/recall domain
+ * validation so an escaped "\ud800" can never mutate state (BAD_REQUEST).
+ */
+export function hasLoneSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const n = i + 1 < s.length ? s.charCodeAt(i + 1) : -1;
+      if (n < 0xdc00 || n > 0xdfff) return true;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Recursively reject any string with an unpaired surrogate. */
+export function containsLoneSurrogateDeep(v: unknown): boolean {
+  if (typeof v === "string") return hasLoneSurrogate(v);
+  if (Array.isArray(v)) {
+    for (const e of v) {
+      if (containsLoneSurrogateDeep(e)) return true;
+    }
+    return false;
+  }
+  if (v !== null && typeof v === "object") {
+    for (const k of Object.keys(v as Record<string, unknown>)) {
+      if (containsLoneSurrogateDeep((v as Record<string, unknown>)[k])) return true;
+      if (hasLoneSurrogate(k)) return true;
+    }
+  }
+  return false;
+}

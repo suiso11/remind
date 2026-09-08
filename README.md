@@ -39,7 +39,7 @@ cp memory.config.example.json memory.config.json  # local only, git-ignored
 echo '{"v":1,"op":"record.recall","params":{"query":"booking","scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 Status (honest, verified): `npm test` builds with `tsc` and runs
-`node:test` over `dist/tests/` — **46 tests pass, 1 skipped** (config
+`node:test` over `dist/tests/` — **49 tests pass, 1 skipped** (config
 strictness, envelopes/bounds, CLI smoke, hardened stdin subprocess suite,
 T2 candidates/approval/idempotency/scope/TTY-guard suite, 4 T2 review
 regressions, plus 10 T3 recall regressions: approval-only/active-scope
@@ -48,12 +48,29 @@ wildcards), tag-ALL/link/time/order/ties/limits, Unicode codepoint
 truncation with exact byte accounting, empty-recall audit, query absence in
 audit/errors, recall-ID uniqueness with per-item exposures, forced audit
 failure rollback, budget-overflow with no exposures, CLI end-to-end over
-persistent seeded SQLite; the single skip is the manual real-TTY
+persistent seeded SQLite; plus 3 T3 fix regressions: 33000-row bounded-SQL
+scale recall with tag/link filter and exact order, unpaired-surrogate
+envelope/direct validation with astral preservation, CLI escaped-surrogate
+denial with no audit; the single skip is the manual real-TTY
 interactive confirmation, exercised by hand only).
 `npm run smoke` walks a strict valid recall / unknown / human-op envelopes
 in a temp dir (recall returns `ok:true` with empty items on the fresh DB).
 T4-T6 domain work (corrections/archive, retention docs,
 fake adapter, A1-A13) is explicitly out of scope for T3.
+T3 fix notes (honest): `record.recall` uses parameterized SQL
+`WHERE scope/status/time AND instr(body, ?)>0 AND EXISTS(tag)… AND
+EXISTS(link)… ORDER BY createdAt DESC, id ASC LIMIT ?` (no `LIKE`, no
+wildcard, no unbounded `IN`; tag fetch only for the `<=limit` selected
+ids), with additive indexes `idx_records_scope_status_created_id`,
+`idx_record_tags_tag_record`, `idx_record_links_toname_from`. This bounds
+host variables and materialization, but the `instr` scan may still examine
+every row in the scope window — not hard constant latency. Denials
+(`BAD_REQUEST`/`FORBIDDEN_SCOPE`/`LIMIT_EXCEEDED`/`STORE_UNAVAILABLE`)
+write no `audit`/`exposures` rows; the exposure ledger is success-only
+(this clarification is not a new feature). Unpaired surrogates (including
+escaped `"\ud800"` halves) are `BAD_REQUEST` with no mutation at the
+protocol envelope and at direct create/recall validation; valid astral
+pairs still pass.
 
 ## Interface
 
@@ -98,16 +115,19 @@ fake adapter, A1-A13) is explicitly out of scope for T3.
 - `src/protocol.ts` — envelopes, fixed codes/messages, bounds
 - `src/db.ts` — SQLite open + `scopes` seed + T2 domain tables
 - `src/normalize.ts` — T2 exact normalization (NFKC/trim/collapse/ASCII
-  fold), canonical times/hashes, approval-token binding, TTY escaping
+  fold), canonical times/hashes, approval-token binding, TTY escaping,
+  plus shared strict lone-surrogate well-formedness (`hasLoneSurrogate` /
+  `containsLoneSurrogateDeep`)
 - `src/store.ts` — T2 candidates + review/approve/reject + idempotency +
-  metadata-only audit, plus T3 `record.recall` (strict params, literal
-  normalized match, tag-ALL/link/time filters, fixed order, bounded
+  metadata-only audit, plus T3 `record.recall` (strict params incl.
+  lone-surrogate rejection, bounded parameterized SQL with `instr` literal
+  plus per-tag/link `EXISTS` plus SQL `LIMIT`, fixed order, bounded
   snippets, full-budget gate, single-transaction audit/exposures;
   correct/archive honestly deferred to T4)
 - `src/cli.ts` — CLI entry (`--config`, bounded LF-framed stdin, stdout line;
   `candidate.create/get` routed to the store, human `review/approve/reject`
   subcommands with TTY + `yes` confirmation)
-- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess/T2/T3)
+- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess/T2/T3/T3-fix scale+surrogate)
 - `memory.config.example.json` — fake scope (`personal/default`) only
 
 ## Roadmap (plan.md 14.12)
