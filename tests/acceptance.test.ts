@@ -482,6 +482,32 @@ describe("T6 acceptance A1-A13 (plan 14.11)", () => {
     const tNaN = queryMemory({ cliPath: cli, configPath: cfg, scope: "personal/default", query: "hello", timeoutMs: Number.NaN });
     assert.equal(tNaN.degraded, true);
     assert.equal(tNaN.code, "BAD_REQUEST");
+    // Fractional timeoutMs is BAD_REQUEST (no silent floor to integer).
+    for (const badT of [5000.5, 100.1, 9999.9]) {
+      const r = queryMemory({ cliPath: cli, configPath: cfg, scope: "personal/default", query: "hello", timeoutMs: badT });
+      assert.equal(r.degraded, true, "timeout " + String(badT));
+      assert.equal(r.code, "BAD_REQUEST", "timeout " + String(badT));
+      if (r.degraded) assert.equal(r.text, FAKE_FALLBACK_TEXT);
+    }
+    // Output budget excludes exactly one required trailing LF (protocol
+    // responseMaxBytes): exact-budget JSON + LF fits, one more JSON byte
+    // overflows; missing/extra LF is malformed framing.
+    {
+      const wide = { ...goodItem, snippet: "x".repeat(200), tags: ["t".repeat(200), "u".repeat(200), "v".repeat(200), "w".repeat(200), "z".repeat(200)] };
+      const probe = { ...good, data: { recallId: "recall_01", items: [wide] } };
+      const jsonLen = Buffer.byteLength(JSON.stringify(probe), "utf8");
+      assert.ok(jsonLen >= 1025, "probe must clear the 1024 budget floor");
+      const fit = queryMemory({ cliPath: emit(probe), configPath: cfg, scope: "personal/default", query: "hello", maxOutputBytes: jsonLen });
+      assert.equal(fit.degraded, false, "exact-budget JSON + one LF must fit");
+      const over = queryMemory({ cliPath: emit(probe), configPath: cfg, scope: "personal/default", query: "hello", maxOutputBytes: jsonLen - 1 });
+      assert.equal(over.degraded, true, "one JSON byte over budget must overflow");
+      assert.equal(over.code, "LIMIT_EXCEEDED");
+      if (over.degraded) assert.equal(over.text, FAKE_FALLBACK_TEXT);
+      const noLf = fx("nolf.js", `process.stdout.write(${JSON.stringify(JSON.stringify(probe))});\n`);
+      assert.equal(queryMemory({ cliPath: noLf, configPath: cfg, scope: "personal/default", query: "hello", maxOutputBytes: jsonLen }).degraded, true, "missing LF must degrade");
+      const twoLf = fx("twolf.js", `process.stdout.write(${JSON.stringify(JSON.stringify(probe))} + "\\n\\n");\n`);
+      assert.equal(queryMemory({ cliPath: twoLf, configPath: cfg, scope: "personal/default", query: "hello", maxOutputBytes: jsonLen }).degraded, true, "extra LF must degrade");
+    }
     // A child ignoring SIGTERM still degrades via SIGKILL within the timeout
     // (local fixture only; guarded by the adapter timeout itself).
     const ignoreTerm = fx("ignoreterm.js", `process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1000);\n`);

@@ -191,8 +191,8 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
   if (limit < 1) return degraded("BAD_REQUEST");
   if (limit > 25) return degraded("LIMIT_EXCEEDED");
   const timeoutRaw = opts.timeoutMs ?? 5000;
-  if (!Number.isFinite(timeoutRaw) || !Number.isInteger(Math.floor(timeoutRaw as number))) return degraded("BAD_REQUEST");
-  const timeoutMs = Math.floor(timeoutRaw as number);
+  if (typeof timeoutRaw !== "number" || !Number.isFinite(timeoutRaw) || !Number.isInteger(timeoutRaw)) return degraded("BAD_REQUEST");
+  const timeoutMs = timeoutRaw as number;
   if (timeoutMs < 100 || timeoutMs > 10000) return degraded("BAD_REQUEST");
   const maxInputRaw = opts.maxInputBytes ?? 32768;
   const maxOutputRaw = opts.maxOutputBytes ?? 8192;
@@ -238,9 +238,16 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
     const raw = (r.stdout ?? Buffer.alloc(0)) as unknown;
     const buf: Buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw ?? ""), "utf8");
     if (buf.length === 0) return degraded("STORE_UNAVAILABLE");
-    if (buf.length > maxOutput) return degraded("LIMIT_EXCEEDED");
+    // Exactly-one-LF framing on raw bytes before decoding: the CLI emits
+    // JSON.stringify(res) + "\n" and responseMaxBytes budgets the JSON bytes
+    // only, so require exactly one trailing 0x0A and no other 0x0A byte.
+    if (buf[buf.length - 1] !== 0x0a || buf.indexOf(0x0a) !== buf.length - 1) {
+      return degraded("STORE_UNAVAILABLE");
+    }
+    const jsonBytes = buf.subarray(0, buf.length - 1);
+    if (jsonBytes.length > maxOutput) return degraded("LIMIT_EXCEEDED");
     try {
-      out = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+      out = new TextDecoder("utf-8", { fatal: true }).decode(jsonBytes);
     } catch {
       return degraded("STORE_UNAVAILABLE");
     }
@@ -249,12 +256,10 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
     return degraded("STORE_UNAVAILABLE");
   }
 
-  // Exactly one LF-framed JSON line (optional single trailing LF): extra
-  // non-whitespace lines are malformed. Consistent with the CLI contract.
-  const lines = out.split("\n");
-  const first = lines[0];
-  const rest = lines.slice(1).join("\n");
-  if (rest.trim().length !== 0) return degraded("STORE_UNAVAILABLE");
+  // Exactly one LF-framed JSON line (exactly one trailing LF required):
+  // missing LF or any extra LF line is malformed. Consistent with the CLI
+  // contract.
+  const first = out;
   let parsed: unknown;
   try {
     parsed = JSON.parse(first.trim());
