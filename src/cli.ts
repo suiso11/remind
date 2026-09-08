@@ -23,10 +23,9 @@
  * JSON envelopes pass the responseMaxBytes budget (fail-closed
  * LIMIT_EXCEEDED, never truncated).
  *
- * T1 honesty: valid automated envelopes (candidate.create/get,
- * record.recall/correct-request) return ok:false NOT_IMPLEMENTED, a
- * temporary T1-only status documented in README. T2-T4 implement the
- * domain; this file never returns ok:true for unimplemented domain ops.
+ * Honesty: T3-T4 domain ops (record.recall/correct-request, archive)
+  * return ok:false NOT_IMPLEMENTED until their tasks land; this file never
+  * returns ok:true for unimplemented domain ops.
  */
 import { loadConfig } from "./config.js";
 import {
@@ -38,6 +37,16 @@ import {
   type ResponseEnvelope,
 } from "./protocol.js";
 import { initDb } from "./db.js";
+import { escapeForTerminal } from "./normalize.js";
+import {
+  approveCandidate,
+  createCandidate,
+  getCandidateForReview,
+  getCandidateMeta,
+  rejectCandidate,
+} from "./store.js";
+import type { DatabaseSync } from "node:sqlite";
+import type { AppConfig } from "./config.js";
 
 /** Fixed stderr lines: no echo of args, config, or exception text. */
 const STDERR_ARGS = "error: bad arguments\n";
@@ -261,15 +270,268 @@ export function handleRawInput(
   }
   const v = validateRequest(parsed);
   if (!v.ok) return applyResponseBudget(v.res, responseMaxBytes);
-  // T1 has no domain tables yet (T2-T4 own them): honest temporary failure.
+  // T2 routes candidate.create/get to the store; T3-T4 ops stay honest.
   return applyResponseBudget(fail("NOT_IMPLEMENTED"), responseMaxBytes);
+}
+
+/** Route a validated JSON request against an open DB (T2: candidates). */
+export function handleValidatedRequest(
+  db: DatabaseSync,
+  config: AppConfig,
+  op: string,
+  params: Record<string, unknown>,
+  idempotencyKey?: string,
+): ResponseEnvelope {
+  if (op === "candidate.create") {
+    // Envelope guarantees the key; double-check fail-closed.
+    if (typeof idempotencyKey !== "string") return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+    return createCandidate(db, config, params, idempotencyKey);
+  }
+  if (op === "candidate.get") {
+    return getCandidateMeta(db, config, params);
+  }
+  // T3 (record.recall) / T4 (record.correct-request, archive): honest deferral.
+  return applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
+}
+
+const HUMAN_SUBCOMMANDS = new Set(["review", "approve", "reject", "archive"]);
+
+function parseHumanArgs(argv: string[]): { sub: string; opts: Record<string, string> } | null {
+  if (argv.length === 0 || !HUMAN_SUBCOMMANDS.has(argv[0] as string)) return null;
+  const sub = argv[0] as string;
+  const opts: Record<string, string> = {};
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if ((a === "--config" || a === "--id" || a === "--scope" || a === "--token" || a === "--idempotency-key" || a === "--reason-code") && i + 1 < argv.length) {
+      opts[a] = argv[++i] as string;
+    } else {
+      // Unknown flags (including --confirm / --yes) are rejected as
+      // BAD_REQUEST JSON by the caller; never silently accepted.
+      return { sub, opts: { ...opts, __bad: a } };
+    }
+  }
+  return { sub, opts };
+}
+
+function readConfirmLine(timeoutMs: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let buf = "";
+    const stdin = process.stdin;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(null);
+    }, Math.max(0, timeoutMs));
+    try {
+      (timer as unknown as { unref?: () => void }).unref?.();
+    } catch {
+      /* ignore */
+    }
+    function cleanup(): void {
+      clearTimeout(timer);
+      try {
+        stdin.removeAllListeners("data");
+        stdin.removeAllListeners("end");
+        stdin.removeAllListeners("error");
+      } catch {
+        /* ignore */
+      }
+      try {
+        stdin.pause();
+      } catch {
+        /* ignore */
+      }
+    }
+    function done(v: string | null): void {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(v);
+    }
+    stdin.setEncoding("utf8");
+    stdin.on("data", (d: string) => {
+      buf += d;
+      const lf = buf.indexOf("\n");
+      if (lf >= 0) done(buf.slice(0, lf));
+    });
+    stdin.on("end", () => done(buf));
+    stdin.on("error", () => done(null));
+    try {
+      stdin.resume();
+    } catch {
+      done(null);
+    }
+  });
+}
+
+async function runHuman(
+  sub: string,
+  opts: Record<string, string>,
+  config: AppConfig,
+  db: DatabaseSync,
+  started: number,
+): Promise<void> {
+  const remaining = (): number => config.timeouts.cliMs - (Date.now() - started);
+  const outJson = (res: ResponseEnvelope): void => {
+    const capped = applyResponseBudget(res, config.limits.responseMaxBytes);
+    process.stdout.write(JSON.stringify(capped) + "\n");
+  };
+  if (opts["__bad"]) {
+    outJson(fail("BAD_REQUEST"));
+    process.exit(0);
+    return;
+  }
+  // Archive is a T4 operation: honest deferral on the human path too.
+  if (sub === "archive") {
+    outJson(fail("NOT_IMPLEMENTED"));
+    process.exit(0);
+    return;
+  }
+  const id = opts["--id"];
+  const scope = opts["--scope"];
+  if (!id || !scope) {
+    outJson(fail("BAD_REQUEST"));
+    process.exit(0);
+    return;
+  }
+  // TTY is mandatory for every human op: no piped approval, no file capture
+  // of the review body via this path's assumptions. Non-TTY approve/reject
+  // get a machine-readable FORBIDDEN; review gets a fixed stderr + non-zero.
+  const stdinTty = !!process.stdin.isTTY;
+  if (!stdinTty) {
+    if (sub === "review") {
+      process.stderr.write("error: human operation requires tty\n");
+      process.exit(2);
+      return;
+    }
+    outJson(fail("FORBIDDEN"));
+    process.exit(0);
+    return;
+  }
+  if (sub === "review") {
+    const r = getCandidateForReview(db, id, scope);
+    if (!r.ok) {
+      // Metadata-only failure on stdout would risk confusion with the review
+      // text; use the fixed JSON envelope so callers can branch safely.
+      // (No body is emitted on failure paths.)
+      if (r.code === "FORBIDDEN_SCOPE") outJson(fail("FORBIDDEN_SCOPE"));
+      else if (r.code === "NOT_FOUND") outJson(fail("NOT_FOUND"));
+      else if (r.code === "STORE_UNAVAILABLE") outJson(fail("STORE_UNAVAILABLE"));
+      else outJson(fail("BAD_REQUEST"));
+      process.exit(0);
+      return;
+    }
+    // Explicit TTY review: complete immutable body (escaped) + metadata +
+    // canonical digest. Display only; approval happens via approve + yes.
+    const lines = [
+      `id: ${escapeForTerminal(r.row.id)}`,
+      `status: ${escapeForTerminal(r.row.status)}`,
+      `kind: ${escapeForTerminal(r.row.kind)}`,
+      `scope: ${escapeForTerminal(r.row.scope)}`,
+      `source: ${escapeForTerminal(r.row.source)}`,
+      `observedAt: ${escapeForTerminal(r.row.observedAt)}`,
+      `createdAt: ${escapeForTerminal(r.row.createdAt)}`,
+      `expiresAt: ${escapeForTerminal(r.row.expiresAt)}`,
+      `bodyHash: ${escapeForTerminal(r.row.bodyHash)}`,
+      `supersedes: ${escapeForTerminal(r.row.supersedes ?? "null")}`,
+      `tags: ${escapeForTerminal(JSON.stringify(r.tags))}`,
+      `link: ${escapeForTerminal(r.link ?? "null")}`,
+      `approvalToken: ${r.token}`,
+      `--- body ---`,
+      escapeForTerminal(r.row.body),
+      `--- end ---`,
+    ];
+    process.stdout.write(lines.join("\n") + "\n");
+    process.exit(0);
+    return;
+  }
+  const token = opts["--token"];
+  const key = opts["--idempotency-key"];
+  if (!token || !key) {
+    outJson(fail("BAD_REQUEST"));
+    process.exit(0);
+    return;
+  }
+  // Interactive confirmation from the real TTY; --confirm-style flags were
+  // already rejected above and natural-language text is never accepted.
+  try {
+    process.stderr.write("confirm: type yes to continue\n");
+  } catch {
+    /* ignore */
+  }
+  const answer = await readConfirmLine(remaining());
+  if (answer === null || answer.trim() !== "yes") {
+    outJson(fail("BAD_REQUEST"));
+    process.exit(0);
+    return;
+  }
+  if (Date.now() - started > config.timeouts.cliMs) {
+    outJson(fail("TIMEOUT"));
+    process.exit(0);
+    return;
+  }
+  if (sub === "approve") {
+    outJson(approveCandidate(db, config, { id, scope, token, idempotencyKey: key }));
+    process.exit(0);
+    return;
+  }
+  // reject
+  const reason = opts["--reason-code"];
+  if (!reason) {
+    outJson(fail("BAD_REQUEST"));
+    process.exit(0);
+    return;
+  }
+  outJson(rejectCandidate(db, config, { id, scope, token, idempotencyKey: key, reasonCode: reason }));
+  process.exit(0);
 }
 
 async function main(): Promise<void> {
   const started = Date.now();
+  const rawArgv = process.argv.slice(2);
+  // Human terminal path branches before any stdin read.
+  const human = parseHumanArgs(rawArgv);
   let configPath: string;
+  if (human) {
+    const cp = human.opts["--config"];
+    if (!cp) {
+      // Missing --config on the human path is a startup failure (no stdout).
+      process.stderr.write(STDERR_ARGS);
+      process.exit(2);
+      return;
+    }
+    configPath = cp;
+    let hConfig;
+    try {
+      hConfig = loadConfig(configPath);
+    } catch {
+      process.stderr.write(STDERR_CONFIG);
+      process.exit(2);
+      return;
+    }
+    let hDb: DatabaseSync | null = null;
+    try {
+      hDb = initDb(hConfig, configPath).db as unknown as DatabaseSync;
+    } catch {
+      process.stderr.write(STDERR_DB);
+      process.exit(3);
+      return;
+    }
+    try {
+      await runHuman(human.sub, human.opts, hConfig, hDb, started);
+    } finally {
+      try {
+        hDb.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    return;
+  }
   try {
-    configPath = parseArgs(process.argv.slice(2)).configPath;
+    configPath = parseArgs(rawArgv).configPath;
   } catch {
     process.stderr.write(STDERR_ARGS);
     process.exit(2);
@@ -284,9 +546,11 @@ async function main(): Promise<void> {
     return;
   }
   let db: { close(): void } | null = null;
+  let rawDb: DatabaseSync | null = null;
   try {
     const opened = initDb(config, configPath);
     db = opened.db;
+    rawDb = opened.db as unknown as DatabaseSync;
   } catch {
     process.stderr.write(STDERR_DB);
     process.exit(3);
@@ -333,7 +597,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  let res: ResponseEnvelope;
+  let res: ResponseEnvelope = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
   if (stdinRes.trailingNonEmpty) {
     // Sensible multiline handling: more than one non-empty LF-framed line
     // already buffered is a business error, without waiting for EOF.
@@ -354,7 +618,33 @@ async function main(): Promise<void> {
       process.exit(2);
       return;
     } else {
-      res = handleRawInput(line, config.limits.responseMaxBytes);
+      const over = checkRawSize(line);
+      if (over) {
+        res = applyResponseBudget(over, config.limits.responseMaxBytes);
+      } else {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          res = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+          parsed = undefined;
+        }
+        if (parsed !== undefined) {
+          const v = validateRequest(parsed);
+          if (!v.ok) {
+            res = applyResponseBudget(v.res, config.limits.responseMaxBytes);
+          } else if (rawDb && (v.req.op === "candidate.create" || v.req.op === "candidate.get")) {
+            try {
+              res = handleValidatedRequest(rawDb, config, v.req.op, v.req.params, v.req.idempotencyKey);
+            } catch {
+              res = applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
+            }
+          } else {
+            // T3-T4 remain honest: recall / correct-request are not implemented.
+            res = applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
+          }
+        }
+      }
     }
   }
 

@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import { resolveDbPath } from "./config.js";
+import { ensureT2Schema } from "./store.js";
 
 /**
  * T1 SQLite foundation: open/create the DB file, set busy_timeout from
@@ -54,6 +55,9 @@ export function initDb(
     for (const s of config.allowedScopes) {
       ins.run(s);
     }
+    // T2+ domain tables (candidates/records/operations/audit/exposures).
+    // Additive only; never drops existing rows.
+    ensureT2Schema(db);
   } catch (e) {
     try {
       db.close();
