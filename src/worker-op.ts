@@ -14,6 +14,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import {
   approveCandidate,
+  correctRequest,
   createCandidate,
   getCandidateMeta,
   recallRecords,
@@ -58,6 +59,16 @@ function main(): void {
       res = getCandidateMeta(db, cfg, req.params);
     } else if (req.op === "record.recall") {
       res = recallRecords(db, cfg, req.params);
+    } else if (req.op === "record.correct-request") {
+      // T4: deadline worker path stays wired for JSON correct requests with
+      // the same size/auth/response-budget/DB-failure semantics as the
+      // direct call (the store owns all gates; approve/archive/reject stay
+      // human-terminal-only and never route here).
+      if (typeof req.idempotencyKey !== "string") {
+        res = applyResponseBudget(fail("BAD_REQUEST"), cfg.limits.responseMaxBytes);
+      } else {
+        res = correctRequest(db, cfg, req.params, req.idempotencyKey);
+      }
     } else {
       res = applyResponseBudget(fail("NOT_IMPLEMENTED"), cfg.limits.responseMaxBytes);
     }

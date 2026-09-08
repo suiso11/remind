@@ -185,7 +185,7 @@ describe("hardened stdin bounds (T1)", () => {
     assert.equal(String(badCfgRun.stderr), "error: invalid config\n");
   });
 
-  it("unimplemented domain ops honestly fail with NOT_IMPLEMENTED, never ok:true", () => {
+  it("domain validation never returns ok:true on bad input (T4: no NOT_IMPLEMENTED)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-hard-"));
     const cfg = writeConfig(dir);
     // T3 implements record.recall: empty params are strict BAD_REQUEST.
@@ -198,8 +198,8 @@ describe("hardened stdin bounds (T1)", () => {
     assert.equal(rBody["ok"], false);
     assert.equal(rBody["code"], "BAD_REQUEST");
 
-    // T2 implements candidate.create/get: empty params are a validation
-    // failure (BAD_REQUEST), while the T4 correction path stays deferred.
+    // T2 implements candidate.create/get, T4 implements record.correct-request:
+    // empty params are validation failures (BAD_REQUEST) on every domain op.
     const create = spawnSync(process.execPath, [cli, "--config", cfg], {
       input:
         JSON.stringify({ v: 1, op: "candidate.create", idempotencyKey: "c-001", params: {} }) + "\n",
@@ -215,7 +215,7 @@ describe("hardened stdin bounds (T1)", () => {
         JSON.stringify({ v: 1, op: "record.correct-request", idempotencyKey: "c-002", params: {} }) + "\n",
       encoding: "utf8",
     });
-    assert.equal(JSON.parse(String(correct.stdout).trim()).code, "NOT_IMPLEMENTED");
+    assert.equal(JSON.parse(String(correct.stdout).trim()).code, "BAD_REQUEST");
   });
 
   it("multiline input already buffered is BAD_REQUEST", () => {

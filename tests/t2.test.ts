@@ -98,7 +98,7 @@ describe("T2 candidates + human approval", () => {
       assert.ok(audits.length >= 2);
       assert.ok(!JSON.stringify(audits).includes(marker));
       // Recall is implemented (T3): empty params fail strict validation,
-      // and correct-request stays an honest T4 deferral.
+      // and correct-request is implemented (T4): empty params are BAD_REQUEST.
       const rec = runJson(cfg, { v: 1, op: "record.recall", params: {} });
       assert.equal(rec.body["code"], "BAD_REQUEST");
     } finally {
@@ -302,7 +302,7 @@ describe("T2 candidates + human approval", () => {
     }
   });
 
-  it("correction creation honestly defers to T4 (schema exists, behavior NOT_IMPLEMENTED)", () => {
+  it("correction creation requires its target (T4: missing target is NOT_FOUND)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-t2-"));
     const cfg = writeConfig(dir);
     const { db, config } = openDb(cfg);
@@ -311,7 +311,7 @@ describe("T2 candidates + human approval", () => {
       assert.ok(cols.some((c) => c.name === "supersedes"));
       assert.equal(
         createCandidate(db, config, createParams("fix", { kind: "correction", supersedes: "rec_x" }), "k-cor-1").code,
-        "NOT_IMPLEMENTED",
+        "NOT_FOUND",
       );
       const viaJson = runJson(cfg, {
         v: 1,
@@ -319,7 +319,7 @@ describe("T2 candidates + human approval", () => {
         idempotencyKey: "k-cor-2",
         params: {},
       });
-      assert.equal(viaJson.body["code"], "NOT_IMPLEMENTED");
+      assert.equal(viaJson.body["code"], "BAD_REQUEST");
     } finally {
       db.close();
     }

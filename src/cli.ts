@@ -36,9 +36,9 @@
  * JSON envelopes pass the responseMaxBytes budget (fail-closed
  * LIMIT_EXCEEDED, never truncated).
  *
- * Honesty: T4 domain ops (record.correct-request, archive)
-  * return ok:false NOT_IMPLEMENTED until their tasks land; this file never
-  * returns ok:true for unimplemented domain ops.
+ * Human ops (review/approve/reject/archive) require BOTH stdin and stdout
+ * to be TTYs plus an interactive `yes` confirmation; JSON `archive` is
+ * FORBIDDEN (human path only) and JSON correct-request routes to the store.
  */
 import { loadConfig } from "./config.js";
 import {
@@ -55,6 +55,8 @@ import { escapeForTerminal } from "./normalize.js";
 import * as fs from "node:fs";
 import {
   approveCandidate,
+  archiveRecord,
+  correctRequest,
   createCandidate,
   getCandidateForReview,
   getCandidateMeta,
@@ -304,11 +306,13 @@ export function handleRawInput(
   }
   const v = validateRequest(parsed);
   if (!v.ok) return applyResponseBudget(v.res, responseMaxBytes);
-  // T2 routes candidate.create/get to the store; T3-T4 ops stay honest.
+  // Sync pre-check only; the DB-bound routing lives in main() (deadline
+  // worker) and handleValidatedRequest(). Unknown/human ops are refused
+  // here without touching the store.
   return applyResponseBudget(fail("NOT_IMPLEMENTED"), responseMaxBytes);
 }
 
-/** Route a validated JSON request against an open DB (T2: candidates). */
+/** Route a validated JSON request against an open DB (T2-T4 domain ops). */
 export function handleValidatedRequest(
   db: DatabaseSync,
   config: AppConfig,
@@ -327,8 +331,16 @@ export function handleValidatedRequest(
   if (op === "record.recall") {
     return recallRecords(db, config, params);
   }
-  // T4 (record.correct-request, archive): honest deferral.
-  return applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
+  if (op === "record.correct-request") {
+    // Envelope guarantees the key; double-check fail-closed. The deadline
+    // worker path (main below) routes here too; this direct call keeps the
+    // domain wired for tests and non-worker use.
+    if (typeof idempotencyKey !== "string") return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+    return correctRequest(db, config, params, idempotencyKey);
+  }
+  // Human-only archive over JSON stays FORBIDDEN (validateRequest already
+  // rejects it); unknown ops are BAD_REQUEST. Neither is reachable here.
+  return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
 }
 
 /** Post-commit policy: a known committed success (ok:true) is never replaced
@@ -345,6 +357,17 @@ export function preserveCommittedResult(
   if (timedOut) return applyResponseBudget(fail("TIMEOUT"), maxBytes);
   if (closeFailed) return applyResponseBudget(fail("STORE_UNAVAILABLE"), maxBytes);
   return res;
+}
+
+/**
+ * Terminal-disclosure gate for human ops. BOTH stdin and stdout must be
+ * TTYs: stdin alone is not enough, because `review ... > review.log` keeps
+ * stdin a TTY while the full candidate body + approval token land in a
+ * file/pipe. Explicit booleans keep this unit-testable (stdin true /
+ * stdout false must refuse); production passes the real isTTY flags.
+ */
+export function isHumanTty(stdinTty: boolean | undefined, stdoutTty: boolean | undefined): boolean {
+  return stdinTty === true && stdoutTty === true;
 }
 
 const HUMAN_SUBCOMMANDS = new Set(["review", "approve", "reject", "archive"]);
@@ -436,12 +459,6 @@ async function runHuman(
     process.exit(0);
     return;
   }
-  // Archive is a T4 operation: honest deferral on the human path too.
-  if (sub === "archive") {
-    outJson(fail("NOT_IMPLEMENTED"));
-    process.exit(0);
-    return;
-  }
   const id = opts["--id"];
   const scope = opts["--scope"];
   if (!id || !scope) {
@@ -449,11 +466,17 @@ async function runHuman(
     process.exit(0);
     return;
   }
-  // TTY is mandatory for every human op: no piped approval, no file capture
-  // of the review body via this path's assumptions. Non-TTY approve/reject
-  // get a machine-readable FORBIDDEN; review gets a fixed stderr + non-zero.
+  // TTY is mandatory on BOTH streams for every human op: no piped
+  // approval, and no file/pipe capture of the review body + approval token
+  // (a stdout redirect keeps stdin a TTY, so stdin alone cannot gate
+  // disclosure). Non-TTY approve/reject/archive get a machine-readable
+  // FORBIDDEN; review gets a fixed stderr + non-zero. No body/token on any
+  // refusal. Archive (T4) additionally requires an interactive `yes` below,
+  // exactly like approve/reject; `--confirm`-style flags were already
+  // rejected above.
   const stdinTty = !!process.stdin.isTTY;
-  if (!stdinTty) {
+  const stdoutTty = !!process.stdout.isTTY;
+  if (!isHumanTty(stdinTty, stdoutTty)) {
     if (sub === "review") {
       process.stderr.write("error: human operation requires tty\n");
       process.exit(2);
@@ -502,7 +525,17 @@ async function runHuman(
   }
   const token = opts["--token"];
   const key = opts["--idempotency-key"];
-  if (!token || !key) {
+  if (sub === "archive") {
+    // Archive binds no approval token (there is no candidate to display);
+    // it needs the record id + scope (checked above) + caller key +
+    // fixed reason code. JSON `archive` stays FORBIDDEN by the envelope.
+    const reason = opts["--reason-code"];
+    if (!key || !reason) {
+      outJson(fail("BAD_REQUEST"));
+      process.exit(0);
+      return;
+    }
+  } else if (!token || !key) {
     outJson(fail("BAD_REQUEST"));
     process.exit(0);
     return;
@@ -526,7 +559,12 @@ async function runHuman(
     return;
   }
   if (sub === "approve") {
-    outJson(approveCandidate(db, config, { id, scope, token, idempotencyKey: key }));
+    outJson(approveCandidate(db, config, { id, scope, token: token as string, idempotencyKey: key as string }));
+    process.exit(0);
+    return;
+  }
+  if (sub === "archive") {
+    outJson(archiveRecord(db, config, { id, scope, idempotencyKey: key as string, reasonCode: opts["--reason-code"] as string }));
     process.exit(0);
     return;
   }
@@ -537,7 +575,7 @@ async function runHuman(
     process.exit(0);
     return;
   }
-  outJson(rejectCandidate(db, config, { id, scope, token, idempotencyKey: key, reasonCode: reason }));
+  outJson(rejectCandidate(db, config, { id, scope, token: token as string, idempotencyKey: key as string, reasonCode: reason }));
   process.exit(0);
 }
 
@@ -706,7 +744,7 @@ async function main(): Promise<void> {
           const v = validateRequest(parsed);
           if (!v.ok) {
             res = applyResponseBudget(v.res, config.limits.responseMaxBytes);
-          } else if (rawDb && (v.req.op === "candidate.create" || v.req.op === "candidate.get" || v.req.op === "record.recall")) {
+          } else if (rawDb && (v.req.op === "candidate.create" || v.req.op === "candidate.get" || v.req.op === "record.recall" || v.req.op === "record.correct-request")) {
             // P1: effective remaining deadline. The parent's remaining cliMs
             // bounds BOTH the SQLite busy wait (effectiveBusyMs clamp, so a
             // busyMs > cliMs config cannot block past the deadline) AND the
@@ -751,8 +789,10 @@ async function main(): Promise<void> {
               }
             }
           } else {
-            // T4 remains honest: correct-request is not implemented.
-            res = applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
+            // Human-only ops (archive/approve/reject) never reach here:
+            // validateRequest already answers FORBIDDEN. Anything else is
+            // an unknown op (BAD_REQUEST), never a silent success.
+            res = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
           }
         }
       }
