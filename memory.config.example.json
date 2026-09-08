@@ -1,0 +1,19 @@
+{
+  "dbPath": "./memory.db",
+  "allowedScopes": ["personal/default"],
+  "candidateTtlSec": 259200,
+  "limits": {
+    "bodyMaxCp": 2000,
+    "queryMaxCp": 500,
+    "tagsMax": 5,
+    "limitDefault": 10,
+    "limitMax": 25,
+    "snippetMaxCp": 200,
+    "responseMaxBytes": 8192
+  },
+  "timeouts": {
+    "cliMs": 5000,
+    "busyMs": 2000
+  },
+  "dbMaxBytes": 104857600
+}
