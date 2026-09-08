@@ -165,22 +165,113 @@ describe("T6 acceptance A1-A13 (plan 14.11)", () => {
     }
   });
 
-  it("A3 approval immutability binding: wrong token is CONFLICT and creates no record", () => {
-    const dir = mkdir();
-    const cfg = writeConfig(dir);
-    const { db, config } = openDb(cfg);
-    try {
-      const before = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
-      const c = createCandidate(db, config, candidateParams("a3 binding probe"), nextKey("k"));
-      assert.equal(c.ok, true);
-      const candId = (c.data as { candidate: { id: string } }).candidate.id as string;
-      const bad = approveCandidate(db, config, { id: candId, scope: "personal/default", token: "sha256: wrong", idempotencyKey: nextKey("h") });
-      assert.equal(bad.ok, false);
-      assert.equal((bad as { code: string }).code, "CONFLICT");
-      const after = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
-      assert.equal(after, before);
-    } finally {
-      db.close();
+  it("A3 approval immutability binding: every token-bound field tamper is rejected with no record", () => {
+    // Token binds [1,id,bodyHash,kind,source,observedAt,scope,supersedes,
+    // tags,link,createdAt,expiresAt] (plan 14.5). Each subcase mints a fresh
+    // candidate, captures the genuine review token, tampers exactly one
+    // stored field via direct SQL (isolated per-candidate, no rollback
+    // needed), then approves with the now-stale token. Scope tamper uses the
+    // ORIGINAL request scope so the contract answer is FORBIDDEN_SCOPE
+    // (row.scope !== request scope); all other tampers are CONFLICT,
+    // including stale-bodyHash approve (stored digest != digest of stored
+    // body is CONFLICT with no record). A literal wrong token alone proves
+    // nothing about field coverage, so every field is mutated here.
+    const cases: Array<{ name: string; code: "CONFLICT" | "FORBIDDEN_SCOPE" | "NOT_FOUND"; tamper: (db: DatabaseSync, id: string) => void; correction?: boolean }> = [
+      { name: "body-only (stale bodyHash)", code: "CONFLICT", tamper: (db, id) => { db.prepare(`UPDATE candidates SET body='tampered body no hash update' WHERE id=?`).run(id); } },
+      { name: "bodyHash", code: "CONFLICT", tamper: (db, id) => { db.prepare(`UPDATE candidates SET bodyHash='sha256:0000000000000000000000000000000000000000000000000000000000000000' WHERE id=?`).run(id); } },
+      { name: "kind", code: "CONFLICT", tamper: (db, id) => { db.prepare(`UPDATE candidates SET kind='model_inference' WHERE id=?`).run(id); } },
+      { name: "source", code: "CONFLICT", tamper: (db, id) => { db.prepare(`UPDATE candidates SET source='session:s9:turn:9' WHERE id=?`).run(id); } },
+      { name: "observedAt", code: "CONFLICT", tamper: (db, id) => { db.prepare(`UPDATE candidates SET observedAt='2026-09-03T00:00:00.000Z' WHERE id=?`).run(id); } },
+      { name: "scope (original request scope)", code: "FORBIDDEN_SCOPE", tamper: (db, id) => { db.prepare(`UPDATE candidates SET scope='personal/other' WHERE id=?`).run(id); } },
+      { name: "tags (extra row)", code: "CONFLICT", tamper: (db, id) => { db.prepare(`INSERT INTO candidate_tags(candidateId, tag) VALUES (?, ?)`).run(id, "smuggled"); } },
+      { name: "link (added row)", code: "CONFLICT", tamper: (db, id) => { db.prepare(`UPDATE candidate_links SET toName='Smuggled' WHERE fromId=?`).run(id); } },
+      { name: "createdAt", code: "CONFLICT", tamper: (db, id) => { db.prepare(`UPDATE candidates SET createdAt='2020-01-01T00:00:00.000Z' WHERE id=?`).run(id); } },
+      { name: "expiresAt (future, token-only)", code: "CONFLICT", tamper: (db, id) => { db.prepare(`UPDATE candidates SET expiresAt='2030-01-01T00:00:00.000Z' WHERE id=?`).run(id); } },
+    ];
+    for (const tc of cases) {
+      const dir = mkdir();
+      const cfg = writeConfig(dir);
+      const { db, config } = openDb(cfg);
+      try {
+        const before = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+        const c = createCandidate(db, config, { ...candidateParams("a3 binding probe " + tc.name), tags: ["t1"], link: "Base" }, nextKey("k"));
+        assert.equal(c.ok, true);
+        const candId = (c.data as { candidate: { id: string } }).candidate.id as string;
+        const rev = getCandidateForReview(db, config, candId, "personal/default");
+        assert.equal(rev.ok, true);
+        if (!rev.ok) throw new Error("review failed for " + tc.name);
+        tc.tamper(db, candId);
+        const attempt = approveCandidate(db, config, { id: candId, scope: "personal/default", token: rev.token, idempotencyKey: nextKey("h") });
+        assert.equal(attempt.ok, false, tc.name + " must be rejected");
+        assert.equal((attempt as { code: string }).code, tc.code, tc.name + " code");
+        const after = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+        assert.equal(after, before, tc.name + " must create no record");
+        const st = db.prepare(`SELECT status FROM candidates WHERE id=?`).get(candId) as { status: string };
+        assert.equal(st.status, "candidate", tc.name + " loser stays candidate");
+      } finally {
+        db.close();
+      }
+    }
+    // supersedes tamper on a correction candidate (token binds the pointer).
+    {
+      const dir = mkdir();
+      const cfg = writeConfig(dir);
+      const { db, config } = openDb(cfg);
+      try {
+        const base = createAndApprove(db, config, "a3 supersedes base");
+        const other = createAndApprove(db, config, "a3 supersedes other");
+        const cr = correctRequest(
+          db, config,
+          { recordId: base.recId, body: "a3 correction body", kind: "correction", provenance: { source: "session:s1:turn:9", observedAt: "2026-09-02T00:00:00.000Z" }, scope: "personal/default" },
+          nextKey("kc"),
+        );
+        assert.equal(cr.ok, true);
+        const candId = (cr.data as { candidate: { id: string } }).candidate.id as string;
+        const rev = getCandidateForReview(db, config, candId, "personal/default");
+        assert.equal(rev.ok, true);
+        if (!rev.ok) throw new Error("review failed");
+        const before = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+        db.prepare(`UPDATE candidates SET supersedes=? WHERE id=?`).run(other.recId, candId);
+        const attempt = approveCandidate(db, config, { id: candId, scope: "personal/default", token: rev.token, idempotencyKey: nextKey("h") });
+        assert.equal(attempt.ok, false);
+        assert.equal((attempt as { code: string }).code, "CONFLICT");
+        const after = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+        assert.equal(after, before);
+      } finally {
+        db.close();
+      }
+    }
+    // Candidate-id mismatch: unknown id is NOT_FOUND; an existing other id
+    // with a foreign token is CONFLICT. Neither creates a record.
+    {
+      const dir = mkdir();
+      const cfg = writeConfig(dir);
+      const { db, config } = openDb(cfg);
+      try {
+        const c1 = createCandidate(db, config, candidateParams("a3 id probe one"), nextKey("k1"));
+        const c2 = createCandidate(db, config, candidateParams("a3 id probe two"), nextKey("k2"));
+        assert.equal(c1.ok, true);
+        assert.equal(c2.ok, true);
+        const id1 = (c1.data as { candidate: { id: string } }).candidate.id as string;
+        const id2 = (c2.data as { candidate: { id: string } }).candidate.id as string;
+        const rev = getCandidateForReview(db, config, id1, "personal/default");
+        assert.equal(rev.ok, true);
+        if (!rev.ok) throw new Error("review failed");
+        const before = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+        const unknown = approveCandidate(db, config, { id: "cand_does_not_exist", scope: "personal/default", token: rev.token, idempotencyKey: nextKey("h1") });
+        assert.equal(unknown.ok, false);
+        assert.equal((unknown as { code: string }).code, "NOT_FOUND");
+        const foreign = approveCandidate(db, config, { id: id2, scope: "personal/default", token: rev.token, idempotencyKey: nextKey("h2") });
+        assert.equal(foreign.ok, false);
+        assert.equal((foreign as { code: string }).code, "CONFLICT");
+        const literal = approveCandidate(db, config, { id: id1, scope: "personal/default", token: "sha256: wrong", idempotencyKey: nextKey("h3") });
+        assert.equal(literal.ok, false);
+        assert.equal((literal as { code: string }).code, "CONFLICT");
+        const after = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+        assert.equal(after, before);
+      } finally {
+        db.close();
+      }
     }
   });
 
@@ -345,6 +436,65 @@ describe("T6 acceptance A1-A13 (plan 14.11)", () => {
     const overbudget = queryMemory({ cliPath: cli, configPath: cfg, scope: "personal/default", query: "hello", maxOutputBytes: 10 });
     assert.equal(overbudget.degraded, true);
     assert.equal(overbudget.code, "LIMIT_EXCEEDED");
+  });
+
+  it("A8b fake-adapter strictness: malformed envelopes/budgets degrade memoryless via local fixtures only", () => {
+    const dir = mkdir();
+    const cfg = writeConfig(dir);
+    const fx = (name: string, body: string): string => {
+      const p = path.join(dir, name);
+      fs.writeFileSync(p, body);
+      return p;
+    };
+    const emit = (obj: unknown, extra = ""): string =>
+      fx(`emit-${Math.random().toString(36).slice(2)}.js`, `process.stdout.write(${JSON.stringify(JSON.stringify(obj))} + "\\n"${extra});\n`);
+    const goodItem = { id: "rec_01", snippet: "hello", truncated: false, tags: [], createdAt: "2026-09-01T00:00:00.000Z" };
+    const good = { v: 1, ok: true, code: "OK", message: "ok", data: { recallId: "recall_01", items: [goodItem] }, deduplicated: false };
+    // ok:true with inconsistent code is malformed.
+    const badCode = { ...good, code: "BAD_REQUEST" };
+    assert.equal(queryMemory({ cliPath: emit(badCode), configPath: cfg, scope: "personal/default", query: "hello" }).degraded, true);
+    // Unknown top-level field is malformed (strict).
+    const extraTop = { ...good, surprise: 1 };
+    assert.equal(queryMemory({ cliPath: emit(extraTop), configPath: cfg, scope: "personal/default", query: "hello" }).degraded, true);
+    // Duplicate item ids are malformed.
+    const dup = { ...good, data: { recallId: "recall_01", items: [goodItem, { ...goodItem }] } };
+    assert.equal(queryMemory({ cliPath: emit(dup), configPath: cfg, scope: "personal/default", query: "hello" }).degraded, true);
+    // Oversized snippet (adopted 200cp contract) degrades rather than passing through.
+    const big = { ...good, data: { recallId: "recall_01", items: [{ ...goodItem, snippet: "x".repeat(201) }] } };
+    const bigRes = queryMemory({ cliPath: emit(big), configPath: cfg, scope: "personal/default", query: "hello" });
+    assert.equal(bigRes.degraded, true);
+    // Invalid UTF-8 stdout bytes degrade (fatal decode, no replacement passthrough).
+    const rawBad = fx("rawbad.js", `process.stdout.write(Buffer.from([0xff, 0xfe, 0x0a]));\n`);
+    const rawRes = queryMemory({ cliPath: rawBad, configPath: cfg, scope: "personal/default", query: "hello" });
+    assert.equal(rawRes.degraded, true);
+    if (rawRes.degraded) assert.equal(rawRes.text, FAKE_FALLBACK_TEXT);
+    // Non-finite / unbounded budgets degrade instead of silent accept.
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, 2.5, 100000]) {
+      const r1 = queryMemory({ cliPath: cli, configPath: cfg, scope: "personal/default", query: "hello", maxInputBytes: bad });
+      assert.equal(r1.degraded, true, "maxInput " + String(bad));
+      const r2 = queryMemory({ cliPath: cli, configPath: cfg, scope: "personal/default", query: "hello", maxOutputBytes: bad });
+      assert.equal(r2.degraded, true, "maxOutput " + String(bad));
+    }
+    // limit < 1 is BAD_REQUEST (no silent clamp to 1); timeout NaN is BAD_REQUEST.
+    const l0 = queryMemory({ cliPath: cli, configPath: cfg, scope: "personal/default", query: "hello", limit: 0 });
+    assert.equal(l0.degraded, true);
+    assert.equal(l0.code, "BAD_REQUEST");
+    const tNaN = queryMemory({ cliPath: cli, configPath: cfg, scope: "personal/default", query: "hello", timeoutMs: Number.NaN });
+    assert.equal(tNaN.degraded, true);
+    assert.equal(tNaN.code, "BAD_REQUEST");
+    // A child ignoring SIGTERM still degrades via SIGKILL within the timeout
+    // (local fixture only; guarded by the adapter timeout itself).
+    const ignoreTerm = fx("ignoreterm.js", `process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1000);\n`);
+    const t0 = Date.now();
+    const ign = queryMemory({ cliPath: ignoreTerm, configPath: cfg, scope: "personal/default", query: "hello", timeoutMs: 800 });
+    assert.equal(ign.degraded, true);
+    assert.equal(ign.code, "TIMEOUT");
+    assert.ok(Date.now() - t0 < 15000, "SIGTERM-ignoring child must not hang the test");
+    // Degraded results never echo the query or diagnostics.
+    if (ign.degraded) {
+      assert.equal(ign.text, FAKE_FALLBACK_TEXT);
+      assert.ok(!JSON.stringify(ign).includes("hello"));
+    }
   });
 
   it("A9 authorization and route separation: JSON human ops FORBIDDEN, scope mismatch FORBIDDEN_SCOPE, actor claims ignored", () => {

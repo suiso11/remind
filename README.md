@@ -39,7 +39,7 @@ cp memory.config.example.json memory.config.json  # local only, git-ignored
 echo '{"v":1,"op":"record.recall","params":{"query":"booking","scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 Status (honest, verified): `npm test` builds with `tsc` and runs
-`node:test` over `dist/tests/` — **73 tests pass, 1 skipped** (config
+`node:test` over `dist/tests/` — **88 tests, 87 pass, 1 skipped** (config
 strictness, envelopes/bounds, CLI smoke, hardened stdin subprocess suite,
 T2 candidates/approval/idempotency/scope/TTY-guard suite, 4 T2 review
 regressions, plus 10 T3 recall regressions: approval-only/active-scope
@@ -67,7 +67,13 @@ expiry; the single skip is the manual real-TTY
 interactive confirmation, exercised by hand only).
 `npm run smoke` walks a strict valid recall / unknown / human-op envelopes
 in a temp dir (recall returns `ok:true` with empty items on the fresh DB).
-T5-T6 work (retention docs, fake adapter, A1-A13) is explicitly out of scope.
+T5 (retention docs, `docs/retention.md`) and T6 (fake adapter
+`src/fake-adapter.ts` + A1-A13 acceptance `tests/acceptance.test.ts`, 14/14
+pass via `npm run acceptance` including A8b strict-envelope fixtures; full-field
+A3 token binding plus stored bodyHash tamper guard; finite adapter bounds that
+degrade instead of clamp, strict single-line envelope, UTF-8 fatal decode,
+`killSignal:SIGKILL` forced deadline) are implemented and tested; the only
+skip/manual remainder is the real-TTY interactive confirmation.
 T3 fix notes (honest): `record.recall` uses parameterized SQL
 `WHERE scope/status/time AND instr(body, ?)>0 AND EXISTS(tag)… AND
 EXISTS(link)… ORDER BY createdAt DESC, id ASC LIMIT ?` (no `LIKE`, no
@@ -168,7 +174,7 @@ pairs still pass.
 - `src/cli.ts` — CLI entry (`--config`, bounded LF-framed stdin, stdout line;
   `candidate.create/get` routed to the store, human `review/approve/reject`
   subcommands with TTY + `yes` confirmation)
-- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess/T2/T3/T3-fix scale+surrogate/T4 correction-archive)
+- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess/T2/T3/T3-fix scale+surrogate/T4 correction-archive/acceptance A1-A13+A8b)
 - `memory.config.example.json` — fake scope (`personal/default`) only
 
 ## Roadmap (plan.md 14.12)
@@ -177,5 +183,5 @@ pairs still pass.
 - [x] T2: candidates + review/approve/reject
 - [x] T3: records + deterministic recall + exposure audit
 - [x] T4: correct-request/archive
-- [ ] T5: retention documentation (no export/delete in MVP)
-- [ ] T6: fake adapter + A1-A13 acceptance
+- [x] T5: retention documentation (no export/delete in MVP)
+- [x] T6: fake adapter + A1-A13 acceptance (14/14 incl. A8b strictness)

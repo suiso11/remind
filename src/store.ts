@@ -432,6 +432,23 @@ function changedRows(result: unknown): number {
 }
 
 /**
+ * Stored-body integrity: the committed bodyHash must equal the digest of the
+ * stored normalized body. Creation writes both consistently, so a mismatch
+ * means the row was tampered with outside the domain path (e.g. direct SQL
+ * UPDATE of body without bodyHash, or vice versa). Approval/rejection must
+ * refuse with CONFLICT and create no record rather than approve altered
+ * content under a stale hash. Checked outside AND inside the transaction
+ * (fresh re-read) so a concurrent tamper cannot slip through.
+ */
+function storedBodyHashIntact(row: CandidateRow): boolean {
+  try {
+    return safeEqual(row.bodyHash, bodyHashFor(normalizeBody(row.body)));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Candidate metadata reads. These THROW on query failure (corruption,
  * incompatible pre-existing table, I/O error) so every public boundary
  * answers STORE_UNAVAILABLE. They must never substitute an empty tag list
@@ -827,6 +844,9 @@ export function approveCandidate(
   }
   // A metadata read failure here is STORE_UNAVAILABLE: binding the token
   // against fabricated empty tags / null link could approve the wrong set.
+  // Tampered body/bodyHash (stored digest != digest of stored body) is
+  // CONFLICT with no record: the stale-hash approve path is closed here.
+  if (!storedBodyHashIntact(row)) return budgeted(fail("CONFLICT"), config);
   let expected: string;
   try {
     expected = tokenForStored(row, readTags(db, args.id), readLink(db, args.id));
@@ -849,6 +869,7 @@ export function approveCandidate(
       // Re-verify inside the transaction (fail closed on concurrent terminal move).
       const fresh = readCandidate(db, args.id);
       if (!fresh || fresh.status !== "candidate") throw new Error("state moved");
+      if (!storedBodyHashIntact(fresh)) throw new Error("token moved");
       if (Date.parse(fresh.expiresAt) <= Date.now()) throw new Error("expired now");
       if (!safeEqual(args.token, tokenForStored(fresh, readTags(db, args.id), readLink(db, args.id)))) {
         throw new Error("token moved");
@@ -1013,7 +1034,8 @@ export function rejectCandidate(
     return budgeted(fail("EXPIRED"), config);
   }
   // Same fail-closed metadata rule as approve: never bind against
-  // fabricated empty tags / null link.
+  // fabricated empty tags / null link. Tampered body/bodyHash also CONFLICT.
+  if (!storedBodyHashIntact(row)) return budgeted(fail("CONFLICT"), config);
   try {
     if (!safeEqual(args.token, tokenForStored(row, readTags(db, args.id), readLink(db, args.id)))) {
       return budgeted(fail("CONFLICT"), config);
@@ -1027,6 +1049,7 @@ export function rejectCandidate(
     const response = withTransaction(db, (): ResponseEnvelope => {
       const fresh = readCandidate(db, args.id);
       if (!fresh || fresh.status !== "candidate") throw new Error("state moved");
+      if (!storedBodyHashIntact(fresh)) throw new Error("token moved");
       if (Date.parse(fresh.expiresAt) <= Date.now()) throw new Error("expired now");
       if (!safeEqual(args.token, tokenForStored(fresh, readTags(db, args.id), readLink(db, args.id)))) {
         throw new Error("token moved");
