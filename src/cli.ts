@@ -23,7 +23,7 @@
  * JSON envelopes pass the responseMaxBytes budget (fail-closed
  * LIMIT_EXCEEDED, never truncated).
  *
- * Honesty: T3-T4 domain ops (record.recall/correct-request, archive)
+ * Honesty: T4 domain ops (record.correct-request, archive)
   * return ok:false NOT_IMPLEMENTED until their tasks land; this file never
   * returns ok:true for unimplemented domain ops.
  */
@@ -43,6 +43,7 @@ import {
   createCandidate,
   getCandidateForReview,
   getCandidateMeta,
+  recallRecords,
   rejectCandidate,
 } from "./store.js";
 import type { DatabaseSync } from "node:sqlite";
@@ -290,7 +291,10 @@ export function handleValidatedRequest(
   if (op === "candidate.get") {
     return getCandidateMeta(db, config, params);
   }
-  // T3 (record.recall) / T4 (record.correct-request, archive): honest deferral.
+  if (op === "record.recall") {
+    return recallRecords(db, config, params);
+  }
+  // T4 (record.correct-request, archive): honest deferral.
   return applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
 }
 
@@ -649,14 +653,14 @@ async function main(): Promise<void> {
           const v = validateRequest(parsed);
           if (!v.ok) {
             res = applyResponseBudget(v.res, config.limits.responseMaxBytes);
-          } else if (rawDb && (v.req.op === "candidate.create" || v.req.op === "candidate.get")) {
+          } else if (rawDb && (v.req.op === "candidate.create" || v.req.op === "candidate.get" || v.req.op === "record.recall")) {
             try {
               res = handleValidatedRequest(rawDb, config, v.req.op, v.req.params, v.req.idempotencyKey);
             } catch {
               res = applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
             }
           } else {
-            // T3-T4 remain honest: recall / correct-request are not implemented.
+            // T4 remains honest: correct-request is not implemented.
             res = applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
           }
         }

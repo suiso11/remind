@@ -141,7 +141,9 @@ describe("hardened stdin bounds (T1)", () => {
     assert.equal(res.status, 0);
     const body = parseSingleJsonLine(stdout);
     assert.equal(body["ok"], false);
-    assert.equal(body["code"], "NOT_IMPLEMENTED");
+    // T3 implements record.recall: empty params are strict BAD_REQUEST
+    // (still proving the LF-framed response arrives without EOF).
+    assert.equal(body["code"], "BAD_REQUEST");
   });
 
   it("never echoes secrets in envelopes or fixed stderr", () => {
@@ -186,6 +188,7 @@ describe("hardened stdin bounds (T1)", () => {
   it("unimplemented domain ops honestly fail with NOT_IMPLEMENTED, never ok:true", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-hard-"));
     const cfg = writeConfig(dir);
+    // T3 implements record.recall: empty params are strict BAD_REQUEST.
     const recall = spawnSync(process.execPath, [cli, "--config", cfg], {
       input: JSON.stringify({ v: 1, op: "record.recall", params: {} }) + "\n",
       encoding: "utf8",
@@ -193,7 +196,7 @@ describe("hardened stdin bounds (T1)", () => {
     assert.equal(recall.status, 0);
     const rBody = parseSingleJsonLine(recall.stdout);
     assert.equal(rBody["ok"], false);
-    assert.equal(rBody["code"], "NOT_IMPLEMENTED");
+    assert.equal(rBody["code"], "BAD_REQUEST");
 
     // T2 implements candidate.create/get: empty params are a validation
     // failure (BAD_REQUEST), while the T4 correction path stays deferred.

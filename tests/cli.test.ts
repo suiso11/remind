@@ -44,8 +44,9 @@ describe("cli smoke (T1 foundation)", () => {
   it("boots, seeds scopes, and honestly reports unimplemented domain", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-smoke-"));
     const cfg = writeConfig(dir);
+    // T4 stays deferred; T3 implements record.recall (empty params are BAD_REQUEST).
     const req =
-      JSON.stringify({ v: 1, op: "record.recall", params: {} }) + "\n";
+      JSON.stringify({ v: 1, op: "record.correct-request", idempotencyKey: "k-smoke-1", params: {} }) + "\n";
     const r = runCli(cfg, req);
     assert.equal(r.status, 0);
     const res = JSON.parse(r.stdout.trim());

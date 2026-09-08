@@ -13,10 +13,12 @@
  * - candidate.create with kind=correction or a supersedes pointer is answered
  *   NOT_IMPLEMENTED (honest T4 deferral): the supersedes column exists in the
  *   schema, but the T4 conditional-supersede transaction is not implemented.
- * - record.correct-request / record.recall / archive stay NOT_IMPLEMENTED /
- *   FORBIDDEN-over-JSON exactly as before (T3-T4 own them).
+ * - record.correct-request / archive stay NOT_IMPLEMENTED /
+ *   FORBIDDEN-over-JSON exactly as before (T4 owns them). record.recall is
+ *   implemented here (T3).
  */
 import { randomBytes } from "node:crypto";
+import * as fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import {
@@ -838,6 +840,295 @@ export function rejectCandidate(
     }
     if (msg === "expired now") return budgeted(fail("EXPIRED"), config);
     if (msg === "state moved" || msg === "token moved") return budgeted(fail("CONFLICT"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* T3 deterministic recall (plan 14.6 + 14.4/14.8/14.10 adopted subset) */
+/* ------------------------------------------------------------------ */
+
+interface ParsedRecall {
+  query: string;
+  tags: string[];
+  link: string | null;
+  since: string | null;
+  until: string | null;
+  limit: number;
+  scope: string;
+  runId: string | null;
+}
+
+type RecallParse =
+  | { ok: true; value: ParsedRecall }
+  | { ok: false; res: ResponseEnvelope };
+
+function parseRecallParams(config: AppConfig, params: Record<string, unknown>): RecallParse {
+  const allowed = new Set(["query", "tags", "link", "since", "until", "limit", "scope", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return { ok: false, res: bad() };
+  }
+  const { query, tags, link, since, until, limit, scope, runId } = params;
+
+  if (typeof query !== "string") return { ok: false, res: bad() };
+  if (countCp(query) > config.limits.queryMaxCp) return { ok: false, res: limitExceeded() };
+  const nq = normalizeBody(query);
+  const nqLen = countCp(nq);
+  if (nqLen < 1) return { ok: false, res: bad() };
+  if (nqLen > config.limits.queryMaxCp) return { ok: false, res: limitExceeded() };
+
+  let nTags: string[] = [];
+  if (tags !== undefined) {
+    if (!Array.isArray(tags)) return { ok: false, res: bad() };
+    if (tags.length > config.limits.tagsMax) return { ok: false, res: limitExceeded() };
+    const seen = new Set<string>();
+    for (const t of tags) {
+      if (typeof t !== "string") return { ok: false, res: bad() };
+      if (countCp(t) > 256) return { ok: false, res: limitExceeded() };
+      if (countCp(t) < 1 || hasControl(t)) return { ok: false, res: bad() };
+      const nt = normalizeTag(t);
+      if (countCp(nt) < 1 || countCp(nt) > 256) return { ok: false, res: bad() };
+      seen.add(nt);
+    }
+    nTags = [...seen].sort();
+  }
+
+  let nLink: string | null = null;
+  if (link !== undefined && link !== null) {
+    if (typeof link !== "string") return { ok: false, res: bad() };
+    if (countCp(link) > 256) return { ok: false, res: limitExceeded() };
+    if (countCp(link) < 1 || hasControl(link)) return { ok: false, res: bad() };
+    const nl = normalizeLink(link);
+    if (countCp(nl) < 1 || countCp(nl) > 256) return { ok: false, res: bad() };
+    nLink = nl;
+  }
+
+  let nSince: string | null = null;
+  if (since !== undefined && since !== null) {
+    const c = canonicalTime(since);
+    if (c === null) return { ok: false, res: bad() };
+    nSince = c;
+  }
+  let nUntil: string | null = null;
+  if (until !== undefined && until !== null) {
+    const c = canonicalTime(until);
+    if (c === null) return { ok: false, res: bad() };
+    nUntil = c;
+  }
+
+  let nLimit = config.limits.limitDefault;
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return { ok: false, res: bad() };
+    if (limit < 1) return { ok: false, res: bad() };
+    if (limit > config.limits.limitMax) return { ok: false, res: limitExceeded() };
+    nLimit = limit;
+  }
+
+  if (typeof scope !== "string") return { ok: false, res: bad() };
+  if (countCp(scope) > 256) return { ok: false, res: limitExceeded() };
+  if (countCp(scope) < 1 || hasControl(scope)) return { ok: false, res: bad() };
+
+  let nRunId: string | null = null;
+  if (runId !== undefined && runId !== null) {
+    if (typeof runId !== "string") return { ok: false, res: bad() };
+    if (countCp(runId) > 256) return { ok: false, res: limitExceeded() };
+    if (countCp(runId) < 1 || hasControl(runId)) return { ok: false, res: bad() };
+    nRunId = runId;
+  }
+
+  return { ok: true, value: { query: nq, tags: nTags, link: nLink, since: nSince, until: nUntil, limit: nLimit, scope: scope as string, runId: nRunId } };
+}
+
+function snippetFor(body: string, maxCp: number): { snippet: string; truncated: boolean } {
+  const cps = [...body];
+  if (cps.length <= maxCp) return { snippet: body, truncated: false };
+  return { snippet: cps.slice(0, maxCp).join(""), truncated: true };
+}
+
+/**
+ * Best-effort DB cap gate for recall (which still writes audit/exposures).
+ * Main-file page accounting + WAL/SHM sidecars when the file path is known.
+ * This is pragmatic, not an exact byte guarantee: page granularity and WAL
+ * checkpoint timing mean the sum is an approximation. Oversize ->
+ * STORE_UNAVAILABLE (fail closed). Unknown/unreadable sizes never block.
+ */
+function isDbOverCap(db: DatabaseSync, config: AppConfig): boolean {
+  try {
+    const pc = db.prepare(`PRAGMA page_count`).get() as { page_count: number } | undefined;
+    const ps = db.prepare(`PRAGMA page_size`).get() as { page_size: number } | undefined;
+    const mainBytes = (pc?.page_count ?? 0) * (ps?.page_size ?? 0);
+    if (mainBytes > 0 && mainBytes > config.dbMaxBytes) return true;
+    try {
+      const rows = db.prepare(`PRAGMA database_list`).all() as Array<{ name: string; file: string }>;
+      const main = rows.find((r) => r.name === "main")?.file ?? "";
+      if (main) {
+        let total = 0;
+        let seen = false;
+        for (const suffix of ["", "-wal", "-shm"]) {
+          try {
+            total += fs.statSync(main + suffix).size;
+            seen = true;
+          } catch {
+            /* missing sidecar is fine */
+          }
+        }
+        if (seen && total > config.dbMaxBytes) return true;
+      }
+    } catch {
+      /* ignore sidecar errors */
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+interface RecallCandidate {
+  id: string;
+  body: string;
+  createdAt: string;
+}
+
+/** record.recall over JSON (read-only selection + metadata-only audit in one txn). */
+export function recallRecords(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  const parsed = parseRecallParams(config, params);
+  if (!parsed.ok) return budgeted(parsed.res, config);
+  const p = parsed.value;
+  if (!isScopeAuthorized(db, config, p.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+
+  const now = nowOverride ?? nowIso();
+  const recallId = genId("recall");
+
+  try {
+    const response = withTransaction(db, (): ResponseEnvelope => {
+      if (isDbOverCap(db, config)) throw new Error("db over cap");
+      // Ordered pre-selection (scope + active + time window). Canonical
+      // millis strings sort lexicographically, so >= / < match
+      // since-inclusive / until-exclusive numerically.
+      let sql = `SELECT id, body, createdAt FROM records WHERE scope = ? AND status = 'active'`;
+      const args: unknown[] = [p.scope];
+      if (p.since !== null) {
+        sql += ` AND createdAt >= ?`;
+        args.push(p.since);
+      }
+      if (p.until !== null) {
+        sql += ` AND createdAt < ?`;
+        args.push(p.until);
+      }
+      sql += ` ORDER BY createdAt DESC, id ASC`;
+      const rows = db.prepare(sql).all(...(args as string[])) as unknown as RecallCandidate[];
+
+      // Literal substring (no wildcards) on normalized bodies.
+      const matched = rows.filter((r) => r.body.includes(p.query));
+
+      // Tag ALL + link exact via deterministic JS checks (no LIKE wildcards).
+      let tagMap = new Map<string, Set<string>>();
+      let linkMap = new Map<string, string>();
+      if (matched.length > 0 && (p.tags.length > 0 || p.link !== null)) {
+        try {
+          const ids = matched.map((r) => r.id);
+          const placeholders = ids.map(() => "?").join(",");
+          const trows = db
+            .prepare(`SELECT recordId, tag FROM record_tags WHERE recordId IN (${placeholders})`)
+            .all(...(ids as [])) as Array<{ recordId: string; tag: string }>;
+          for (const t of trows) {
+            let s = tagMap.get(t.recordId);
+            if (!s) {
+              s = new Set<string>();
+              tagMap.set(t.recordId, s);
+            }
+            s.add(t.tag);
+          }
+          if (p.link !== null) {
+            const lrows = db
+              .prepare(`SELECT fromId, toName FROM record_links WHERE fromId IN (${placeholders})`)
+              .all(...(ids as [])) as Array<{ fromId: string; toName: string }>;
+            for (const l of lrows) linkMap.set(l.fromId, l.toName);
+          }
+        } catch {
+          throw new Error("tag/link read failed");
+        }
+      } else if (matched.length > 0) {
+        // Still need tags for the response projection.
+        try {
+          const ids = matched.map((r) => r.id);
+          const placeholders = ids.map(() => "?").join(",");
+          const trows = db
+            .prepare(`SELECT recordId, tag FROM record_tags WHERE recordId IN (${placeholders})`)
+            .all(...(ids as [])) as Array<{ recordId: string; tag: string }>;
+          for (const t of trows) {
+            let s = tagMap.get(t.recordId);
+            if (!s) {
+              s = new Set<string>();
+              tagMap.set(t.recordId, s);
+            }
+            s.add(t.tag);
+          }
+        } catch {
+          throw new Error("tag read failed");
+        }
+      }
+
+      const filtered = matched.filter((r) => {
+        if (p.tags.length > 0) {
+          const have = tagMap.get(r.id) ?? new Set<string>();
+          for (const t of p.tags) {
+            if (!have.has(t)) return false;
+          }
+        }
+        if (p.link !== null) {
+          if (linkMap.get(r.id) !== p.link) return false;
+        }
+        return true;
+      });
+
+      const top = filtered.slice(0, p.limit);
+      const items = top.map((r) => {
+        const { snippet, truncated } = snippetFor(r.body, config.limits.snippetMaxCp);
+        const tags = [...(tagMap.get(r.id) ?? new Set<string>())].sort();
+        return { id: r.id, snippet, truncated, tags, createdAt: r.createdAt };
+      });
+
+      // Full-response budget BEFORE any audit/exposure write: no partial
+      // shaving, no orphan exposure rows on overflow.
+      const probe: ResponseEnvelope = ok({ recallId, items });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      const stored = budgeted(probe, config);
+      if (!stored.ok) throw new Error("response over budget");
+      const responseBytes = Buffer.byteLength(JSON.stringify(stored), "utf8");
+
+      // Metadata-only audit + per-item exposures (no query/body/snippet text).
+      db.prepare(
+        `INSERT INTO audit(ts, op, targetId, code, scope, bytes, limitN, runId, recallId, approver, approvedAt, token, reasonCode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)`,
+      ).run(now, "record.recall", recallId, stored.code, p.scope, responseBytes, p.limit, p.runId, recallId);
+      const exp = db.prepare(
+        `INSERT INTO exposures(ts, recallId, runId, scope, recordId, snippetBytes, truncated, limitN)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const it of items) {
+        exp.run(
+          now,
+          recallId,
+          p.runId,
+          p.scope,
+          it.id,
+          Buffer.byteLength(it.snippet, "utf8"),
+          it.truncated ? 1 : 0,
+          p.limit,
+        );
+      }
+      return stored;
+    });
+    return response;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }
