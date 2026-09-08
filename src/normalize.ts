@@ -6,8 +6,9 @@ export function countCp(s: string): number {
 }
 
 function isWhiteSpace(ch: string): boolean {
-  // \s with unicode flag covers Unicode White_Space.
-  return /^\s$/u.test(ch);
+  // Exact Unicode White_Space (plan 14.6). Do NOT use JS \s: it also
+  // matches U+FEFF (BOM), which is not White_Space.
+  return /^\p{White_Space}$/u.test(ch);
 }
 
 /**

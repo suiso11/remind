@@ -116,7 +116,7 @@ describe("T2 candidates + human approval", () => {
       assert.equal(getCandidateMeta(db, config, { id, scope: "personal/other" }).code, "FORBIDDEN_SCOPE");
       assert.equal(getCandidateMeta(db, config, { id } as Record<string, unknown>).code, "BAD_REQUEST");
       assert.equal(getCandidateMeta(db, config, { id: "cand_missing", scope: "personal/default" }).code, "NOT_FOUND");
-      const rev = getCandidateForReview(db, id, "personal/other");
+      const rev = getCandidateForReview(db, config, id, "personal/other");
       assert.equal(rev.ok, false);
       if (!rev.ok) assert.equal(rev.code, "FORBIDDEN_SCOPE");
     } finally {
@@ -131,7 +131,7 @@ describe("T2 candidates + human approval", () => {
     try {
       const c = createCandidate(db, config, createParams("approve me", { tags: ["a", "b"], link: "Target" }), "k-ap-1");
       const id = (c.data as { candidate: { id: string } }).candidate.id as string;
-      const rev = getCandidateForReview(db, id, "personal/default");
+      const rev = getCandidateForReview(db, config, id, "personal/default");
       assert.equal(rev.ok, true);
       if (!rev.ok) throw new Error("review failed");
       const bad = approveCandidate(db, config, { id, scope: "personal/default", token: "sha256:dead", idempotencyKey: "h-ap-bad" });
@@ -163,7 +163,7 @@ describe("T2 candidates + human approval", () => {
     try {
       const c = createCandidate(db, config, createParams("reject me"), "k-rj-1");
       const id = (c.data as { candidate: { id: string } }).candidate.id as string;
-      const rev = getCandidateForReview(db, id, "personal/default");
+      const rev = getCandidateForReview(db, config, id, "personal/default");
       if (!rev.ok) throw new Error("review failed");
       assert.equal(
         rejectCandidate(db, config, { id, scope: "personal/default", token: rev.token, idempotencyKey: "h-rj-1", reasonCode: "NOPE" }).code,
@@ -189,7 +189,7 @@ describe("T2 candidates + human approval", () => {
     try {
       const c = createCandidate(db, config, createParams("expiring", { ttlSec: 60 }), "k-ex-1");
       const id = (c.data as { candidate: { id: string } }).candidate.id as string;
-      const rev = getCandidateForReview(db, id, "personal/default");
+      const rev = getCandidateForReview(db, config, id, "personal/default");
       if (!rev.ok) throw new Error("review failed");
       db.prepare(`UPDATE candidates SET expiresAt='2020-01-01T00:00:00.000Z' WHERE id=?`).run(id);
       assert.equal(
@@ -255,7 +255,7 @@ describe("T2 candidates + human approval", () => {
     try {
       const c = createCandidate(db, config, createParams("tty guard"), "k-tty-1");
       const id = (c.data as { candidate: { id: string } }).candidate.id as string;
-      const rev = getCandidateForReview(db, id, "personal/default");
+      const rev = getCandidateForReview(db, config, id, "personal/default");
       if (!rev.ok) throw new Error("review failed");
       // stdin is a pipe here (isTTY false), so the CLI must refuse approval.
       const r = spawnSync(

@@ -294,6 +294,22 @@ export function handleValidatedRequest(
   return applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
 }
 
+/** Post-commit policy: a known committed success (ok:true) is never replaced
+ * by TIMEOUT or a DB-close failure. Unknown-outcome cases (process killed
+ * before stdout, timeout before commit) keep idempotent replay via the
+ * caller's same key + params. Close errors never leak raw text. */
+export function preserveCommittedResult(
+  res: ResponseEnvelope,
+  timedOut: boolean,
+  closeFailed: boolean,
+  maxBytes: number,
+): ResponseEnvelope {
+  if (res.ok) return res;
+  if (timedOut) return applyResponseBudget(fail("TIMEOUT"), maxBytes);
+  if (closeFailed) return applyResponseBudget(fail("STORE_UNAVAILABLE"), maxBytes);
+  return res;
+}
+
 const HUMAN_SUBCOMMANDS = new Set(["review", "approve", "reject", "archive"]);
 
 function parseHumanArgs(argv: string[]): { sub: string; opts: Record<string, string> } | null {
@@ -411,7 +427,7 @@ async function runHuman(
     return;
   }
   if (sub === "review") {
-    const r = getCandidateForReview(db, id, scope);
+    const r = getCandidateForReview(db, config, id, scope);
     if (!r.ok) {
       // Metadata-only failure on stdout would risk confusion with the review
       // text; use the fixed JSON envelope so callers can branch safely.
@@ -648,19 +664,29 @@ async function main(): Promise<void> {
     }
   }
 
-  if (elapsed() > config.timeouts.cliMs) {
-    res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
-  }
+  const timedOut = elapsed() > config.timeouts.cliMs;
+  let closeFailed = false;
   try {
     db?.close();
   } catch {
-    res = applyResponseBudget(
-      fail("STORE_UNAVAILABLE"),
-      config.limits.responseMaxBytes,
-    );
+    // Fixed code only; never leaks the raw close error, and never
+    // replaces a known committed success below.
+    closeFailed = true;
   }
+  res = preserveCommittedResult(res, timedOut, closeFailed, config.limits.responseMaxBytes);
   process.stdout.write(JSON.stringify(res) + "\n");
   process.exit(0);
 }
 
-void main();
+// Entry guard: importing this module from tests must not run main().
+// Only the real CLI entry (argv[1] is cli.js) executes.
+function isCliEntry(): boolean {
+  try {
+    return (process.argv[1] ?? "").replace(/\\/g, "/").endsWith("src/cli.js") ||
+      (process.argv[1] ?? "").replace(/\\/g, "/").endsWith("dist/src/cli.js");
+  } catch {
+    return false;
+  }
+}
+
+if (isCliEntry()) void main();

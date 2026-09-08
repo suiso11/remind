@@ -35,9 +35,12 @@ cp memory.config.example.json memory.config.json  # local only, git-ignored
 echo '{"v":1,"op":"record.recall","params":{}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 Status (honest, verified): `npm test` builds with `tsc` and runs
-`node:test` over `dist/tests/` — **32 tests pass, 1 skipped** (config
+`node:test` over `dist/tests/` — **36 tests pass, 1 skipped** (config
 strictness, envelopes/bounds, CLI smoke, hardened stdin subprocess suite,
-T2 candidates/approval/idempotency/scope/TTY-guard suite; the single skip
+T2 candidates/approval/idempotency/scope/TTY-guard suite, plus 4 T2 review
+regressions: revoked-scope review denial, pre-commit response-budget
+fail-closed with no orphans, exact Unicode `White_Space` BOM handling, and
+committed-success preservation over TIMEOUT/close failure; the single skip
 is the manual real-TTY interactive confirmation, exercised by hand only).
 `npm run smoke` walks valid/unknown/human-op envelopes in a temp dir.
 T3-T6 domain work (records/recall/corrections/archive, retention docs,
@@ -75,6 +78,10 @@ fake adapter, A1-A13) is explicitly out of scope for T2.
   `BAD_REQUEST`; `candidate.create`/`candidate.get` execute against the
   store (T2); `record.recall`/`record.correct-request` return
   `NOT_IMPLEMENTED` (honest T3-T4 deferral) until T3-T4.
+- Review discloses only for authorized scopes (startup config AND `scopes`
+  table); over-budget create/approve/reject fail closed with no orphan
+  rows; a known committed `ok:true` is never replaced by `TIMEOUT` or a
+  close failure (unknown outcomes keep idempotent replay).
 
 ## Layout
 

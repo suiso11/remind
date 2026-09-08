@@ -365,3 +365,12 @@
 - **T1 実装範囲:** CLI 封筒・固定エラーコード・起動時 config 検証・`scopes` 初期投入・有界（要求 32768B / `responseMaxBytes`）のみ。`candidate.*` / `record.*` ドメインは未実装であり、妥当な自動化封筒には `ok:false, code:NOT_IMPLEMENTED`（一時的 T1 専用状態・固定文言・応答予算適用）を返す。`ok:true` の偽装はしない（T2–T4 で対応）。stdin は LF フレーム単位の有界非同期読取とし、EOF 待機なし・raw 上限の事前適用・`cliMs` 期限・UTF-8 fatal 検証を行う。stderr（起動/config/DB/入力系）は固定文言のみで引数・設定内容・例外文を出さない。
 - **テスト:** `npm test`（tsc + node:test、23 件合格）— config 厳格検証・封筒/`BAD_REQUEST`・有界/`LIMIT_EXCEEDED`・人手 op の `FORBIDDEN`・未実装ドメインの `NOT_IMPLEMENTED`・CLI smoke（scopes seed・起動失敗の非ゼロ終了・stdout 無出力）・有界 stdin サブプロセス群（改行なし超過・開放パイプ期限・不正 UTF-8・EOF なし LF 応答・秘密非露出・複数行 `BAD_REQUEST`）。
 - **未解決のまま:** Companion 連携契約（U11）を含む U1–U11 の正式決定、A1–A13 受入（T6）、T2–T6 ドメイン。本文書の実装・テスト済み主張は T1 範囲に限定し、§1–§13 の planning-only 位置づけを維持する。
+
+## 16. 採用記録（ユーザ承認済み・T2 時点）
+
+- **承認 (approved):** §14 のうち T2 範囲（`candidate.create/get` + 人手 `review/approve/reject` + 全 field bind token・期限・呼出者指定冪等キー・単一トランザクション・本文なし監査）の採用。実装リポジトリ = 本ディレクトリ（remind）を維持し、Companion 変更なし（U11 未解決のまま）。
+- **pin（T2 時点・変更なし）:** Node.js v24.12.0 / npm 11.6.2 / `engines >=24.12.0 <25` / TypeScript 5.9.3 / SQLite は Node 組込 `node:sqlite`（runtime 依存ゼロ）。T1 の記録を維持する。
+- **T2 実装範囲:** `candidates` 永続化（`supersedes` 列は保持するが T4 振る舞いは `NOT_IMPLEMENTED` で正直に延期）+ `candidate.create/get`（本文は返さない。`candidate.get` は `{id, scope}` 必須で scope 照合）+ 人手 `review/approve/reject`（TTY 必須・`yes` 対話確認・`--confirm` 系省略不可）。`record.recall` / `record.correct-request` / `archive` は未実装のまま `NOT_IMPLEMENTED`（自動化 JSON）/`FORBIDDEN`（人手専用 op の JSON 経由）で正直に応答し、`ok:true` の偽装はしない（T3–T4 で対応）。
+- **T2 レビュー修正（777fdb1 以降・本節のみ）:** (a) 人手 `review` は開示前に起動時 config AND `scopes` 表で scope 認可を検査し、失効 scope は `FORBIDDEN_SCOPE` で本文・トークンを出さない。(b) `create/approve/reject` は応答予算の超過をコミット前に判定し、超過時は行・`operations`・監査を残さず `LIMIT_EXCEEDED` で fail closed とする（孤児候補・変異付き失敗キャッシュを作らない）。(c) 正規化の空白判定は厳密な Unicode `White_Space`（`\p{White_Space}`）とし、JS `\s` が含む U+FEFF (BOM) を空白とみなさない。(d) 確定済み成功応答（`ok:true`）は後段の TIMEOUT・DB close 失敗で置換しない（固定コードのみ、原文漏洩なし）。未知結果（kill・応答喪失）は従来通り同一キー再送の冪等 replay で解決する。(e) `approve` の `records` 挿入は `candidateId=承認対象候補id` を確認済みであり、重複修正は行わない。
+- **テスト:** `npm test`（tsc + node:test、**36 件合格・1 件 skip**）— T1 一式 + T2 候補/承認/冪等/scope/TTY ガード + 本節の回帰 4 件（失効 scope レビュー拒否・予算超過の無孤児・BOM 非空白・確定成功の保存）。唯一の skip は実 TTY 対話確認（手動のみ、自動化不可）。`npm run smoke` は有効/未知/人手 op 封筒の手動 walkthrough に成功。T3–T6 ドメイン作業（records/recall・訂正/archive・保持文書・fake adapter・A1–A13）は T2 の範囲外であり、本節は T3+ の実装・受入を主張しない。
+- **未解決のまま:** U1–U11（U11 連携契約を含む）の正式決定、A1–A13 受入（T6）、T3–T6 ドメイン。本文書の実装済み主張は T1–T2 範囲に限定し、§1–§13 の planning-only 位置づけを維持する。

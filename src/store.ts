@@ -256,6 +256,11 @@ function budgeted(res: ResponseEnvelope, config: AppConfig): ResponseEnvelope {
   return applyResponseBudget(res, config.limits.responseMaxBytes);
 }
 
+/** Pre-commit budget gate: success envelopes must fit before any mutation commits. */
+function successFits(res: ResponseEnvelope, maxBytes: number): boolean {
+  return Buffer.byteLength(JSON.stringify(res), "utf8") <= maxBytes;
+}
+
 function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -439,6 +444,12 @@ export function createCandidate(
 
   try {
     const response = withTransaction(db, (): ResponseEnvelope => {
+      // Budget gate BEFORE any insert: an over-budget success must not
+      // leave an orphan candidate row or a cached failure with mutation.
+      const probe: ResponseEnvelope = ok({
+        candidate: { id, bodyHash: n.bodyHash, status: "candidate", expiresAt },
+      });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
         `INSERT INTO candidates(id, body, bodyHash, kind, source, observedAt, scope, supersedes, status, idempotencyKey, requestHash, createdAt, expiresAt)
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'candidate', ?, ?, ?, ?)`,
@@ -475,6 +486,7 @@ export function createCandidate(
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     // Unique-key collision on the idempotency key means a concurrent commit
     // won the race: re-read and replay deterministically.
     if (/UNIQUE constraint failed: operations/.test(msg)) {
@@ -549,6 +561,7 @@ export function getCandidateMeta(
 /** Human review read model (TTY path + direct-call tests). No body leak outside TTY. */
 export function getCandidateForReview(
   db: DatabaseSync,
+  config: AppConfig,
   id: string,
   scope: string,
 ): { ok: true; row: CandidateRow; tags: string[]; link: string | null; token: string } | { ok: false; code: "BAD_REQUEST" | "FORBIDDEN_SCOPE" | "NOT_FOUND" | "STORE_UNAVAILABLE" } {
@@ -556,6 +569,9 @@ export function getCandidateForReview(
   if (typeof scope !== "string" || countCp(scope) < 1 || countCp(scope) > 256 || hasControl(scope)) {
     return { ok: false, code: "BAD_REQUEST" };
   }
+  // Authorize BEFORE disclosing the full body/token: a revoked scope
+  // (removed from startup config or the scopes table) must not review.
+  if (!isScopeAuthorized(db, config, scope)) return { ok: false, code: "FORBIDDEN_SCOPE" };
   let row: CandidateRow | null;
   try {
     row = readCandidate(db, id);
@@ -659,6 +675,10 @@ export function approveCandidate(
       if (!safeEqual(args.token, tokenForStored(fresh, readTags(db, args.id), readLink(db, args.id)))) {
         throw new Error("token moved");
       }
+      // Budget gate BEFORE any insert: no orphan record / candidate mutation
+      // on an over-budget success.
+      const probe: ResponseEnvelope = ok({ record: { id: recId } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
         `INSERT INTO records(id, candidateId, body, bodyHash, kind, source, observedAt, scope, status, supersedes, createdAt)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?)`,
@@ -697,6 +717,7 @@ export function approveCandidate(
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       const again = readOperation(db, args.idempotencyKey);
       if (again && again.op === "approve" && again.requestHash === reqHash) {
@@ -778,6 +799,8 @@ export function rejectCandidate(
       if (!safeEqual(args.token, tokenForStored(fresh, readTags(db, args.id), readLink(db, args.id)))) {
         throw new Error("token moved");
       }
+      const probe: ResponseEnvelope = ok({ candidate: { id: args.id, status: "rejected" } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(`UPDATE candidates SET status='rejected' WHERE id=? AND status='candidate'`).run(args.id);
       const res: ResponseEnvelope = ok({ candidate: { id: args.id, status: "rejected" } });
       const stored = budgeted(res, config);
@@ -805,6 +828,7 @@ export function rejectCandidate(
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       const again = readOperation(db, args.idempotencyKey);
       if (again && again.op === "reject" && again.requestHash === reqHash) {
