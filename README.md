@@ -1,14 +1,17 @@
-# remind-memory-cli (T1 foundation, hardened)
+# remind-memory-cli (T2 candidates + approval, hardened)
 
 Local external-long-term-memory CLI foundation. Planning source: `plan.md`
-section 14 (MVP proposal). **T1 implements only the runnable foundation**
+section 14 (MVP proposal). **T1** delivered the runnable foundation
 (boot, strict config, JSON envelopes, SQLite `scopes` init, protocol bound
-tests). Domain operations (`candidate.*`, `record.*` tables, approvals,
-recall search, corrections) are **not implemented yet** (T2-T4). Valid
-automated envelopes honestly fail with `ok:false, code:NOT_IMPLEMENTED`,
-a **temporary T1-only status** (fixed code/message, budgeted like every
-other envelope). T2-T4 replace it with real domain results; T1 never
-returns `ok:true` for unimplemented domain ops.
+tests). **T2** adds candidates + human review/approve/reject
+(`candidate.create` / `candidate.get` over JSON; `review` / `approve` /
+`reject` on the human TTY path; approval-token binding; idempotent writes;
+metadata-only audit). Remaining domain operations (`record.recall`,
+`record.correct-request`, `archive`) are **not implemented yet** (T3-T4).
+Valid automated envelopes for those honestly fail with `ok:false,
+code:NOT_IMPLEMENTED`, a temporary status (fixed code/message, budgeted
+like every other envelope). T3-T4 replace it with real domain results; this
+CLI never returns `ok:true` for unimplemented domain ops.
 
 Companion integration is unresolved (plan.md U11); this repo changes nothing
 in Companion.
@@ -32,11 +35,20 @@ cp memory.config.example.json memory.config.json  # local only, git-ignored
 echo '{"v":1,"op":"record.recall","params":{}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 Status (honest, verified): `npm test` builds with `tsc` and runs
-`node:test` over `dist/tests/` — **22 tests pass** (config strictness,
-envelopes/bounds, CLI smoke, hardened stdin subprocess suite). `npm run
-smoke` walks valid/unknown/human-op envelopes in a temp dir. T2-T6 domain
-work (candidates/records/recall/corrections, A1-A13) is explicitly out of
-scope for T1.
+`node:test` over `dist/tests/` — **52 tests pass, 1 skipped** (config
+strictness, envelopes/bounds, CLI smoke, hardened stdin subprocess suite,
+T2 candidates/approval/idempotency/scope/TTY-guard suite, plus 4 T2 review
+regressions: revoked-scope review denial, pre-commit response-budget
+fail-closed with no orphans, exact Unicode `White_Space` BOM handling, and
+committed-success preservation over TIMEOUT/close failure; plus 16 PR1
+review regressions: stdout-TTY disclosure gate with piped-stdout subprocess,
+fail-closed candidate tag/link metadata at public boundaries, transactional
+pre-commit dbMaxBytes rollback for create/approve/reject, WAL-reserve and
+fail-closed measurement/SHM-bound edge cases; the single skip
+is the manual real-TTY interactive confirmation, exercised by hand only).
+`npm run smoke` walks valid/unknown/human-op envelopes in a temp dir.
+T3-T6 domain work (records/recall/corrections/archive, retention docs,
+fake adapter, A1-A13) is explicitly out of scope for T2.
 
 ## Interface
 
@@ -67,22 +79,38 @@ scope for T1.
   `LIMIT_EXCEEDED`/`TIMEOUT`/`STORE_UNAVAILABLE`): over-budget responses
   become fail-closed `LIMIT_EXCEEDED`, never truncated.
 - Human-only ops over JSON return `FORBIDDEN`; unknown ops return
-  `BAD_REQUEST`; valid automated ops return `NOT_IMPLEMENTED` (T1-only,
-  honest failure) until T2-T4.
+  `BAD_REQUEST`; `candidate.create`/`candidate.get` execute against the
+  store (T2); `record.recall`/`record.correct-request` return
+  `NOT_IMPLEMENTED` (honest T3-T4 deferral) until T3-T4.
+- Review discloses only for authorized scopes (startup config AND `scopes`
+  table) and only when BOTH stdin and stdout are TTYs (stdout redirect/pipe
+  refuses with no body/token); over-budget create/approve/reject fail closed
+  with no orphan rows; crossing `dbMaxBytes` (conservative WAL/SHM-reserve
+  pre-commit bound, fail-closed measurement) rolls back create/approve/reject
+  with `STORE_UNAVAILABLE`; candidate tag/link read failures answer
+  `STORE_UNAVAILABLE`, never fabricated empty metadata; a known committed
+  `ok:true` is never replaced by `TIMEOUT` or a close failure (unknown
+  outcomes keep idempotent replay).
 
 ## Layout
 
 - `src/config.ts` — strict startup config load/validate
 - `src/protocol.ts` — envelopes, fixed codes/messages, bounds
-- `src/db.ts` — SQLite open + `scopes` seed (T2-T4 tables go here)
-- `src/cli.ts` — CLI entry (`--config`, bounded LF-framed stdin, stdout line)
-- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess)
+- `src/db.ts` — SQLite open + `scopes` seed + T2 domain tables
+- `src/normalize.ts` — T2 exact normalization (NFKC/trim/collapse/ASCII
+  fold), canonical times/hashes, approval-token binding, TTY escaping
+- `src/store.ts` — T2 candidates + review/approve/reject + idempotency +
+  metadata-only audit (recall/correct/archive honestly deferred to T3-T4)
+- `src/cli.ts` — CLI entry (`--config`, bounded LF-framed stdin, stdout line;
+  `candidate.create/get` routed to the store, human `review/approve/reject`
+  subcommands with TTY + `yes` confirmation)
+- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess/T2)
 - `memory.config.example.json` — fake scope (`personal/default`) only
 
 ## Roadmap (plan.md 14.12)
 
 - [x] T1: this foundation
-- [ ] T2: candidates + review/approve/reject
+- [x] T2: candidates + review/approve/reject
 - [ ] T3: records + deterministic recall + exposure audit
 - [ ] T4: correct-request/archive
 - [ ] T5: retention documentation (no export/delete in MVP)
