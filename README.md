@@ -1,4 +1,4 @@
-# remind-memory-cli (T2 candidates + approval, hardened)
+# remind-memory-cli (T3 deterministic recall, hardened)
 
 Local external-long-term-memory CLI foundation. Planning source: `plan.md`
 section 14 (MVP proposal). **T1** delivered the runnable foundation
@@ -6,11 +6,15 @@ section 14 (MVP proposal). **T1** delivered the runnable foundation
 tests). **T2** adds candidates + human review/approve/reject
 (`candidate.create` / `candidate.get` over JSON; `review` / `approve` /
 `reject` on the human TTY path; approval-token binding; idempotent writes;
-metadata-only audit). Remaining domain operations (`record.recall`,
-`record.correct-request`, `archive`) are **not implemented yet** (T3-T4).
+metadata-only audit). **T3** adds deterministic `record.recall` atop
+approved records only (literal normalization, tag-ALL/link/time filters,
+fixed `createdAt DESC, id ASC` order, bounded prefix snippets, full-response
+budget, per-recall `recallId` with metadata-only `audit` + `exposures` rows
+in one fail-closed transaction). Remaining domain operations
+(`record.correct-request`, `archive`) are **not implemented yet** (T4).
 Valid automated envelopes for those honestly fail with `ok:false,
 code:NOT_IMPLEMENTED`, a temporary status (fixed code/message, budgeted
-like every other envelope). T3-T4 replace it with real domain results; this
+like every other envelope). T4 replaces it with real domain results; this
 CLI never returns `ok:true` for unimplemented domain ops.
 
 Companion integration is unresolved (plan.md U11); this repo changes nothing
@@ -32,19 +36,24 @@ npm ci
 npm test        # build (tsc) + unit/smoke tests over dist/
 npm run smoke   # manual CLI envelope walkthrough in a temp dir
 cp memory.config.example.json memory.config.json  # local only, git-ignored
-echo '{"v":1,"op":"record.recall","params":{}}' | node dist/src/cli.js --config ./memory.config.json
+echo '{"v":1,"op":"record.recall","params":{"query":"booking","scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 Status (honest, verified): `npm test` builds with `tsc` and runs
-`node:test` over `dist/tests/` — **36 tests pass, 1 skipped** (config
+`node:test` over `dist/tests/` — **46 tests pass, 1 skipped** (config
 strictness, envelopes/bounds, CLI smoke, hardened stdin subprocess suite,
-T2 candidates/approval/idempotency/scope/TTY-guard suite, plus 4 T2 review
-regressions: revoked-scope review denial, pre-commit response-budget
-fail-closed with no orphans, exact Unicode `White_Space` BOM handling, and
-committed-success preservation over TIMEOUT/close failure; the single skip
-is the manual real-TTY interactive confirmation, exercised by hand only).
-`npm run smoke` walks valid/unknown/human-op envelopes in a temp dir.
-T3-T6 domain work (records/recall/corrections/archive, retention docs,
-fake adapter, A1-A13) is explicitly out of scope for T2.
+T2 candidates/approval/idempotency/scope/TTY-guard suite, 4 T2 review
+regressions, plus 10 T3 recall regressions: approval-only/active-scope
+filtering with revoked scope, literal normalization (`%_` quotes, no
+wildcards), tag-ALL/link/time/order/ties/limits, Unicode codepoint
+truncation with exact byte accounting, empty-recall audit, query absence in
+audit/errors, recall-ID uniqueness with per-item exposures, forced audit
+failure rollback, budget-overflow with no exposures, CLI end-to-end over
+persistent seeded SQLite; the single skip is the manual real-TTY
+interactive confirmation, exercised by hand only).
+`npm run smoke` walks a strict valid recall / unknown / human-op envelopes
+in a temp dir (recall returns `ok:true` with empty items on the fresh DB).
+T4-T6 domain work (corrections/archive, retention docs,
+fake adapter, A1-A13) is explicitly out of scope for T3.
 
 ## Interface
 
@@ -75,9 +84,9 @@ fake adapter, A1-A13) is explicitly out of scope for T2.
   `LIMIT_EXCEEDED`/`TIMEOUT`/`STORE_UNAVAILABLE`): over-budget responses
   become fail-closed `LIMIT_EXCEEDED`, never truncated.
 - Human-only ops over JSON return `FORBIDDEN`; unknown ops return
-  `BAD_REQUEST`; `candidate.create`/`candidate.get` execute against the
-  store (T2); `record.recall`/`record.correct-request` return
-  `NOT_IMPLEMENTED` (honest T3-T4 deferral) until T3-T4.
+  `BAD_REQUEST`; `candidate.create`/`candidate.get`/`record.recall` execute
+  against the store (T2-T3); `record.correct-request` returns
+  `NOT_IMPLEMENTED` (honest T4 deferral) until T4.
 - Review discloses only for authorized scopes (startup config AND `scopes`
   table); over-budget create/approve/reject fail closed with no orphan
   rows; a known committed `ok:true` is never replaced by `TIMEOUT` or a
@@ -91,18 +100,21 @@ fake adapter, A1-A13) is explicitly out of scope for T2.
 - `src/normalize.ts` — T2 exact normalization (NFKC/trim/collapse/ASCII
   fold), canonical times/hashes, approval-token binding, TTY escaping
 - `src/store.ts` — T2 candidates + review/approve/reject + idempotency +
-  metadata-only audit (recall/correct/archive honestly deferred to T3-T4)
+  metadata-only audit, plus T3 `record.recall` (strict params, literal
+  normalized match, tag-ALL/link/time filters, fixed order, bounded
+  snippets, full-budget gate, single-transaction audit/exposures;
+  correct/archive honestly deferred to T4)
 - `src/cli.ts` — CLI entry (`--config`, bounded LF-framed stdin, stdout line;
   `candidate.create/get` routed to the store, human `review/approve/reject`
   subcommands with TTY + `yes` confirmation)
-- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess/T2)
+- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess/T2/T3)
 - `memory.config.example.json` — fake scope (`personal/default`) only
 
 ## Roadmap (plan.md 14.12)
 
 - [x] T1: this foundation
 - [x] T2: candidates + review/approve/reject
-- [ ] T3: records + deterministic recall + exposure audit
+- [x] T3: records + deterministic recall + exposure audit
 - [ ] T4: correct-request/archive
 - [ ] T5: retention documentation (no export/delete in MVP)
 - [ ] T6: fake adapter + A1-A13 acceptance
