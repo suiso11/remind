@@ -35,12 +35,16 @@ cp memory.config.example.json memory.config.json  # local only, git-ignored
 echo '{"v":1,"op":"record.recall","params":{}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 Status (honest, verified): `npm test` builds with `tsc` and runs
-`node:test` over `dist/tests/` — **36 tests pass, 1 skipped** (config
+`node:test` over `dist/tests/` — **52 tests pass, 1 skipped** (config
 strictness, envelopes/bounds, CLI smoke, hardened stdin subprocess suite,
 T2 candidates/approval/idempotency/scope/TTY-guard suite, plus 4 T2 review
 regressions: revoked-scope review denial, pre-commit response-budget
 fail-closed with no orphans, exact Unicode `White_Space` BOM handling, and
-committed-success preservation over TIMEOUT/close failure; the single skip
+committed-success preservation over TIMEOUT/close failure; plus 16 PR1
+review regressions: stdout-TTY disclosure gate with piped-stdout subprocess,
+fail-closed candidate tag/link metadata at public boundaries, transactional
+pre-commit dbMaxBytes rollback for create/approve/reject, WAL-reserve and
+fail-closed measurement/SHM-bound edge cases; the single skip
 is the manual real-TTY interactive confirmation, exercised by hand only).
 `npm run smoke` walks valid/unknown/human-op envelopes in a temp dir.
 T3-T6 domain work (records/recall/corrections/archive, retention docs,
@@ -79,9 +83,14 @@ fake adapter, A1-A13) is explicitly out of scope for T2.
   store (T2); `record.recall`/`record.correct-request` return
   `NOT_IMPLEMENTED` (honest T3-T4 deferral) until T3-T4.
 - Review discloses only for authorized scopes (startup config AND `scopes`
-  table); over-budget create/approve/reject fail closed with no orphan
-  rows; a known committed `ok:true` is never replaced by `TIMEOUT` or a
-  close failure (unknown outcomes keep idempotent replay).
+  table) and only when BOTH stdin and stdout are TTYs (stdout redirect/pipe
+  refuses with no body/token); over-budget create/approve/reject fail closed
+  with no orphan rows; crossing `dbMaxBytes` (conservative WAL/SHM-reserve
+  pre-commit bound, fail-closed measurement) rolls back create/approve/reject
+  with `STORE_UNAVAILABLE`; candidate tag/link read failures answer
+  `STORE_UNAVAILABLE`, never fabricated empty metadata; a known committed
+  `ok:true` is never replaced by `TIMEOUT` or a close failure (unknown
+  outcomes keep idempotent replay).
 
 ## Layout
 

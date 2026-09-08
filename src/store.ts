@@ -17,6 +17,7 @@
  *   FORBIDDEN-over-JSON exactly as before (T3-T4 own them).
  */
 import { randomBytes } from "node:crypto";
+import * as fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import {
@@ -330,22 +331,22 @@ export function readCandidate(db: DatabaseSync, id: string): CandidateRow | null
   }
 }
 
+/**
+ * Candidate metadata reads. These THROW on query failure (corruption,
+ * incompatible pre-existing table, I/O error) so every public boundary
+ * answers STORE_UNAVAILABLE. They must never substitute an empty tag list
+ * / null link: that would report incomplete metadata as success and, worse,
+ * bind the approval token to the wrong tag/link set and commit tag-less
+ * records. Callers catch the throw and fail closed.
+ */
 function readTags(db: DatabaseSync, candidateId: string): string[] {
-  try {
-    const rows = db.prepare(`SELECT tag FROM candidate_tags WHERE candidateId = ? ORDER BY tag ASC`).all(candidateId) as Array<{ tag: string }>;
-    return rows.map((r) => r.tag);
-  } catch {
-    return [];
-  }
+  const rows = db.prepare(`SELECT tag FROM candidate_tags WHERE candidateId = ? ORDER BY tag ASC`).all(candidateId) as Array<{ tag: string }>;
+  return rows.map((r) => r.tag);
 }
 
 function readLink(db: DatabaseSync, fromId: string): string | null {
-  try {
-    const row = db.prepare(`SELECT toName FROM candidate_links WHERE fromId = ?`).get(fromId) as { toName: string } | undefined;
-    return row ? row.toName : null;
-  } catch {
-    return null;
-  }
+  const row = db.prepare(`SELECT toName FROM candidate_links WHERE fromId = ?`).get(fromId) as { toName: string } | undefined;
+  return row ? row.toName : null;
 }
 
 export function tokenForStored(
@@ -444,6 +445,9 @@ export function createCandidate(
 
   try {
     const response = withTransaction(db, (): ResponseEnvelope => {
+      // Entry gate (cheap reject when already over cap; fail closed when
+      // the footprint cannot be measured).
+      if (isDbOverCap(db, config)) throw new Error("db over cap");
       // Budget gate BEFORE any insert: an over-budget success must not
       // leave an orphan candidate row or a cached failure with mutation.
       const probe: ResponseEnvelope = ok({
@@ -481,11 +485,17 @@ export function createCandidate(
         token: null,
         reasonCode: null,
       });
+      // Pre-commit cap: conservative WAL-reserve bound re-measured after
+      // the writes (page_count already reflects allocations). Crossing
+      // rolls back here (STORE_UNAVAILABLE) instead of leaving an
+      // oversized database.
+      assertDbUnderCap(db, config);
       return stored;
     });
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     // Unique-key collision on the idempotency key means a concurrent commit
     // won the race: re-read and replay deterministically.
@@ -537,8 +547,16 @@ export function getCandidateMeta(
       return budgeted(fail("STORE_UNAVAILABLE"), config);
     }
   }
-  const tags = readTags(db, id);
-  const link = readLink(db, id);
+  // Metadata query failure is STORE_UNAVAILABLE, never a fabricated
+  // empty tag list / null link (readTags/readLink throw on failure).
+  let tags: string[];
+  let link: string | null;
+  try {
+    tags = readTags(db, id);
+    link = readLink(db, id);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
   return budgeted(
     ok({
       candidate: {
@@ -580,9 +598,15 @@ export function getCandidateForReview(
   }
   if (!row) return { ok: false, code: "NOT_FOUND" };
   if (row.scope !== scope) return { ok: false, code: "FORBIDDEN_SCOPE" };
-  const tags = readTags(db, id);
-  const link = readLink(db, id);
-  return { ok: true, row, tags, link, token: tokenForStored(row, tags, link) };
+  // Metadata query failure must not disclose a row with fabricated
+  // empty tags / null link (and a token bound to that wrong set).
+  try {
+    const tags = readTags(db, id);
+    const link = readLink(db, id);
+    return { ok: true, row, tags, link, token: tokenForStored(row, tags, link) };
+  } catch {
+    return { ok: false, code: "STORE_UNAVAILABLE" };
+  }
 }
 
 function lazyExpire(db: DatabaseSync, id: string): void {
@@ -600,6 +624,183 @@ function currentApprover(): string {
   } catch {
     return "terminal-user";
   }
+}
+
+/**
+ * DB cap gate (dbMaxBytes). Committed size = max(logical, physical):
+ * - Logical: PRAGMA page_count * page_size of the main image (includes
+ *   freelist pages, so conservative; also the only signal for :memory:
+ *   databases, which have no file path).
+ * - Physical: filesystem bytes of the main file + WAL (-wal) + SHM (-shm)
+ *   sidecars. In WAL mode uncheckpointed COMMITTED writes live in -wal, so
+ *   the file sum is what actually grows; the logical view alone would miss
+ *   it. Summing logical + physical would double-count the main image,
+ *   hence max(), not the sum.
+ * - Pre-commit bound (proven conservative, no value-byte heuristic).
+ *   Small writes fitting a free page move neither page_count nor -wal
+ *   pre-commit, yet COMMIT appends at least one WAL frame (page image +
+ *   24-byte frame header + 32-byte WAL header). The gate hence reserves
+ *   commit-time WAL growth explicitly. SQLite WAL format constants
+ *   (documented file format): frame header 24 bytes, WAL header 32 bytes,
+ *   wal-index (SHM) grows in 32KiB blocks (NOT a 32768-byte global
+ *   maximum). Each 32KiB wal-index block covers at most 4096 frames (the
+ *   first block holds slightly fewer usable entries, ~4062, because of its
+ *   header). Dividing the projected frame count by 4000 (< 4062) therefore
+ *   overestimates the block count, and one extra block covers the header
+ *   shortfall plus the empty-WAL case; the result is a conservative upper
+ *   bound on post-commit SHM size, not an exact size. After the writes,
+ *   inside the transaction, re-read pc = page_count, the current WAL size,
+ *   and the physical files, then require
+ *   max(pc * ps, phys) + pc * (ps + 24) + 32 + shmGrowth <= cap, where
+ *   shmGrowth = max(0, neededShm - currentShmBytes) and neededShm =
+ *   (ceil(projectedFrames / 4000) + 1) * 32768 with projectedFrames =
+ *   existingFrames + pc and existingFrames =
+ *   ceil(max(0, walSize - 32) / (ps + 24)). COMMIT can append at most one
+ *   WAL frame per database page (dirty + newly allocated pages are all
+ *   within the observed pc), each frame at most ps + 24 bytes, plus at most
+ *   one 32-byte WAL header, plus SHM growth to the multi-block bound above.
+ *   This over-reserves (up to ~one full extra database image plus SHM
+ *   blocks) by design: a committed database can never exceed the cap under
+ *   the supported WAL assumptions, at the cost of requiring roughly one
+ *   image of headroom for any write.
+ * - Fail-closed measurement: any unreadable PRAGMA / malformed database_list
+ *   / non-ENOENT stat throws, the entry gate treats it as over cap, and the
+ *   pre-commit gate throws "db over cap"; callers answer STORE_UNAVAILABLE.
+ *   Only ENOENT on a -wal/-shm sidecar is tolerated (missing sidecar = 0).
+ *   Nothing is admitted on a failed measurement.
+ */
+export const WAL_FRAME_HEADER_BYTES = 24;
+export const WAL_HEADER_BYTES = 32;
+export const WAL_INDEX_BLOCK_BYTES = 32768;
+/** Conservative divisor: real blocks cover <=4096 frames (first ~4062). */
+export const WAL_INDEX_FRAMES_PER_BLOCK_CONSERVATIVE = 4000;
+
+/** True only for ENOENT stat failures (missing sidecar). All else is fatal. */
+export function isEnoentStatError(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { code?: unknown }).code === "ENOENT";
+}
+
+function statSizeOrThrow(p: string): number {
+  const s = fs.statSync(p).size;
+  if (!Number.isSafeInteger(s) || s < 0) throw new Error("db measure failed");
+  return s;
+}
+
+function sidecarSizeOrThrow(p: string): number {
+  try {
+    return statSizeOrThrow(p);
+  } catch (e) {
+    if (isEnoentStatError(e)) return 0;
+    throw e;
+  }
+}
+
+/**
+ * Conservative post-commit SHM size minus already-counted SHM (growth only).
+ * Multi-block wal-index bound: see the gate comment above.
+ */
+export function shmGrowthBound(args: {
+  walSize: number;
+  shmSize: number;
+  pageCount: number;
+  pageSize: number;
+}): number {
+  const { walSize, shmSize, pageCount, pageSize } = args;
+  if (
+    !Number.isSafeInteger(walSize) || walSize < 0 ||
+    !Number.isSafeInteger(shmSize) || shmSize < 0 ||
+    !Number.isSafeInteger(pageCount) || pageCount < 0 ||
+    !Number.isSafeInteger(pageSize) || pageSize <= 0
+  ) {
+    throw new Error("db measure failed");
+  }
+  const frameSize = pageSize + WAL_FRAME_HEADER_BYTES;
+  if (!Number.isSafeInteger(frameSize) || frameSize <= 0) throw new Error("db measure failed");
+  const existingFrames =
+    walSize <= WAL_HEADER_BYTES ? 0 : Math.ceil((walSize - WAL_HEADER_BYTES) / frameSize);
+  if (!Number.isSafeInteger(existingFrames) || existingFrames < 0) throw new Error("db measure failed");
+  const projected = existingFrames + pageCount;
+  if (!Number.isSafeInteger(projected) || projected < 0) throw new Error("db measure failed");
+  const neededBlocks =
+    Math.ceil(projected / WAL_INDEX_FRAMES_PER_BLOCK_CONSERVATIVE) + 1;
+  if (!Number.isSafeInteger(neededBlocks) || neededBlocks < 0) throw new Error("db measure failed");
+  const neededShm = neededBlocks * WAL_INDEX_BLOCK_BYTES;
+  if (!Number.isSafeInteger(neededShm) || neededShm < 0) throw new Error("db measure failed");
+  return Math.max(0, neededShm - shmSize);
+}
+
+export function measureFootprintOrThrow(db: DatabaseSync): {
+  footprint: number;
+  pageCount: number;
+  pageSize: number;
+  shmGrowth: number;
+} {
+  const pcRow = db.prepare(`PRAGMA page_count`).get() as { page_count: unknown } | undefined;
+  const psRow = db.prepare(`PRAGMA page_size`).get() as { page_size: unknown } | undefined;
+  const pc = pcRow?.page_count;
+  const ps = psRow?.page_size;
+  if (typeof pc !== "number" || typeof ps !== "number" || !Number.isSafeInteger(pc) || !Number.isSafeInteger(ps) || pc < 0 || ps <= 0) {
+    throw new Error("db measure failed");
+  }
+  const logical = pc * ps;
+  if (!Number.isSafeInteger(logical)) throw new Error("db measure failed");
+  const rows = db.prepare(`PRAGMA database_list`).all() as Array<{ name: string; file: unknown }>;
+  if (!Array.isArray(rows)) throw new Error("db measure failed");
+  const main = rows.find((r) => typeof r === "object" && r !== null && (r as { name: unknown }).name === "main") as
+    | { name: string; file: unknown }
+    | undefined;
+  if (!main) throw new Error("db measure failed");
+  const mainFile: unknown = main.file;
+  let physical = 0;
+  let walSize = 0;
+  let shmSize = 0;
+  if (mainFile === "") {
+    // :memory: database: no files; WAL/SHM sizes stay 0 (SHM growth bound
+    // below still reserves conservatively from pc).
+  } else if (typeof mainFile === "string" && mainFile.length > 0) {
+    // Main-file stat failure is fatal (fail closed); only ENOENT on a
+    // -wal/-shm sidecar means "missing sidecar = 0". Any other sidecar
+    // stat error (EACCES, ENOTDIR, EIO, ...) is rethrown fail-closed.
+    const mainSize = statSizeOrThrow(mainFile);
+    walSize = sidecarSizeOrThrow(mainFile + "-wal");
+    shmSize = sidecarSizeOrThrow(mainFile + "-shm");
+    physical = mainSize + walSize + shmSize;
+    if (!Number.isSafeInteger(physical) || physical < 0) throw new Error("db measure failed");
+  } else {
+    // Malformed/missing main entry (null, non-string, absent): fail closed
+    // rather than misclassifying a file DB as :memory:.
+    throw new Error("db measure failed");
+  }
+  const shmGrowth = shmGrowthBound({ walSize, shmSize, pageCount: pc, pageSize: ps });
+  return { footprint: Math.max(logical, physical), pageCount: pc, pageSize: ps, shmGrowth };
+}
+
+function isDbOverCap(db: DatabaseSync, config: AppConfig): boolean {
+  try {
+    return measureFootprintOrThrow(db).footprint > config.dbMaxBytes;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Pre-commit gate: call inside the transaction after all writes. Re-reads
+ * page_count / files (so allocations are observed) and enforces the
+ * conservative WAL-reserve bound. Throws "db over cap" on crossing AND on
+ * measurement failure (fail closed); withTransaction rolls everything back.
+ */
+function assertDbUnderCap(db: DatabaseSync, config: AppConfig): void {
+  let m: { footprint: number; pageCount: number; pageSize: number; shmGrowth: number };
+  try {
+    m = measureFootprintOrThrow(db);
+  } catch {
+    throw new Error("db over cap");
+  }
+  const reserve = m.pageCount * (m.pageSize + WAL_FRAME_HEADER_BYTES) + WAL_HEADER_BYTES + m.shmGrowth;
+  if (!Number.isSafeInteger(reserve) || !Number.isSafeInteger(m.footprint + reserve)) {
+    throw new Error("db over cap");
+  }
+  if (m.footprint + reserve > config.dbMaxBytes) throw new Error("db over cap");
 }
 
 /** Human approve (domain core; CLI adds TTY + yes-confirmation on top). */
@@ -659,15 +860,23 @@ export function approveCandidate(
   if (row.kind === "correction" || row.supersedes !== null) {
     return budgeted(fail("NOT_IMPLEMENTED"), config);
   }
-  const tags = readTags(db, args.id);
-  const link = readLink(db, args.id);
-  const expected = tokenForStored(row, tags, link);
+  // A metadata read failure here is STORE_UNAVAILABLE: binding the token
+  // against fabricated empty tags / null link could approve the wrong set.
+  let expected: string;
+  try {
+    expected = tokenForStored(row, readTags(db, args.id), readLink(db, args.id));
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
   if (!safeEqual(args.token, expected)) return budgeted(fail("CONFLICT"), config);
 
   const approvedAt = nowOverride ?? nowIso();
   const recId = genId("rec");
   try {
     const response = withTransaction(db, (): ResponseEnvelope => {
+      // Entry gate (cheap reject when already over cap; fail closed when
+      // the footprint cannot be measured).
+      if (isDbOverCap(db, config)) throw new Error("db over cap");
       // Re-verify inside the transaction (fail closed on concurrent terminal move).
       const fresh = readCandidate(db, args.id);
       if (!fresh || fresh.status !== "candidate") throw new Error("state moved");
@@ -712,11 +921,16 @@ export function approveCandidate(
         token: args.token,
         reasonCode: null,
       });
+      // Pre-commit cap: conservative WAL-reserve bound re-measured after
+      // the writes. Crossing rolls back record + status flip
+      // (STORE_UNAVAILABLE).
+      assertDbUnderCap(db, config);
       return stored;
     });
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       const again = readOperation(db, args.idempotencyKey);
@@ -786,13 +1000,22 @@ export function rejectCandidate(
     lazyExpire(db, args.id);
     return budgeted(fail("EXPIRED"), config);
   }
-  const tags = readTags(db, args.id);
-  const link = readLink(db, args.id);
-  if (!safeEqual(args.token, tokenForStored(row, tags, link))) return budgeted(fail("CONFLICT"), config);
+  // Same fail-closed metadata rule as approve: never bind against
+  // fabricated empty tags / null link.
+  try {
+    if (!safeEqual(args.token, tokenForStored(row, readTags(db, args.id), readLink(db, args.id)))) {
+      return budgeted(fail("CONFLICT"), config);
+    }
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
 
   const now = nowOverride ?? nowIso();
   try {
     const response = withTransaction(db, (): ResponseEnvelope => {
+      // Entry gate (cheap reject when already over cap; fail closed when
+      // the footprint cannot be measured).
+      if (isDbOverCap(db, config)) throw new Error("db over cap");
       const fresh = readCandidate(db, args.id);
       if (!fresh || fresh.status !== "candidate") throw new Error("state moved");
       if (Date.parse(fresh.expiresAt) <= Date.now()) throw new Error("expired now");
@@ -823,11 +1046,15 @@ export function rejectCandidate(
         token: args.token,
         reasonCode: "USER_REJECTED",
       });
+      // Pre-commit cap: conservative WAL-reserve bound re-measured after
+      // the writes. Crossing rolls back the flip.
+      assertDbUnderCap(db, config);
       return stored;
     });
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       const again = readOperation(db, args.idempotencyKey);

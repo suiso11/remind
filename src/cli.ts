@@ -310,6 +310,17 @@ export function preserveCommittedResult(
   return res;
 }
 
+/**
+ * Terminal-disclosure gate for human ops. BOTH stdin and stdout must be
+ * TTYs: stdin alone is not enough, because `review ... > review.log` keeps
+ * stdin a TTY while the full candidate body + approval token land in a
+ * file/pipe. Explicit booleans keep this unit-testable (stdin true /
+ * stdout false must refuse); production passes the real isTTY flags.
+ */
+export function isHumanTty(stdinTty: boolean | undefined, stdoutTty: boolean | undefined): boolean {
+  return stdinTty === true && stdoutTty === true;
+}
+
 const HUMAN_SUBCOMMANDS = new Set(["review", "approve", "reject", "archive"]);
 
 function parseHumanArgs(argv: string[]): { sub: string; opts: Record<string, string> } | null {
@@ -412,11 +423,14 @@ async function runHuman(
     process.exit(0);
     return;
   }
-  // TTY is mandatory for every human op: no piped approval, no file capture
-  // of the review body via this path's assumptions. Non-TTY approve/reject
-  // get a machine-readable FORBIDDEN; review gets a fixed stderr + non-zero.
+  // TTY is mandatory on BOTH streams for every human op: no piped
+  // approval, and no file/pipe capture of the review body + approval token
+  // (a stdout redirect keeps stdin a TTY, so stdin alone cannot gate
+  // disclosure). Non-TTY approve/reject get a machine-readable FORBIDDEN;
+  // review gets a fixed stderr + non-zero. No body/token on any refusal.
   const stdinTty = !!process.stdin.isTTY;
-  if (!stdinTty) {
+  const stdoutTty = !!process.stdout.isTTY;
+  if (!isHumanTty(stdinTty, stdoutTty)) {
     if (sub === "review") {
       process.stderr.write("error: human operation requires tty\n");
       process.exit(2);
