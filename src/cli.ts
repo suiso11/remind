@@ -18,11 +18,18 @@
  * config aborts a never-ending stdin => TIMEOUT envelope. The store op then
  * runs on a worker thread bounded by the REMAINING cliMs: the SQLite busy
  * wait is clamped to min(busyMs, remaining) and an independent parent timer
- * terminates the worker on expiry => TIMEOUT with unknown commit outcome
- * (idempotent replay via the same key + params). A same-thread setTimeout
- * alone cannot interrupt synchronous SQLite; the worker boundary is what
- * makes the deadline effective. Line bytes are
+ * answers TIMEOUT on expiry (unknown commit outcome; idempotent replay via
+ * the same key + params) followed by whole-process exit. worker.terminate()
+ * is best-effort only and is NOT relied upon to unwind worker finally blocks
+ * or promptly interrupt native SQLite; the reliable bound is the parent's
+ * timely TIMEOUT plus OS process exit (which closes handles; SQLite recovery
+ * decides the commit outcome). A same-thread setTimeout
+ * alone cannot interrupt synchronous SQLite; the worker boundary plus the
+ * parent timer plus process exit is what makes the deadline effective. Line bytes are
  * decoded as UTF-8 with fatal:true; invalid bytes => BAD_REQUEST envelope.
+ *
+ * Final automated JSON uses fs.writeSync(1, line) before intentional exit so
+ * the bounded response is not truncated by an async stdout write.
  *
  * Errors: startup/config/db/input-path stderr carries FIXED codes only and
  * never echoes argv, config contents, or exception messages. All stdout
@@ -45,6 +52,7 @@ import {
 import { applyEffectiveBusyTimeout, initDb } from "./db.js";
 import { effectiveBusyMs, runStoreOpWithDeadline } from "./deadline.js";
 import { escapeForTerminal } from "./normalize.js";
+import * as fs from "node:fs";
 import {
   approveCandidate,
   createCandidate,
@@ -61,6 +69,24 @@ const STDERR_ARGS = "error: bad arguments\n";
 const STDERR_CONFIG = "error: invalid config\n";
 const STDERR_DB = "error: store unavailable\n";
 const STDERR_INPUT = "error: bad input\n";
+
+/**
+ * Reliable final JSON emit for the automated path: fs.writeSync(1, ...) the
+ * bounded envelope before the intentional process.exit(). process.stdout.write
+ * is async and may truncate when followed by exit(); the sync write keeps the
+ * bounded response intact. Never throws (best effort on broken pipes).
+ */
+function emitJsonLine(res: ResponseEnvelope): void {
+  try {
+    fs.writeSync(1, JSON.stringify(res) + "\n");
+  } catch {
+    try {
+      process.stdout.write(JSON.stringify(res) + "\n");
+    } catch {
+      /* ignore */
+    }
+  }
+}
 
 function usage(): string {
   return "usage: memory-cli --config <path>";
@@ -403,7 +429,7 @@ async function runHuman(
   const remaining = (): number => config.timeouts.cliMs - (Date.now() - started);
   const outJson = (res: ResponseEnvelope): void => {
     const capped = applyResponseBudget(res, config.limits.responseMaxBytes);
-    process.stdout.write(JSON.stringify(capped) + "\n");
+    emitJsonLine(capped);
   };
   if (opts["__bad"]) {
     outJson(fail("BAD_REQUEST"));
@@ -598,7 +624,7 @@ async function main(): Promise<void> {
         fail(timedOut ? "TIMEOUT" : "STORE_UNAVAILABLE"),
         config.limits.responseMaxBytes,
       );
-      process.stdout.write(JSON.stringify(res) + "\n");
+      emitJsonLine(res);
       process.exit(0);
       return;
     }
@@ -623,7 +649,7 @@ async function main(): Promise<void> {
       config.limits.responseMaxBytes,
     );
     closeDb();
-    process.stdout.write(JSON.stringify(res) + "\n");
+    emitJsonLine(res);
     process.exit(0);
     return;
   }
@@ -633,7 +659,7 @@ async function main(): Promise<void> {
       config.limits.responseMaxBytes,
     );
     closeDb();
-    process.stdout.write(JSON.stringify(res) + "\n");
+    emitJsonLine(res);
     process.exit(0);
     return;
   }
@@ -685,10 +711,14 @@ async function main(): Promise<void> {
             // bounds BOTH the SQLite busy wait (effectiveBusyMs clamp, so a
             // busyMs > cliMs config cannot block past the deadline) AND the
             // whole op via a worker thread with an independent parent timer
-            // (worker.terminate() interrupts a long scan; a same-thread
-            // setTimeout could not interrupt synchronous SQLite). A timed-out
-            // worker has UNKNOWN commit outcome: answer TIMEOUT and let the
-            // caller replay with the same idempotency key + params.
+            // followed by whole-process exit. worker.terminate() is
+            // best-effort only (no reliable finally unwind / native-SQLite
+            // interruption promised); a same-thread setTimeout could not
+            // interrupt synchronous SQLite. A timed-out op has UNKNOWN commit
+            // outcome (OS exit closes handles; SQLite recovery decides):
+            // answer TIMEOUT and let the caller replay with the same
+            // idempotency key + params. Worker construction/error/exit
+            // without a message answers STORE_UNAVAILABLE immediately.
             const opRemaining = remaining();
             if (opRemaining <= 0) {
               res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
@@ -739,7 +769,7 @@ async function main(): Promise<void> {
     closeFailed = true;
   }
   res = preserveCommittedResult(res, timedOut, closeFailed, config.limits.responseMaxBytes);
-  process.stdout.write(JSON.stringify(res) + "\n");
+  emitJsonLine(res);
   process.exit(0);
 }
 

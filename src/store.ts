@@ -321,14 +321,12 @@ interface StoredOp {
 }
 
 function readOperation(db: DatabaseSync, key: string): StoredOp | null {
-  try {
-    const row = db
-      .prepare(`SELECT op, requestHash, responseJson FROM operations WHERE idempotencyKey = ?`)
-      .get(key) as StoredOp | undefined;
-    return row ?? null;
-  } catch {
-    return null;
-  }
+  // Fail closed: DB I/O failures THROW so callers answer STORE_UNAVAILABLE.
+  // Never swallow to null (null means "no prior key", i.e. safe to insert).
+  const row = db
+    .prepare(`SELECT op, requestHash, responseJson FROM operations WHERE idempotencyKey = ?`)
+    .get(key) as StoredOp | undefined;
+  return row ?? null;
 }
 
 function replaySaved(savedJson: string, config: AppConfig): ResponseEnvelope {
@@ -535,7 +533,12 @@ export function createCandidate(
     // Unique-key collision on the idempotency key means a concurrent commit
     // won the race: re-read and replay deterministically.
     if (/UNIQUE constraint failed: operations/.test(msg)) {
-      const again = readOperation(db, idempotencyKey);
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
       if (again && again.op === "candidate.create" && again.requestHash === reqHash) {
         return replaySaved(again.responseJson, config);
       }
@@ -798,7 +801,12 @@ export function approveCandidate(
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
-      const again = readOperation(db, args.idempotencyKey);
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, args.idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
       if (again && again.op === "approve" && again.requestHash === reqHash) {
         return replaySaved(again.responseJson, config);
       }
@@ -922,7 +930,12 @@ export function rejectCandidate(
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
-      const again = readOperation(db, args.idempotencyKey);
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, args.idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
       if (again && again.op === "reject" && again.requestHash === reqHash) {
         return replaySaved(again.responseJson, config);
       }

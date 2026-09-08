@@ -1,11 +1,13 @@
 /**
  * Worker entry for P1 deadline enforcement (runs on the worker thread).
  * Opens its OWN SQLite connection (never shares the parent's handle),
- * applies the parent-computed effective busy timeout, optionally honors the
- * test-only REMIND_WORKER_DELAY_MS synchronous delay (to deterministically
- * exercise the parent's independent deadline in tests), runs exactly one
- * validated store op, posts {res} back, and always closes its connection
- * (open transactions roll back on close: no orphan txn after terminate).
+ * applies the parent-computed effective busy timeout, runs exactly one
+ * validated store op, posts {res} back, and attempts to close its connection.
+ * Honest limit: when the parent's deadline fires, worker.terminate() is
+ * best-effort and may NOT unwind the finally below nor interrupt native
+ * SQLite promptly; the CLI's reliable bound is its own TIMEOUT response
+ * plus whole-process exit (OS closes handles, SQLite recovery decides the
+ * commit outcome, which stays UNKNOWN to the caller).
  */
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
@@ -28,20 +30,6 @@ interface Req {
   effectiveBusyMs: number;
 }
 
-function testOnlyDelay(): void {
-  // Test hook only: simulate a long deterministic scan without needing a
-  // huge dataset. Production never sets this env var.
-  const raw = process.env["REMIND_WORKER_DELAY_MS"];
-  if (!raw) return;
-  const ms = Number(raw);
-  if (!Number.isFinite(ms) || ms <= 0) return;
-  const end = Date.now() + Math.min(ms, 30000);
-  while (Date.now() < end) {
-    // Synchronous block: a same-thread setTimeout could not interrupt this;
-    // only the parent's worker.terminate() stops it (the point of P1).
-  }
-}
-
 function main(): void {
   const req = workerData as Req;
   const post = (res: unknown): void => {
@@ -58,7 +46,6 @@ function main(): void {
     // Bound lock waits by the parent's remaining deadline (never the raw
     // configured busyMs when it exceeds the remaining budget).
     db.exec(`PRAGMA busy_timeout = ${busy}`);
-    testOnlyDelay();
     const cfg = req.config;
     let res;
     if (req.op === "candidate.create") {
