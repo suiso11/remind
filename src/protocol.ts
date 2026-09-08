@@ -21,7 +21,8 @@ export type ErrorCode =
   | "FORBIDDEN_SCOPE"
   | "STORE_UNAVAILABLE"
   | "LIMIT_EXCEEDED"
-  | "TIMEOUT";
+  | "TIMEOUT"
+  | "NOT_IMPLEMENTED";
 
 export interface ResponseEnvelope {
   v: 1;
@@ -33,7 +34,9 @@ export interface ResponseEnvelope {
   deduplicated: boolean;
 }
 
-/** Fixed message templates (no input echo). */
+/** Fixed message templates (no input echo).
+ * NOT_IMPLEMENTED is a temporary T1-only status: valid automated envelopes
+ * are honestly rejected until T2-T4 implement the domain. Never ok:true. */
 export const MESSAGES: Record<ErrorCode, string> = {
   OK: "ok",
   BAD_REQUEST: "bad request",
@@ -45,6 +48,7 @@ export const MESSAGES: Record<ErrorCode, string> = {
   STORE_UNAVAILABLE: "store unavailable",
   LIMIT_EXCEEDED: "limit exceeded",
   TIMEOUT: "timeout",
+  NOT_IMPLEMENTED: "not implemented",
 };
 
 export function ok(data: Record<string, unknown> | null = null): ResponseEnvelope {

@@ -41,7 +41,7 @@ function runCli(configPath: string, stdin: string) {
 }
 
 describe("cli smoke (T1 foundation)", () => {
-  it("boots, seeds scopes, and answers a valid envelope", () => {
+  it("boots, seeds scopes, and honestly reports unimplemented domain", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-smoke-"));
     const cfg = writeConfig(dir);
     const req =
@@ -50,9 +50,8 @@ describe("cli smoke (T1 foundation)", () => {
     assert.equal(r.status, 0);
     const res = JSON.parse(r.stdout.trim());
     assert.equal(res.v, 1);
-    assert.equal(res.ok, true);
-    assert.equal(res.code, "OK");
-    assert.equal(res.data.op, "record.recall");
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "NOT_IMPLEMENTED");
     const db = new DatabaseSync(path.join(dir, "smoke.db"));
     const rows = db
       .prepare("SELECT scope FROM scopes ORDER BY scope")

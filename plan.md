@@ -362,6 +362,6 @@
 
 - **承認 (approved):** §14 MVP 推奨案の採用、実装リポジトリ = 本ディレクトリ（remind）、スタック Node.js Supported LTS + TypeScript + SQLite + 単独 CLI JSON + fake adapter、Companion 変更なし。
 - **pin（T1 verified）:** Node.js v24.12.0 / npm 11.6.2 / `engines >=24.12.0 <25` / TypeScript 5.9.3 / SQLite は Node 組込 `node:sqlite`（runtime 依存ゼロ）。ロックファイル・CI（`.github/workflows/ci.yml`, node 24.12.0）に記録。
-- **T1 実装範囲:** CLI 封筒・固定エラーコード・起動時 config 検証・`scopes` 初期投入・有界（要求 32768B / `responseMaxBytes`）のみ。`candidate.*` / `record.*` ドメインは未実装であり、CLI は `data.domain:"not-implemented"` を正直に返す（T2–T4 で対応）。
-- **テスト:** `npm test`（tsc + node:test、15 件合格）— config 厳格検証・封筒/`BAD_REQUEST`・有界/`LIMIT_EXCEEDED`・人手 op の `FORBIDDEN`・CLI smoke（scopes seed・起動失敗の非ゼロ終了・stdout 無出力）。
+- **T1 実装範囲:** CLI 封筒・固定エラーコード・起動時 config 検証・`scopes` 初期投入・有界（要求 32768B / `responseMaxBytes`）のみ。`candidate.*` / `record.*` ドメインは未実装であり、妥当な自動化封筒には `ok:false, code:NOT_IMPLEMENTED`（一時的 T1 専用状態・固定文言・応答予算適用）を返す。`ok:true` の偽装はしない（T2–T4 で対応）。stdin は LF フレーム単位の有界非同期読取とし、EOF 待機なし・raw 上限の事前適用・`cliMs` 期限・UTF-8 fatal 検証を行う。stderr（起動/config/DB/入力系）は固定文言のみで引数・設定内容・例外文を出さない。
+- **テスト:** `npm test`（tsc + node:test、23 件合格）— config 厳格検証・封筒/`BAD_REQUEST`・有界/`LIMIT_EXCEEDED`・人手 op の `FORBIDDEN`・未実装ドメインの `NOT_IMPLEMENTED`・CLI smoke（scopes seed・起動失敗の非ゼロ終了・stdout 無出力）・有界 stdin サブプロセス群（改行なし超過・開放パイプ期限・不正 UTF-8・EOF なし LF 応答・秘密非露出・複数行 `BAD_REQUEST`）。
 - **未解決のまま:** Companion 連携契約（U11）を含む U1–U11 の正式決定、A1–A13 受入（T6）、T2–T6 ドメイン。本文書の実装・テスト済み主張は T1 範囲に限定し、§1–§13 の planning-only 位置づけを維持する。

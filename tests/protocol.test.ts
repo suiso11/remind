@@ -86,4 +86,12 @@ describe("protocol envelopes", () => {
     assert.equal(r.message, "bad request");
     assert.ok(!JSON.stringify(r).includes("c-001"));
   });
+
+  it("reserves NOT_IMPLEMENTED as the honest T1-only domain failure", () => {
+    const r = fail("NOT_IMPLEMENTED");
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "NOT_IMPLEMENTED");
+    assert.equal(r.message, "not implemented");
+    assert.equal(r.data, null);
+  });
 });
