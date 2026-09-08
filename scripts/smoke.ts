@@ -18,7 +18,7 @@ parsed.dbPath = path.join(dir, "smoke.db");
 fs.writeFileSync(cfg, JSON.stringify(parsed));
 
 const cases: Array<[string, string]> = [
-  ["valid recall envelope", JSON.stringify({ v: 1, op: "record.recall", params: {} })],
+  ["valid recall envelope (strict params)", JSON.stringify({ v: 1, op: "record.recall", params: { query: "hello", scope: "personal/default", limit: 10 } })],
   ["unknown op", JSON.stringify({ v: 1, op: "nope.nope", params: {} })],
   ["human op over JSON", JSON.stringify({ v: 1, op: "approve", params: {} })],
 ];

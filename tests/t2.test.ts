@@ -97,9 +97,10 @@ describe("T2 candidates + human approval", () => {
       const audits = db.prepare(`SELECT * FROM audit`).all() as Array<Record<string, unknown>>;
       assert.ok(audits.length >= 2);
       assert.ok(!JSON.stringify(audits).includes(marker));
-      // Recall stays an honest T3 deferral.
+      // Recall is implemented (T3): empty params fail strict validation,
+      // and correct-request stays an honest T4 deferral.
       const rec = runJson(cfg, { v: 1, op: "record.recall", params: {} });
-      assert.equal(rec.body["code"], "NOT_IMPLEMENTED");
+      assert.equal(rec.body["code"], "BAD_REQUEST");
     } finally {
       db.close();
     }

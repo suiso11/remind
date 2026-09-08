@@ -15,7 +15,13 @@
  * Bounds: raw stdin bytes are capped at 32768 (RAW_MAX_BYTES) *while
  * streaming*, before buffering/parsing. Exceeding bytes => LIMIT_EXCEEDED
  * envelope even with no newline. The overall cliMs deadline from startup
- * config aborts a never-ending stdin => TIMEOUT envelope. Line bytes are
+ * config aborts a never-ending stdin => TIMEOUT envelope. The store op then
+ * runs on a worker thread bounded by the REMAINING cliMs: the SQLite busy
+ * wait is clamped to min(busyMs, remaining) and an independent parent timer
+ * terminates the worker on expiry => TIMEOUT with unknown commit outcome
+ * (idempotent replay via the same key + params). A same-thread setTimeout
+ * alone cannot interrupt synchronous SQLite; the worker boundary is what
+ * makes the deadline effective. Line bytes are
  * decoded as UTF-8 with fatal:true; invalid bytes => BAD_REQUEST envelope.
  *
  * Errors: startup/config/db/input-path stderr carries FIXED codes only and
@@ -23,7 +29,7 @@
  * JSON envelopes pass the responseMaxBytes budget (fail-closed
  * LIMIT_EXCEEDED, never truncated).
  *
- * Honesty: T3-T4 domain ops (record.recall/correct-request, archive)
+ * Honesty: T4 domain ops (record.correct-request, archive)
   * return ok:false NOT_IMPLEMENTED until their tasks land; this file never
   * returns ok:true for unimplemented domain ops.
  */
@@ -36,13 +42,15 @@ import {
   validateRequest,
   type ResponseEnvelope,
 } from "./protocol.js";
-import { initDb } from "./db.js";
+import { applyEffectiveBusyTimeout, initDb } from "./db.js";
+import { effectiveBusyMs, runStoreOpWithDeadline } from "./deadline.js";
 import { escapeForTerminal } from "./normalize.js";
 import {
   approveCandidate,
   createCandidate,
   getCandidateForReview,
   getCandidateMeta,
+  recallRecords,
   rejectCandidate,
 } from "./store.js";
 import type { DatabaseSync } from "node:sqlite";
@@ -290,7 +298,10 @@ export function handleValidatedRequest(
   if (op === "candidate.get") {
     return getCandidateMeta(db, config, params);
   }
-  // T3 (record.recall) / T4 (record.correct-request, archive): honest deferral.
+  if (op === "record.recall") {
+    return recallRecords(db, config, params);
+  }
+  // T4 (record.correct-request, archive): honest deferral.
   return applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
 }
 
@@ -529,7 +540,10 @@ async function main(): Promise<void> {
     }
     let hDb: DatabaseSync | null = null;
     try {
-      hDb = initDb(hConfig, configPath).db as unknown as DatabaseSync;
+      const hEff = effectiveBusyMs(hConfig.timeouts.busyMs, hConfig.timeouts.cliMs);
+      hDb = initDb(hConfig, configPath, hEff).db as unknown as DatabaseSync;
+      // Bound interactive lock waits by the overall deadline too.
+      applyEffectiveBusyTimeout(hDb, hConfig.timeouts.busyMs, hConfig.timeouts.cliMs);
     } catch {
       process.stderr.write(STDERR_DB);
       process.exit(3);
@@ -561,13 +575,33 @@ async function main(): Promise<void> {
     process.exit(2);
     return;
   }
+  const elapsed = (): number => Date.now() - started;
+  const remaining = (): number => config.timeouts.cliMs - elapsed();
   let db: { close(): void } | null = null;
   let rawDb: DatabaseSync | null = null;
+  let dbFile = "";
   try {
-    const opened = initDb(config, configPath);
+    const startupEff = effectiveBusyMs(config.timeouts.busyMs, remaining());
+    const opened = initDb(config, configPath, startupEff);
     db = opened.db;
     rawDb = opened.db as unknown as DatabaseSync;
-  } catch {
+    dbFile = opened.dbFile;
+  } catch (e) {
+    // P1: initDb DDL also contends on the write lock. With the clamped
+    // busy wait it fails fast; lock contention answers a bounded envelope
+    // (never a late OK, never an unbounded 5000ms block), while genuine
+    // startup failures keep the fixed stderr + non-zero exit contract.
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/busy|locked|timeout/i.test(msg)) {
+      const timedOut = Date.now() - started > config.timeouts.cliMs;
+      const res = applyResponseBudget(
+        fail(timedOut ? "TIMEOUT" : "STORE_UNAVAILABLE"),
+        config.limits.responseMaxBytes,
+      );
+      process.stdout.write(JSON.stringify(res) + "\n");
+      process.exit(0);
+      return;
+    }
     process.stderr.write(STDERR_DB);
     process.exit(3);
     return;
@@ -580,9 +614,6 @@ async function main(): Promise<void> {
       /* ignore; close failure handled at the single close point below */
     }
   };
-
-  const elapsed = (): number => Date.now() - started;
-  const remaining = (): number => config.timeouts.cliMs - elapsed();
 
   // Bounded stdin read with the real remaining deadline.
   const stdinRes = await readFirstLine(RAW_MAX_BYTES, remaining());
@@ -649,14 +680,48 @@ async function main(): Promise<void> {
           const v = validateRequest(parsed);
           if (!v.ok) {
             res = applyResponseBudget(v.res, config.limits.responseMaxBytes);
-          } else if (rawDb && (v.req.op === "candidate.create" || v.req.op === "candidate.get")) {
-            try {
-              res = handleValidatedRequest(rawDb, config, v.req.op, v.req.params, v.req.idempotencyKey);
-            } catch {
-              res = applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
+          } else if (rawDb && (v.req.op === "candidate.create" || v.req.op === "candidate.get" || v.req.op === "record.recall")) {
+            // P1: effective remaining deadline. The parent's remaining cliMs
+            // bounds BOTH the SQLite busy wait (effectiveBusyMs clamp, so a
+            // busyMs > cliMs config cannot block past the deadline) AND the
+            // whole op via a worker thread with an independent parent timer
+            // (worker.terminate() interrupts a long scan; a same-thread
+            // setTimeout could not interrupt synchronous SQLite). A timed-out
+            // worker has UNKNOWN commit outcome: answer TIMEOUT and let the
+            // caller replay with the same idempotency key + params.
+            const opRemaining = remaining();
+            if (opRemaining <= 0) {
+              res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
+            } else {
+              // Release the parent handle so the worker is the only
+              // connection; then run bounded.
+              closeDb();
+              db = null;
+              rawDb = null;
+              const eff = effectiveBusyMs(config.timeouts.busyMs, opRemaining);
+              try {
+                const outcome = await runStoreOpWithDeadline(
+                  {
+                    dbFile,
+                    config,
+                    op: v.req.op,
+                    params: v.req.params,
+                    idempotencyKey: v.req.idempotencyKey,
+                    effectiveBusyMs: eff,
+                  },
+                  opRemaining,
+                );
+                if (outcome.timedOut) {
+                  res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
+                } else {
+                  res = outcome.res;
+                }
+              } catch {
+                res = applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
+              }
             }
           } else {
-            // T3-T4 remain honest: recall / correct-request are not implemented.
+            // T4 remains honest: correct-request is not implemented.
             res = applyResponseBudget(fail("NOT_IMPLEMENTED"), config.limits.responseMaxBytes);
           }
         }

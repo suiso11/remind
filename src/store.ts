@@ -13,10 +13,12 @@
  * - candidate.create with kind=correction or a supersedes pointer is answered
  *   NOT_IMPLEMENTED (honest T4 deferral): the supersedes column exists in the
  *   schema, but the T4 conditional-supersede transaction is not implemented.
- * - record.correct-request / record.recall / archive stay NOT_IMPLEMENTED /
- *   FORBIDDEN-over-JSON exactly as before (T3-T4 own them).
+ * - record.correct-request / archive stay NOT_IMPLEMENTED /
+ *   FORBIDDEN-over-JSON exactly as before (T4 owns them). record.recall is
+ *   implemented here (T3).
  */
 import { randomBytes } from "node:crypto";
+import * as fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import {
@@ -24,6 +26,7 @@ import {
   bodyHashFor,
   canonicalStringify,
   canonicalTime,
+  containsLoneSurrogateDeep,
   countCp,
   hasControl,
   normalizeBody,
@@ -70,6 +73,16 @@ export function ensureT2Schema(db: DatabaseSync): void {
   db.exec(`CREATE TABLE IF NOT EXISTS exposures(
     ts TEXT NOT NULL, recallId TEXT NOT NULL, runId TEXT NULL, scope TEXT NULL,
     recordId TEXT NOT NULL, snippetBytes INTEGER NULL, truncated INTEGER NULL, limitN INTEGER NULL)`);
+  // T3 bounded-retrieval indexes (additive migration; existing rows untouched).
+  // records(scope,status,createdAt,id) covers the recall pre-filter + fixed
+  // order; tag/link PKs already bind (recordId,tag)/(fromId), the extra
+  // indexes cover the reverse exact-match direction.
+  // Honest note: this bounds host variables and result materialization, but
+  // the SQL scan may still examine every row in the scope window (instr
+  // predicate); it is not hard constant latency.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_records_scope_status_created_id ON records(scope, status, createdAt, id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_record_tags_tag_record ON record_tags(tag, recordId)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_record_links_toname_from ON record_links(toName, fromId)`);
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -80,16 +93,36 @@ function genId(prefix: string): string {
   return `${prefix}_${randomBytes(8).toString("hex")}`;
 }
 
-/** Scope is authorized when it is in startup config AND in the scopes table. */
+/** Scope authorization tri-state (P2 fix).
+ *
+ * - Scope absent from startup config => genuine denial (returns false).
+ * - Scope present in config but missing from the scopes table => genuine
+ *   denial (returns false; the row may have been revoked).
+ * - Any scopes-table I/O failure (closed DB, missing/corrupt table, I/O
+ *   error) THROWS Error("scope check unavailable"): callers must answer
+ *   STORE_UNAVAILABLE, never FORBIDDEN_SCOPE. Returning false here used to
+ *   misclassify STORE_UNAVAILABLE as FORBIDDEN_SCOPE.
+ */
 export function isScopeAuthorized(db: DatabaseSync, config: AppConfig, scope: string): boolean {
   if (!config.allowedScopes.includes(scope)) return false;
+  let row: { scope: string } | undefined;
   try {
-    const row = db.prepare(`SELECT scope FROM scopes WHERE scope = ?`).get(scope) as
+    row = db.prepare(`SELECT scope FROM scopes WHERE scope = ?`).get(scope) as
       | { scope: string }
       | undefined;
-    return !!row;
   } catch {
-    return false;
+    throw new Error("scope check unavailable");
+  }
+  return !!row;
+}
+
+/** Scope gate for envelope-returning ops: false => FORBIDDEN_SCOPE, throw => STORE_UNAVAILABLE. */
+function scopeGate(db: DatabaseSync, config: AppConfig, scope: string): ResponseEnvelope | null {
+  try {
+    if (!isScopeAuthorized(db, config, scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    return null;
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }
 
@@ -130,10 +163,14 @@ export function parseCreateParams(
   config: AppConfig,
   params: Record<string, unknown>,
 ): ParseResult {
+  // Direct-call hardening (mirrors the protocol envelope): any unpaired
+  // surrogate in any param string is BAD_REQUEST with no mutation.
+  if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
   const allowed = new Set(["body", "kind", "provenance", "scope", "tags", "link", "ttlSec", "runId", "supersedes"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return { ok: false, res: bad() };
   }
+  if (containsLoneSurrogateDeep(Object.keys(params))) return { ok: false, res: bad() };
   const { body, kind, provenance, scope, tags, link, ttlSec, runId, supersedes } = params;
 
   if (typeof body !== "string") return { ok: false, res: bad() };
@@ -330,22 +367,22 @@ export function readCandidate(db: DatabaseSync, id: string): CandidateRow | null
   }
 }
 
+/**
+ * Candidate metadata reads. These THROW on query failure (corruption,
+ * incompatible pre-existing table, I/O error) so every public boundary
+ * answers STORE_UNAVAILABLE. They must never substitute an empty tag list
+ * / null link: that would report incomplete metadata as success and, worse,
+ * bind the approval token to the wrong tag/link set and commit tag-less
+ * records. Callers catch the throw and fail closed.
+ */
 function readTags(db: DatabaseSync, candidateId: string): string[] {
-  try {
-    const rows = db.prepare(`SELECT tag FROM candidate_tags WHERE candidateId = ? ORDER BY tag ASC`).all(candidateId) as Array<{ tag: string }>;
-    return rows.map((r) => r.tag);
-  } catch {
-    return [];
-  }
+  const rows = db.prepare(`SELECT tag FROM candidate_tags WHERE candidateId = ? ORDER BY tag ASC`).all(candidateId) as Array<{ tag: string }>;
+  return rows.map((r) => r.tag);
 }
 
 function readLink(db: DatabaseSync, fromId: string): string | null {
-  try {
-    const row = db.prepare(`SELECT toName FROM candidate_links WHERE fromId = ?`).get(fromId) as { toName: string } | undefined;
-    return row ? row.toName : null;
-  } catch {
-    return null;
-  }
+  const row = db.prepare(`SELECT toName FROM candidate_links WHERE fromId = ?`).get(fromId) as { toName: string } | undefined;
+  return row ? row.toName : null;
 }
 
 export function tokenForStored(
@@ -429,11 +466,15 @@ export function createCandidate(
   }
   if (saved) {
     if (saved.op !== "candidate.create") return budgeted(fail("CONFLICT"), config);
-    if (!isScopeAuthorized(db, config, n.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    const denied = scopeGate(db, config, n.scope);
+    if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
     return replaySaved(saved.responseJson, config);
   }
-  if (!isScopeAuthorized(db, config, n.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, n.scope);
+    if (denied) return denied;
+  }
 
   const now = nowOverride ?? nowIso();
   const nowMs = Date.parse(now);
@@ -481,11 +522,15 @@ export function createCandidate(
         token: null,
         reasonCode: null,
       });
+      // Pre-commit cap: the write that crosses dbMaxBytes rolls back here
+      // (STORE_UNAVAILABLE) instead of leaving an oversized database.
+      assertDbUnderCap(db, config);
       return stored;
     });
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     // Unique-key collision on the idempotency key means a concurrent commit
     // won the race: re-read and replay deterministically.
@@ -518,7 +563,10 @@ export function getCandidateMeta(
   if (typeof scope !== "string" || countCp(scope) < 1 || countCp(scope) > 256 || hasControl(scope)) {
     return budgeted(fail("BAD_REQUEST"), config);
   }
-  if (!isScopeAuthorized(db, config, scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, scope);
+    if (denied) return denied;
+  }
   let row: CandidateRow | null;
   try {
     row = readCandidate(db, id);
@@ -537,8 +585,16 @@ export function getCandidateMeta(
       return budgeted(fail("STORE_UNAVAILABLE"), config);
     }
   }
-  const tags = readTags(db, id);
-  const link = readLink(db, id);
+  // Metadata query failure is STORE_UNAVAILABLE, never a fabricated
+  // empty tag list / null link (readTags/readLink throw on failure).
+  let tags: string[];
+  let link: string | null;
+  try {
+    tags = readTags(db, id);
+    link = readLink(db, id);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
   return budgeted(
     ok({
       candidate: {
@@ -571,7 +627,12 @@ export function getCandidateForReview(
   }
   // Authorize BEFORE disclosing the full body/token: a revoked scope
   // (removed from startup config or the scopes table) must not review.
-  if (!isScopeAuthorized(db, config, scope)) return { ok: false, code: "FORBIDDEN_SCOPE" };
+  // A scopes-table I/O failure is STORE_UNAVAILABLE, never FORBIDDEN_SCOPE.
+  try {
+    if (!isScopeAuthorized(db, config, scope)) return { ok: false, code: "FORBIDDEN_SCOPE" };
+  } catch {
+    return { ok: false, code: "STORE_UNAVAILABLE" };
+  }
   let row: CandidateRow | null;
   try {
     row = readCandidate(db, id);
@@ -580,9 +641,15 @@ export function getCandidateForReview(
   }
   if (!row) return { ok: false, code: "NOT_FOUND" };
   if (row.scope !== scope) return { ok: false, code: "FORBIDDEN_SCOPE" };
-  const tags = readTags(db, id);
-  const link = readLink(db, id);
-  return { ok: true, row, tags, link, token: tokenForStored(row, tags, link) };
+  // Metadata query failure must not disclose a row with fabricated
+  // empty tags / null link (and a token bound to that wrong set).
+  try {
+    const tags = readTags(db, id);
+    const link = readLink(db, id);
+    return { ok: true, row, tags, link, token: tokenForStored(row, tags, link) };
+  } catch {
+    return { ok: false, code: "STORE_UNAVAILABLE" };
+  }
 }
 
 function lazyExpire(db: DatabaseSync, id: string): void {
@@ -629,11 +696,15 @@ export function approveCandidate(
   }
   if (saved) {
     if (saved.op !== "approve") return budgeted(fail("CONFLICT"), config);
-    if (!isScopeAuthorized(db, config, args.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
     return replaySaved(saved.responseJson, config);
   }
-  if (!isScopeAuthorized(db, config, args.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
+  }
 
   lazyExpire(db, args.id);
   let row: CandidateRow | null;
@@ -659,9 +730,14 @@ export function approveCandidate(
   if (row.kind === "correction" || row.supersedes !== null) {
     return budgeted(fail("NOT_IMPLEMENTED"), config);
   }
-  const tags = readTags(db, args.id);
-  const link = readLink(db, args.id);
-  const expected = tokenForStored(row, tags, link);
+  // A metadata read failure here is STORE_UNAVAILABLE: binding the token
+  // against fabricated empty tags / null link could approve the wrong set.
+  let expected: string;
+  try {
+    expected = tokenForStored(row, readTags(db, args.id), readLink(db, args.id));
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
   if (!safeEqual(args.token, expected)) return budgeted(fail("CONFLICT"), config);
 
   const approvedAt = nowOverride ?? nowIso();
@@ -712,11 +788,14 @@ export function approveCandidate(
         token: args.token,
         reasonCode: null,
       });
+      // Pre-commit cap: crossing dbMaxBytes rolls back record + status flip.
+      assertDbUnderCap(db, config);
       return stored;
     });
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       const again = readOperation(db, args.idempotencyKey);
@@ -761,11 +840,15 @@ export function rejectCandidate(
   }
   if (saved) {
     if (saved.op !== "reject") return budgeted(fail("CONFLICT"), config);
-    if (!isScopeAuthorized(db, config, args.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
     return replaySaved(saved.responseJson, config);
   }
-  if (!isScopeAuthorized(db, config, args.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
+  }
 
   lazyExpire(db, args.id);
   let row: CandidateRow | null;
@@ -786,9 +869,15 @@ export function rejectCandidate(
     lazyExpire(db, args.id);
     return budgeted(fail("EXPIRED"), config);
   }
-  const tags = readTags(db, args.id);
-  const link = readLink(db, args.id);
-  if (!safeEqual(args.token, tokenForStored(row, tags, link))) return budgeted(fail("CONFLICT"), config);
+  // Same fail-closed metadata rule as approve: never bind against
+  // fabricated empty tags / null link.
+  try {
+    if (!safeEqual(args.token, tokenForStored(row, readTags(db, args.id), readLink(db, args.id)))) {
+      return budgeted(fail("CONFLICT"), config);
+    }
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
 
   const now = nowOverride ?? nowIso();
   try {
@@ -823,11 +912,14 @@ export function rejectCandidate(
         token: args.token,
         reasonCode: "USER_REJECTED",
       });
+      // Pre-commit cap: crossing dbMaxBytes rolls back the status flip.
+      assertDbUnderCap(db, config);
       return stored;
     });
     return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       const again = readOperation(db, args.idempotencyKey);
@@ -838,6 +930,308 @@ export function rejectCandidate(
     }
     if (msg === "expired now") return budgeted(fail("EXPIRED"), config);
     if (msg === "state moved" || msg === "token moved") return budgeted(fail("CONFLICT"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* T3 deterministic recall (plan 14.6 + 14.4/14.8/14.10 adopted subset) */
+/* ------------------------------------------------------------------ */
+
+interface ParsedRecall {
+  query: string;
+  tags: string[];
+  link: string | null;
+  since: string | null;
+  until: string | null;
+  limit: number;
+  scope: string;
+  runId: string | null;
+}
+
+type RecallParse =
+  | { ok: true; value: ParsedRecall }
+  | { ok: false; res: ResponseEnvelope };
+
+function parseRecallParams(config: AppConfig, params: Record<string, unknown>): RecallParse {
+  // Direct-call hardening: unpaired surrogates (incl. escaped lone halves
+  // that bypass UTF-8 checks) are BAD_REQUEST with no audit/exposure write.
+  if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
+  const allowed = new Set(["query", "tags", "link", "since", "until", "limit", "scope", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return { ok: false, res: bad() };
+  }
+  if (containsLoneSurrogateDeep(Object.keys(params))) return { ok: false, res: bad() };
+  const { query, tags, link, since, until, limit, scope, runId } = params;
+
+  if (typeof query !== "string") return { ok: false, res: bad() };
+  if (countCp(query) > config.limits.queryMaxCp) return { ok: false, res: limitExceeded() };
+  const nq = normalizeBody(query);
+  const nqLen = countCp(nq);
+  if (nqLen < 1) return { ok: false, res: bad() };
+  if (nqLen > config.limits.queryMaxCp) return { ok: false, res: limitExceeded() };
+
+  let nTags: string[] = [];
+  if (tags !== undefined) {
+    if (!Array.isArray(tags)) return { ok: false, res: bad() };
+    if (tags.length > config.limits.tagsMax) return { ok: false, res: limitExceeded() };
+    const seen = new Set<string>();
+    for (const t of tags) {
+      if (typeof t !== "string") return { ok: false, res: bad() };
+      if (countCp(t) > 256) return { ok: false, res: limitExceeded() };
+      if (countCp(t) < 1 || hasControl(t)) return { ok: false, res: bad() };
+      const nt = normalizeTag(t);
+      if (countCp(nt) < 1 || countCp(nt) > 256) return { ok: false, res: bad() };
+      seen.add(nt);
+    }
+    nTags = [...seen].sort();
+  }
+
+  let nLink: string | null = null;
+  if (link !== undefined && link !== null) {
+    if (typeof link !== "string") return { ok: false, res: bad() };
+    if (countCp(link) > 256) return { ok: false, res: limitExceeded() };
+    if (countCp(link) < 1 || hasControl(link)) return { ok: false, res: bad() };
+    const nl = normalizeLink(link);
+    if (countCp(nl) < 1 || countCp(nl) > 256) return { ok: false, res: bad() };
+    nLink = nl;
+  }
+
+  let nSince: string | null = null;
+  if (since !== undefined && since !== null) {
+    const c = canonicalTime(since);
+    if (c === null) return { ok: false, res: bad() };
+    nSince = c;
+  }
+  let nUntil: string | null = null;
+  if (until !== undefined && until !== null) {
+    const c = canonicalTime(until);
+    if (c === null) return { ok: false, res: bad() };
+    nUntil = c;
+  }
+
+  let nLimit = config.limits.limitDefault;
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return { ok: false, res: bad() };
+    if (limit < 1) return { ok: false, res: bad() };
+    if (limit > config.limits.limitMax) return { ok: false, res: limitExceeded() };
+    nLimit = limit;
+  }
+
+  if (typeof scope !== "string") return { ok: false, res: bad() };
+  if (countCp(scope) > 256) return { ok: false, res: limitExceeded() };
+  if (countCp(scope) < 1 || hasControl(scope)) return { ok: false, res: bad() };
+
+  let nRunId: string | null = null;
+  if (runId !== undefined && runId !== null) {
+    if (typeof runId !== "string") return { ok: false, res: bad() };
+    if (countCp(runId) > 256) return { ok: false, res: limitExceeded() };
+    if (countCp(runId) < 1 || hasControl(runId)) return { ok: false, res: bad() };
+    nRunId = runId;
+  }
+
+  return { ok: true, value: { query: nq, tags: nTags, link: nLink, since: nSince, until: nUntil, limit: nLimit, scope: scope as string, runId: nRunId } };
+}
+
+function snippetFor(body: string, maxCp: number): { snippet: string; truncated: boolean } {
+  const cps = [...body];
+  if (cps.length <= maxCp) return { snippet: body, truncated: false };
+  return { snippet: cps.slice(0, maxCp).join(""), truncated: true };
+}
+
+/**
+ * DB cap gate (dbMaxBytes). Effective size = max(logical, physical):
+ * - Logical: PRAGMA page_count * page_size of the main image (includes
+ *   freelist pages, so conservative; also the only signal for :memory:
+ *   databases, which have no file path).
+ * - Physical: filesystem bytes of the main file + WAL (-wal) + SHM (-shm)
+ *   sidecars. In WAL mode uncheckpointed writes live in -wal, so the file
+ *   sum is what actually grows before COMMIT; the logical view alone would
+ *   miss it. Summing logical + physical would double-count the main image,
+ *   hence max(), not the sum.
+ * Oversize -> true (fail closed, STORE_UNAVAILABLE). Unknown/unreadable
+ * sizes never block (fail-open on measurement only). Checked at transaction
+ * entry (cheap reject) AND after mutations before COMMIT: the write that
+ * crosses the cap throws inside withTransaction, rolls back, and leaves no
+ * oversized database behind.
+ */
+function isDbOverCap(db: DatabaseSync, config: AppConfig): boolean {
+  try {
+    let logical = 0;
+    try {
+      const pc = db.prepare(`PRAGMA page_count`).get() as { page_count: number } | undefined;
+      const ps = db.prepare(`PRAGMA page_size`).get() as { page_size: number } | undefined;
+      logical = (pc?.page_count ?? 0) * (ps?.page_size ?? 0);
+    } catch {
+      /* logical unknown; physical may still decide */
+    }
+    let physical = 0;
+    let seen = false;
+    try {
+      const rows = db.prepare(`PRAGMA database_list`).all() as Array<{ name: string; file: string }>;
+      const main = rows.find((r) => r.name === "main")?.file ?? "";
+      if (main) {
+        for (const suffix of ["", "-wal", "-shm"]) {
+          try {
+            physical += fs.statSync(main + suffix).size;
+            seen = true;
+          } catch {
+            /* missing sidecar is fine */
+          }
+        }
+      }
+    } catch {
+      /* ignore sidecar errors */
+    }
+    if (!seen) return logical > 0 && logical > config.dbMaxBytes;
+    return Math.max(logical, physical) > config.dbMaxBytes;
+  } catch {
+    return false;
+  }
+}
+
+/** Post-mutation gate: call inside the transaction after all writes, before COMMIT. */
+function assertDbUnderCap(db: DatabaseSync, config: AppConfig): void {
+  if (isDbOverCap(db, config)) throw new Error("db over cap");
+}
+
+interface RecallCandidate {
+  id: string;
+  body: string;
+  createdAt: string;
+}
+
+/** record.recall over JSON (read-only selection + metadata-only audit in one txn). */
+export function recallRecords(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  const parsed = parseRecallParams(config, params);
+  if (!parsed.ok) return budgeted(parsed.res, config);
+  const p = parsed.value;
+  {
+    const denied = scopeGate(db, config, p.scope);
+    if (denied) return denied;
+  }
+
+  const now = nowOverride ?? nowIso();
+  const recallId = genId("recall");
+
+  try {
+    const response = withTransaction(db, (): ResponseEnvelope => {
+      if (isDbOverCap(db, config)) throw new Error("db over cap");
+      // Bounded SQL retrieval (T3 fix): every predicate is parameterized,
+      // the literal substring uses instr(body, ?)>0 (no LIKE/wildcards), tag
+      // ALL uses one EXISTS per tag, the optional link uses one EXISTS, and
+      // SQL LIMIT enforces the bound (<= limitMax <= 100, recall <= 25 here).
+      // Host variables are therefore O(tags)+O(1) (<= ~20), never O(matches),
+      // so a 32k+ match window cannot hit the SQLite variable cap. Tags for
+      // the response are fetched only for the <= limit selected ids, so the
+      // second IN list is bounded by LIMIT too.
+      // Honest note: this bounds variables + materialization, but the instr
+      // scan may still examine every row in the scope/time window; it is not
+      // hard constant latency.
+      // Canonical millis strings sort lexicographically, so >= / < match
+      // since-inclusive / until-exclusive numerically.
+      let sql = `SELECT id, body, createdAt FROM records WHERE scope = ? AND status = 'active'`;
+      const args: Array<string | number> = [p.scope];
+      if (p.since !== null) {
+        sql += ` AND createdAt >= ?`;
+        args.push(p.since);
+      }
+      if (p.until !== null) {
+        sql += ` AND createdAt < ?`;
+        args.push(p.until);
+      }
+      sql += ` AND instr(body, ?) > 0`;
+      args.push(p.query);
+      for (const t of p.tags) {
+        sql += ` AND EXISTS (SELECT 1 FROM record_tags WHERE recordId = records.id AND tag = ?)`;
+        args.push(t);
+      }
+      if (p.link !== null) {
+        sql += ` AND EXISTS (SELECT 1 FROM record_links WHERE fromId = records.id AND toName = ?)`;
+        args.push(p.link);
+      }
+      sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
+      args.push(p.limit);
+      let rows: RecallCandidate[];
+      try {
+        rows = db.prepare(sql).all(...args) as unknown as RecallCandidate[];
+      } catch {
+        throw new Error("recall select failed");
+      }
+
+      // Tags for the bounded selected ids only (<= limit placeholders).
+      const tagMap = new Map<string, Set<string>>();
+      if (rows.length > 0) {
+        try {
+          const ids = rows.map((r) => r.id);
+          const placeholders = ids.map(() => "?").join(",");
+          const trows = db
+            .prepare(`SELECT recordId, tag FROM record_tags WHERE recordId IN (${placeholders})`)
+            .all(...(ids as [])) as Array<{ recordId: string; tag: string }>;
+          for (const t of trows) {
+            let s = tagMap.get(t.recordId);
+            if (!s) {
+              s = new Set<string>();
+              tagMap.set(t.recordId, s);
+            }
+            s.add(t.tag);
+          }
+        } catch {
+          throw new Error("tag read failed");
+        }
+      }
+
+      const top = rows;
+      const items = top.map((r) => {
+        const { snippet, truncated } = snippetFor(r.body, config.limits.snippetMaxCp);
+        const tags = [...(tagMap.get(r.id) ?? new Set<string>())].sort();
+        return { id: r.id, snippet, truncated, tags, createdAt: r.createdAt };
+      });
+
+      // Full-response budget BEFORE any audit/exposure write: no partial
+      // shaving, no orphan exposure rows on overflow.
+      const probe: ResponseEnvelope = ok({ recallId, items });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      const stored = budgeted(probe, config);
+      if (!stored.ok) throw new Error("response over budget");
+      const responseBytes = Buffer.byteLength(JSON.stringify(stored), "utf8");
+
+      // Metadata-only audit + per-item exposures (no query/body/snippet text).
+      db.prepare(
+        `INSERT INTO audit(ts, op, targetId, code, scope, bytes, limitN, runId, recallId, approver, approvedAt, token, reasonCode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)`,
+      ).run(now, "record.recall", recallId, stored.code, p.scope, responseBytes, p.limit, p.runId, recallId);
+      const exp = db.prepare(
+        `INSERT INTO exposures(ts, recallId, runId, scope, recordId, snippetBytes, truncated, limitN)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const it of items) {
+        exp.run(
+          now,
+          recallId,
+          p.runId,
+          p.scope,
+          it.id,
+          Buffer.byteLength(it.snippet, "utf8"),
+          it.truncated ? 1 : 0,
+          p.limit,
+        );
+      }
+      // Pre-commit cap: audit/exposure growth that crosses dbMaxBytes rolls
+      // back the whole recall (no partial ledger rows survive).
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+    return response;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }

@@ -10,10 +10,29 @@ import { ensureT2Schema } from "./store.js";
  * startup config, create the `scopes` table, seed allowed scopes
  * additively (never delete existing rows). Later tasks (T2-T4) add
  * the remaining tables in this same module.
+ *
+ * P1 honesty: the configured busyMs is only the *initial* SQLite busy wait.
+ * The automated CLI path passes effectiveBusyMs = min(busyMs, remaining
+ * cliMs) into initDb (so DDL/seed never blocks past the deadline) and
+ * runs the op on a bounded worker thread, so a busyMs > cliMs config can
+ * never block past the overall deadline and a long scan is terminated.
  */
+export function applyEffectiveBusyTimeout(
+  db: DatabaseSync,
+  busyMs: number,
+  remainingMs: number,
+): number {
+  const eff =
+    !Number.isFinite(remainingMs) || remainingMs <= 0
+      ? 0
+      : Math.max(0, Math.min(Math.floor(busyMs), Math.floor(remainingMs)));
+  db.exec(`PRAGMA busy_timeout = ${eff}`);
+  return eff;
+}
 export function initDb(
   config: AppConfig,
   configPath: string,
+  busyMsOverride?: number,
 ): { db: DatabaseSync; dbFile: string } {
   const dbFile = resolveDbPath(configPath, config.dbPath);
   const dir = path.dirname(dbFile);
@@ -45,8 +64,12 @@ export function initDb(
     );
   }
   try {
+    const busy =
+      typeof busyMsOverride === "number" && Number.isFinite(busyMsOverride)
+        ? Math.max(0, Math.floor(busyMsOverride))
+        : config.timeouts.busyMs;
     db.exec(
-      `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = ${config.timeouts.busyMs};`,
+      `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = ${busy};`,
     );
     db.exec(`CREATE TABLE IF NOT EXISTS scopes(scope TEXT PRIMARY KEY)`);
     const ins = db.prepare(
