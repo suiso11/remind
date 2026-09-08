@@ -39,7 +39,7 @@ cp memory.config.example.json memory.config.json  # local only, git-ignored
 echo '{"v":1,"op":"record.recall","params":{"query":"booking","scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 Status (honest, verified): `npm test` builds with `tsc` and runs
-`node:test` over `dist/tests/` — **68 tests pass, 1 skipped** (config
+`node:test` over `dist/tests/` — **73 tests pass, 1 skipped** (config
 strictness, envelopes/bounds, CLI smoke, hardened stdin subprocess suite,
 T2 candidates/approval/idempotency/scope/TTY-guard suite, 4 T2 review
 regressions, plus 10 T3 recall regressions: approval-only/active-scope
@@ -52,11 +52,18 @@ persistent seeded SQLite; plus 3 T3 fix regressions: 33000-row bounded-SQL
 scale recall with tag/link filter and exact order, unpaired-surrogate
 envelope/direct validation with astral preservation, CLI escaped-surrogate
 denial with no audit; plus 8 T4 correction/archive tests: atomic
-supersede with chain link, competing-approval single winner with loser
-rollback, archive-vs-correction races both directions, cross-scope
+supersede with chain link, sequential competing-approval single winner with
+loser rollback, archive-vs-correction races both directions, cross-scope
 denial/invisibility, idempotent replay vs param-change conflict, no-orphan
 failure paths, recall exclusion of superseded/archived, JSON/non-TTY
-archive denial; the single skip is the manual real-TTY
+archive denial; plus 5 T4 race-tightening tests: real concurrent
+worker-thread approvals sharing one file DB behind a start barrier (one
+winner, loser CONFLICT, exact atomic records/candidate/audit/operations),
+concurrent approve-vs-archive mutual exclusion, direct
+`candidate.create(kind=correction)` parity with the new in-transaction
+target gate, failing-audit-trigger rollback for approve-correction and
+archive, and replay after DB reopen plus after target-archive/candidate-
+expiry; the single skip is the manual real-TTY
 interactive confirmation, exercised by hand only).
 `npm run smoke` walks a strict valid recall / unknown / human-op envelopes
 in a temp dir (recall returns `ok:true` with empty items on the fresh DB).
@@ -147,9 +154,17 @@ pairs still pass.
   plus per-tag/link `EXISTS` plus SQL `LIMIT`, fixed order, bounded
   snippets, full-budget gate, single-transaction audit/exposures), T4
   `record.correct-request` (short-form correction candidate, advisory +
-  in-transaction target gate, idempotent) + correction approval (atomic
+  in-transaction target gate, idempotent; direct `candidate.create` with
+  `kind=correction` carries the same advisory + in-transaction gate) + correction approval (atomic
   conditional supersede, single race winner) + human `archiveRecord`
-  (conditional active→archived flip, terminal, metadata-only audit)
+  (conditional active→archived flip, terminal, metadata-only audit with
+  `approvedAt=null`; `audit.ts` is the timestamp, kept to avoid conflating
+  archive with approval) plus a documented limitation: local single-user
+  error semantics keep adopted `NOT_FOUND` / `FORBIDDEN_SCOPE` /
+  `CONFLICT` on id lookups (which can disclose id existence); no policy
+  change without agreement. Prior T4 coverage was sequential simulation
+  only; the new race suite above is the first real shared-file-DB
+  concurrency verification (WAL, `BEGIN IMMEDIATE`, 8s busy wait).
 - `src/cli.ts` — CLI entry (`--config`, bounded LF-framed stdin, stdout line;
   `candidate.create/get` routed to the store, human `review/approve/reject`
   subcommands with TTY + `yes` confirmation)

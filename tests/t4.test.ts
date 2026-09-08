@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -356,6 +357,293 @@ describe("T4 correction + archive", () => {
       );
     } finally {
       db.close();
+    }
+  });
+});
+
+function dbFileFor(dir: string, dbName = "t4.db"): string {
+  return path.join(dir, dbName);
+}
+
+function writeRaceWorker(storePath: string, file: string): void {
+  fs.writeFileSync(
+    file,
+    [
+      `const { parentPort, workerData } = require("node:worker_threads");`,
+      `const { DatabaseSync } = require("node:sqlite");`,
+      `const sab = new Int32Array(workerData.sab);`,
+      `Atomics.wait(sab, 0, 0);`,
+      `const db = new DatabaseSync(workerData.dbFile);`,
+      `db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 8000;");`,
+      `const store = require(workerData.storePath);`,
+      `let res;`,
+      `try {`,
+      `  if (workerData.kind === "approve") res = store.approveCandidate(db, workerData.config, workerData.args);`,
+      `  else res = store.archiveRecord(db, workerData.config, workerData.args);`,
+      `} catch (e) { res = { ok: false, code: "STORE_UNAVAILABLE" }; }`,
+      `try { db.close(); } catch {}`,
+      `parentPort.postMessage(res);`,
+      ``,
+    ].join("\n"),
+  );
+}
+
+function runTwoJobs(
+  dbFile: string,
+  config: ReturnType<typeof loadConfig>,
+  storePath: string,
+  workerFile: string,
+  jobs: Array<{ kind: string; args: Record<string, unknown> }>,
+): Promise<unknown[]> {
+  const sab = new SharedArrayBuffer(4);
+  const view = new Int32Array(sab);
+  view[0] = 0;
+  const workers = jobs.map(
+    (j) =>
+      new Worker(workerFile, {
+        workerData: { sab, dbFile, config, storePath, kind: j.kind, args: j.args },
+      }),
+  );
+  const results = workers.map(
+    (w) =>
+      new Promise<unknown>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("race worker timeout")), 20000);
+        w.once("message", (m) => {
+          clearTimeout(timer);
+          resolve(m);
+        });
+        w.once("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      }),
+  );
+  Atomics.store(view, 0, 1);
+  Atomics.notify(view, 0, 2);
+  return Promise.all(results).finally(() => {
+    for (const w of workers) void w.terminate();
+  });
+}
+
+describe("T4 real concurrency + rollback + reopen", () => {
+  it("concurrent correction approvals on shared file DB: one winner, loser CONFLICT atomic", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-t4race-"));
+    const cfg = writeConfig(dir);
+    const { db, config } = openDb(cfg);
+    const dbFile = dbFileFor(dir);
+    const oldId = seedActive(db, config, "concurrent race base");
+    const mk = (body: string) => {
+      const cr = correctRequest(db, config, correctionParams(oldId, body), nextKey("kc"));
+      assert.equal(cr.ok, true);
+      return (cr.data as { candidate: { id: string } }).candidate.id as string;
+    };
+    const a = mk("concurrent alpha body");
+    const b = mk("concurrent beta body");
+    const ra = getCandidateForReview(db, config, a, "personal/default");
+    const rb = getCandidateForReview(db, config, b, "personal/default");
+    assert.equal(ra.ok && rb.ok, true);
+    if (!ra.ok || !rb.ok) throw new Error("review failed");
+    const recBefore = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+    const keyA = nextKey("ha");
+    const keyB = nextKey("hb");
+    db.close();
+    const storePath = path.join(repoRoot, "dist", "src", "store.js");
+    const workerFile = path.join(dir, "race-worker.cjs");
+    writeRaceWorker(storePath, workerFile);
+    const [resa, resb] = (await runTwoJobs(dbFile, config, storePath, workerFile, [
+      { kind: "approve", args: { id: a, scope: "personal/default", token: ra.token, idempotencyKey: keyA } },
+      { kind: "approve", args: { id: b, scope: "personal/default", token: rb.token, idempotencyKey: keyB } },
+    ])) as Array<{ ok: boolean; code: string }>;
+    assert.equal(Number(resa.ok) + Number(resb.ok), 1);
+    const loser = resa.ok ? resb : resa;
+    assert.equal(loser.ok, false);
+    assert.equal(loser.code, "CONFLICT");
+    const winnerId = resa.ok ? a : b;
+    const loserId = resa.ok ? b : a;
+    const winnerKey = resa.ok ? keyA : keyB;
+    const loserKey = resa.ok ? keyB : keyA;
+    const loserBody = resa.ok ? "concurrent beta body" : "concurrent alpha body";
+    const { db: db2 } = openDb(cfg);
+    try {
+      const recAfter = (db2.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+      assert.equal(recAfter, recBefore + 1);
+      const lrow = db2.prepare(`SELECT status FROM candidates WHERE id=?`).get(loserId) as { status: string };
+      assert.equal(lrow.status, "candidate");
+      const wrow = db2.prepare(`SELECT status FROM candidates WHERE id=?`).get(winnerId) as { status: string };
+      assert.equal(wrow.status, "approved");
+      const ops = db2.prepare(`SELECT idempotencyKey FROM operations`).all() as Array<{ idempotencyKey: string }>;
+      assert.equal(ops.map((o) => o.idempotencyKey).includes(winnerKey), true);
+      assert.equal(ops.map((o) => o.idempotencyKey).includes(loserKey), false);
+      const audits = db2.prepare(`SELECT * FROM audit`).all() as Array<Record<string, unknown>>;
+      assert.ok(!JSON.stringify(audits).includes(loserBody));
+      const old = db2.prepare(`SELECT status FROM records WHERE id=?`).get(oldId) as { status: string };
+      assert.equal(old.status, "superseded");
+    } finally {
+      db2.close();
+    }
+  });
+
+  it("concurrent approve vs archive on shared file DB: exactly one winner", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-t4race-"));
+    const cfg = writeConfig(dir);
+    const { db, config } = openDb(cfg);
+    const dbFile = dbFileFor(dir);
+    const oldId = seedActive(db, config, "approve vs archive base");
+    const cr = correctRequest(db, config, correctionParams(oldId, "approve vs archive fix"), nextKey("kc"));
+    assert.equal(cr.ok, true);
+    const candId = (cr.data as { candidate: { id: string } }).candidate.id as string;
+    const rev = getCandidateForReview(db, config, candId, "personal/default");
+    assert.equal(rev.ok, true);
+    if (!rev.ok) throw new Error("review failed");
+    const keyA = nextKey("ha");
+    const keyR = nextKey("ar");
+    const recBefore = (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+    db.close();
+    const storePath = path.join(repoRoot, "dist", "src", "store.js");
+    const workerFile = path.join(dir, "race-worker2.cjs");
+    writeRaceWorker(storePath, workerFile);
+    const [apRes, arRes] = (await runTwoJobs(dbFile, config, storePath, workerFile, [
+      { kind: "approve", args: { id: candId, scope: "personal/default", token: rev.token, idempotencyKey: keyA } },
+      { kind: "archive", args: { id: oldId, scope: "personal/default", idempotencyKey: keyR, reasonCode: "USER_ARCHIVED" } },
+    ])) as Array<{ ok: boolean; code: string }>;
+    assert.equal(Number(apRes.ok) + Number(arRes.ok), 1);
+    assert.equal((apRes.ok ? arRes : apRes).code, "CONFLICT");
+    const { db: db2 } = openDb(cfg);
+    try {
+      const recAfter = (db2.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+      if (apRes.ok) {
+        assert.equal(recAfter, recBefore + 1);
+        assert.equal((db2.prepare(`SELECT status FROM records WHERE id=?`).get(oldId) as { status: string }).status, "superseded");
+        assert.equal((db2.prepare(`SELECT status FROM candidates WHERE id=?`).get(candId) as { status: string }).status, "approved");
+      } else {
+        assert.equal(recAfter, recBefore);
+        assert.equal((db2.prepare(`SELECT status FROM records WHERE id=?`).get(oldId) as { status: string }).status, "archived");
+        assert.equal((db2.prepare(`SELECT status FROM candidates WHERE id=?`).get(candId) as { status: string }).status, "candidate");
+        assert.ok(!JSON.stringify(db2.prepare(`SELECT * FROM audit`).all()).includes("approve vs archive fix"));
+      }
+    } finally {
+      db2.close();
+    }
+  });
+
+  it("direct candidate.create(kind correction) parity: inactive target denied, in-txn gate", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-t4-"));
+    const cfg = writeConfig(dir);
+    const { db, config } = openDb(cfg);
+    try {
+      const oldId = seedActive(db, config, "direct correction base");
+      const base = {
+        body: "direct correction body",
+        kind: "correction",
+        provenance: { source: "session:s1:turn:9", observedAt: "2026-09-02T00:00:00.000Z" },
+        scope: "personal/default",
+        supersedes: oldId,
+      };
+      const okFirst = createCandidate(db, config, base, nextKey("kd"));
+      assert.equal(okFirst.ok, true);
+      assert.equal(
+        archiveRecord(db, config, { id: oldId, scope: "personal/default", idempotencyKey: nextKey("ar"), reasonCode: "USER_ARCHIVED" }).ok,
+        true,
+      );
+      const nBefore = (db.prepare(`SELECT COUNT(*) AS n FROM candidates`).get() as { n: number }).n;
+      // Parity: both entry points deny a correction naming an inactive target.
+      assert.equal(createCandidate(db, config, { ...base, body: "direct late body" }, nextKey("kd")).code, "CONFLICT");
+      assert.equal(correctRequest(db, config, correctionParams(oldId, "late via short form"), nextKey("kc")).code, "CONFLICT");
+      const nAfter = (db.prepare(`SELECT COUNT(*) AS n FROM candidates`).get() as { n: number }).n;
+      assert.equal(nAfter, nBefore);
+      // Missing target stays NOT_FOUND on both paths (no policy change).
+      assert.equal(createCandidate(db, config, { ...base, body: "x-missing", supersedes: "rec_missing" }, nextKey("kd")).code, "NOT_FOUND");
+      assert.equal(correctRequest(db, config, correctionParams("rec_missing", "x-missing"), nextKey("kc")).code, "NOT_FOUND");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("audit failure rolls back approve-correction and archive atomically", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-t4-"));
+    const cfg = writeConfig(dir);
+    const { db, config } = openDb(cfg);
+    try {
+      const oldId = seedActive(db, config, "rollback base record");
+      const cr = correctRequest(db, config, correctionParams(oldId, "rollback fix body"), nextKey("kc"));
+      assert.equal(cr.ok, true);
+      const candId = (cr.data as { candidate: { id: string } }).candidate.id as string;
+      const rev = getCandidateForReview(db, config, candId, "personal/default");
+      assert.equal(rev.ok, true);
+      if (!rev.ok) throw new Error("review failed");
+      const snap = {
+        records: (db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n,
+        candidates: JSON.stringify(db.prepare(`SELECT id, status FROM candidates ORDER BY id`).all()),
+        ops: (db.prepare(`SELECT COUNT(*) AS n FROM operations`).get() as { n: number }).n,
+        audit: (db.prepare(`SELECT COUNT(*) AS n FROM audit`).get() as { n: number }).n,
+      };
+      db.exec(`CREATE TRIGGER t4_audit_fail BEFORE INSERT ON audit WHEN NEW.op='approve' BEGIN SELECT RAISE(ABORT, 'audit boom'); END;`);
+      const boom = approveCandidate(db, config, { id: candId, scope: "personal/default", token: rev.token, idempotencyKey: nextKey("ha") });
+      assert.equal(boom.code, "STORE_UNAVAILABLE");
+      db.exec(`DROP TRIGGER t4_audit_fail;`);
+      assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n, snap.records);
+      assert.equal(JSON.stringify(db.prepare(`SELECT id, status FROM candidates ORDER BY id`).all()), snap.candidates);
+      assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM operations`).get() as { n: number }).n, snap.ops);
+      assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM audit`).get() as { n: number }).n, snap.audit);
+      assert.equal((db.prepare(`SELECT status FROM records WHERE id=?`).get(oldId) as { status: string }).status, "active");
+      // Approve succeeds once the trigger is gone (rollback left no partial state).
+      const rev2 = getCandidateForReview(db, config, candId, "personal/default");
+      assert.equal(rev2.ok, true);
+      if (!rev2.ok) throw new Error("review failed");
+      assert.equal(approveCandidate(db, config, { id: candId, scope: "personal/default", token: rev2.token, idempotencyKey: nextKey("ha") }).ok, true);
+      const fresh = seedActive(db, config, "rollback archive base");
+      const snap2 = {
+        status: (db.prepare(`SELECT status FROM records WHERE id=?`).get(fresh) as { status: string }).status,
+        ops: (db.prepare(`SELECT COUNT(*) AS n FROM operations`).get() as { n: number }).n,
+        audit: (db.prepare(`SELECT COUNT(*) AS n FROM audit`).get() as { n: number }).n,
+      };
+      db.exec(`CREATE TRIGGER t4_audit_fail2 BEFORE INSERT ON audit WHEN NEW.op='archive' BEGIN SELECT RAISE(ABORT, 'audit boom'); END;`);
+      const boom2 = archiveRecord(db, config, { id: fresh, scope: "personal/default", idempotencyKey: nextKey("ar"), reasonCode: "USER_ARCHIVED" });
+      assert.equal(boom2.code, "STORE_UNAVAILABLE");
+      db.exec(`DROP TRIGGER t4_audit_fail2;`);
+      assert.equal((db.prepare(`SELECT status FROM records WHERE id=?`).get(fresh) as { status: string }).status, snap2.status);
+      assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM operations`).get() as { n: number }).n, snap2.ops);
+      assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM audit`).get() as { n: number }).n, snap2.audit);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("replay survives DB reopen and target/expiry moves (same-process replay already covered)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-t4-"));
+    const cfg = writeConfig(dir);
+    const first = openDb(cfg);
+    const oldId = seedActive(first.db, first.config, "reopen replay base");
+    const params = correctionParams(oldId, "reopen replay fix");
+    const key = nextKey("kc");
+    const r1 = correctRequest(first.db, first.config, params, key);
+    assert.equal(r1.ok, true);
+    first.db.close();
+    const second = openDb(cfg);
+    try {
+      const r2 = correctRequest(second.db, second.config, params, key);
+      assert.equal((r2 as { deduplicated?: boolean }).deduplicated, true);
+      assert.deepEqual(r2.data, r1.data);
+      assert.equal(correctRequest(second.db, second.config, correctionParams(oldId, "changed body"), key).code, "CONFLICT");
+      // Archive the target after commit: the committed replay still replays
+      // stably (bypass), while a fresh key on the moved target is CONFLICT.
+      assert.equal(
+        archiveRecord(second.db, second.config, { id: oldId, scope: "personal/default", idempotencyKey: nextKey("ar"), reasonCode: "USER_ARCHIVED" }).ok,
+        true,
+      );
+      const r3 = correctRequest(second.db, second.config, params, key);
+      assert.equal((r3 as { deduplicated?: boolean }).deduplicated, true);
+      assert.deepEqual(r3.data, r1.data);
+      assert.equal(correctRequest(second.db, second.config, correctionParams(oldId, "fresh after archive"), nextKey("kc")).code, "CONFLICT");
+      // Expire the committed candidate row manually: committed replay still
+      // returns the stored envelope (EXPIRED is for fresh executions only).
+      const candId = (r1.data as { candidate: { id: string } }).candidate.id as string;
+      second.db.prepare(`UPDATE candidates SET expiresAt='2000-01-01T00:00:00.000Z' WHERE id=?`).run(candId);
+      const r4 = correctRequest(second.db, second.config, params, key);
+      assert.equal((r4 as { deduplicated?: boolean }).deduplicated, true);
+      assert.deepEqual(r4.data, r1.data);
+    } finally {
+      second.db.close();
     }
   });
 });

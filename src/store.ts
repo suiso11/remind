@@ -18,6 +18,11 @@
  *   target CONFLICT. Committed idempotent replays bypass the target check so
  *   a stored envelope replays stably after later target moves.
  * - record.recall is implemented here (T3): only status='active' rows match.
+ * - Local single-user error semantics (adopted plan, unchanged): id lookups
+ *   answer NOT_FOUND when the row is absent, FORBIDDEN_SCOPE on scope
+ *   mismatch, CONFLICT when present-but-inactive. This oracle can disclose
+ *   id existence to a same-scope caller; accepted as a residual limitation
+ *   for the local single-user CLI (no new semantics without agreement).
  */
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
@@ -553,6 +558,13 @@ export function createCandidate(
 
   try {
     const response = withTransaction(db, (): ResponseEnvelope => {
+      // Transaction-time target recheck (mirrors record.correct-request):
+      // the advisory gate above ran before BEGIN IMMEDIATE, so a record
+      // archived/superseded in between must not gain a correction candidate.
+      if (n.supersedes !== null) {
+        const gateIn = checkCorrectionTarget(db, config, n.scope, n.supersedes);
+        if (!gateIn.ok) throw new Error("target moved");
+      }
       // Budget gate BEFORE any insert: an over-budget success must not
       // leave an orphan candidate row or a cached failure with mutation.
       const probe: ResponseEnvelope = ok({
@@ -600,6 +612,13 @@ export function createCandidate(
     const msg = e instanceof Error ? e.message : String(e);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "target moved") {
+      // Re-read outside the rolled-back transaction for the precise code
+      // (NOT_FOUND / FORBIDDEN_SCOPE / CONFLICT), mirroring correct-request.
+      const gate = checkCorrectionTarget(db, config, n.scope, n.supersedes as string);
+      if (!gate.ok) return gate.res;
+      return budgeted(fail("CONFLICT"), config);
+    }
     // Unique-key collision on the idempotency key means a concurrent commit
     // won the race: re-read and replay deterministically.
     if (/UNIQUE constraint failed: operations/.test(msg)) {
@@ -1407,7 +1426,7 @@ export function archiveRecord(
         scope: args.scope,
         runId: null,
         approver: currentApprover(),
-        approvedAt: now,
+        approvedAt: null,
         token: null,
         reasonCode: "USER_ARCHIVED",
       });
