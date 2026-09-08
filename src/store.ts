@@ -93,16 +93,36 @@ function genId(prefix: string): string {
   return `${prefix}_${randomBytes(8).toString("hex")}`;
 }
 
-/** Scope is authorized when it is in startup config AND in the scopes table. */
+/** Scope authorization tri-state (P2 fix).
+ *
+ * - Scope absent from startup config => genuine denial (returns false).
+ * - Scope present in config but missing from the scopes table => genuine
+ *   denial (returns false; the row may have been revoked).
+ * - Any scopes-table I/O failure (closed DB, missing/corrupt table, I/O
+ *   error) THROWS Error("scope check unavailable"): callers must answer
+ *   STORE_UNAVAILABLE, never FORBIDDEN_SCOPE. Returning false here used to
+ *   misclassify STORE_UNAVAILABLE as FORBIDDEN_SCOPE.
+ */
 export function isScopeAuthorized(db: DatabaseSync, config: AppConfig, scope: string): boolean {
   if (!config.allowedScopes.includes(scope)) return false;
+  let row: { scope: string } | undefined;
   try {
-    const row = db.prepare(`SELECT scope FROM scopes WHERE scope = ?`).get(scope) as
+    row = db.prepare(`SELECT scope FROM scopes WHERE scope = ?`).get(scope) as
       | { scope: string }
       | undefined;
-    return !!row;
   } catch {
-    return false;
+    throw new Error("scope check unavailable");
+  }
+  return !!row;
+}
+
+/** Scope gate for envelope-returning ops: false => FORBIDDEN_SCOPE, throw => STORE_UNAVAILABLE. */
+function scopeGate(db: DatabaseSync, config: AppConfig, scope: string): ResponseEnvelope | null {
+  try {
+    if (!isScopeAuthorized(db, config, scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    return null;
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }
 
@@ -446,11 +466,15 @@ export function createCandidate(
   }
   if (saved) {
     if (saved.op !== "candidate.create") return budgeted(fail("CONFLICT"), config);
-    if (!isScopeAuthorized(db, config, n.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    const denied = scopeGate(db, config, n.scope);
+    if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
     return replaySaved(saved.responseJson, config);
   }
-  if (!isScopeAuthorized(db, config, n.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, n.scope);
+    if (denied) return denied;
+  }
 
   const now = nowOverride ?? nowIso();
   const nowMs = Date.parse(now);
@@ -539,7 +563,10 @@ export function getCandidateMeta(
   if (typeof scope !== "string" || countCp(scope) < 1 || countCp(scope) > 256 || hasControl(scope)) {
     return budgeted(fail("BAD_REQUEST"), config);
   }
-  if (!isScopeAuthorized(db, config, scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, scope);
+    if (denied) return denied;
+  }
   let row: CandidateRow | null;
   try {
     row = readCandidate(db, id);
@@ -600,7 +627,12 @@ export function getCandidateForReview(
   }
   // Authorize BEFORE disclosing the full body/token: a revoked scope
   // (removed from startup config or the scopes table) must not review.
-  if (!isScopeAuthorized(db, config, scope)) return { ok: false, code: "FORBIDDEN_SCOPE" };
+  // A scopes-table I/O failure is STORE_UNAVAILABLE, never FORBIDDEN_SCOPE.
+  try {
+    if (!isScopeAuthorized(db, config, scope)) return { ok: false, code: "FORBIDDEN_SCOPE" };
+  } catch {
+    return { ok: false, code: "STORE_UNAVAILABLE" };
+  }
   let row: CandidateRow | null;
   try {
     row = readCandidate(db, id);
@@ -664,11 +696,15 @@ export function approveCandidate(
   }
   if (saved) {
     if (saved.op !== "approve") return budgeted(fail("CONFLICT"), config);
-    if (!isScopeAuthorized(db, config, args.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
     return replaySaved(saved.responseJson, config);
   }
-  if (!isScopeAuthorized(db, config, args.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
+  }
 
   lazyExpire(db, args.id);
   let row: CandidateRow | null;
@@ -804,11 +840,15 @@ export function rejectCandidate(
   }
   if (saved) {
     if (saved.op !== "reject") return budgeted(fail("CONFLICT"), config);
-    if (!isScopeAuthorized(db, config, args.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
     return replaySaved(saved.responseJson, config);
   }
-  if (!isScopeAuthorized(db, config, args.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
+  }
 
   lazyExpire(db, args.id);
   let row: CandidateRow | null;
@@ -1071,7 +1111,10 @@ export function recallRecords(
   const parsed = parseRecallParams(config, params);
   if (!parsed.ok) return budgeted(parsed.res, config);
   const p = parsed.value;
-  if (!isScopeAuthorized(db, config, p.scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  {
+    const denied = scopeGate(db, config, p.scope);
+    if (denied) return denied;
+  }
 
   const now = nowOverride ?? nowIso();
   const recallId = genId("recall");

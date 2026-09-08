@@ -85,8 +85,14 @@ pairs still pass.
 - Bounded stdin: raw UTF-8 bytes are capped at `32768` **while streaming**
   (before buffering/parsing), so overflow without a newline still returns
   `LIMIT_EXCEEDED`. The `timeouts.cliMs` deadline aborts a never-ending
-  stdin with `TIMEOUT`. Line bytes are decoded as UTF-8 `fatal:true`;
-  invalid bytes return `BAD_REQUEST`. Neither path waits indefinitely.
+  stdin with `TIMEOUT`, and the store op runs on a worker thread bounded by
+  the REMAINING `cliMs`: SQLite busy wait is clamped to
+  `min(busyMs, remaining)` and an independent parent timer terminates the
+  worker on expiry (`TIMEOUT`, unknown commit outcome, idempotent replay).
+  A same-thread `setTimeout` alone cannot interrupt synchronous SQLite; the
+  worker boundary is what makes the deadline effective. Line bytes are
+  decoded as UTF-8 `fatal:true`; invalid bytes return `BAD_REQUEST`.
+  Neither path waits indefinitely.
 - Startup failures (missing `--config`, invalid config, DB open failure,
   empty/unreadable stdin) exit non-zero with **no stdout JSON** and a
   **fixed** stderr line only (`error: bad arguments` /
@@ -105,15 +111,24 @@ pairs still pass.
   against the store (T2-T3); `record.correct-request` returns
   `NOT_IMPLEMENTED` (honest T4 deferral) until T4.
 - Review discloses only for authorized scopes (startup config AND `scopes`
-  table); over-budget create/approve/reject fail closed with no orphan
-  rows; a known committed `ok:true` is never replaced by `TIMEOUT` or a
-  close failure (unknown outcomes keep idempotent replay).
+  table); a scopes-table I/O failure (closed DB, missing/corrupt table) is
+  `STORE_UNAVAILABLE`, never `FORBIDDEN_SCOPE` (genuine denials — unknown
+  config scope or revoked row — stay `FORBIDDEN_SCOPE`); over-budget
+  create/approve/reject fail closed with no orphan rows; a known committed
+  `ok:true` is never replaced by `TIMEOUT` or a close failure (a worker
+  terminated by the deadline has UNKNOWN outcome: `TIMEOUT` with idempotent
+  replay via the same key + params).
 
 ## Layout
 
 - `src/config.ts` — strict startup config load/validate
 - `src/protocol.ts` — envelopes, fixed codes/messages, bounds
-- `src/db.ts` — SQLite open + `scopes` seed + T2 domain tables
+- `src/db.ts` — SQLite open + `scopes` seed + T2 domain tables, plus
+  `applyEffectiveBusyTimeout` (P1 clamp `min(busyMs, remaining cliMs)`)
+- `src/deadline.ts` + `src/worker-op.ts` — P1 effective remaining deadline:
+  store op on a worker thread with its own connection, bounded busy wait,
+  independent parent timer with `worker.terminate()` (unknown commit
+  outcome documented; same-thread `setTimeout` cannot interrupt sync SQLite)
 - `src/normalize.ts` — T2 exact normalization (NFKC/trim/collapse/ASCII
   fold), canonical times/hashes, approval-token binding, TTY escaping,
   plus shared strict lone-surrogate well-formedness (`hasLoneSurrogate` /
