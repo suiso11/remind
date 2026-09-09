@@ -72,11 +72,13 @@
 | `record.get` | 1 件取得。同一 scope の id を status によらず返す | `id/scope` |
 | `record.list` | 有界一覧。既定 active のみ。順序 `createdAt DESC, id ASC`、`since` inclusive / `until` exclusive | `scope/limit/since/until/status?` |
 | `record.recall` | 有界ハイブリッド想起（§6）。利用を監査記録 | `query/tags[]/link/since/until/limit/scope/runId` |
+| `record.feedback` | 引用・採用の明示報告。露出検証＋usage追記＋heat加算を単一txnで実行。mere recallでは加算しない | `recallId/recordIds[]/scope/runId`（＋呼出者 `idempotencyKey` 必須） |
 | `record.correct` | 訂正。新 record 追記＋旧 `active → superseded` を同一 txn で行う。訂正時にリンク再付与可 | `recordId/body/kind=correction/provenance/scope/links[]?` |
 | `record.archive` | 検索・想起対象からの除外。`active → archived`（終端・復帰なし）。物理削除ではない | `id/scope/reasonCode`（固定コードのみ） |
 | `maintain.distill` | 有界保守。summary/correction レコードを通常の冪等 op で直接・自律的に書く（§7）。取消可能・同時実行 1 | `scope/cursor/limit/runId` |
 
 - `remember` の txn 範囲は raw・record・正本リンク・idempotency・audit のみである。Markdown 投影・索引更新はコミット後に行い、失敗時はリトライキューへ回す。投影の遅延・失敗はコミット済み記憶の利用可能性を損なわない（正本から直接読める）。
+- `record.feedback` は書込系（呼出者 `idempotencyKey` 必須・冪等は共通封筒に従う）。`record.recall` は `recallId` に対応する露出集合（返却 IDs・同一 `scope`）を有界保持する。露出集合外・他 scope の ID を含む報告は全体拒否（`FORBIDDEN_SCOPE`/`NOT_FOUND`）し `usage`・heat を一切変えない。検証通過分のみ `usage` 追記＋`note_heat` 加算を単一 txn で行う。`record.recall` 自体は露出のみで heat を加算しない。
 - 訂正の競合は旧行の条件付き UPDATE（`WHERE id=? AND status='active' AND scope=?`）の更新行数で勝者 1 件に絞り、敗者は `CONFLICT` で全巻き戻しとする。
 - `correct` / `archive` は対象行なしを `NOT_FOUND`、scope 不一致を `FORBIDDEN_SCOPE`、非 active 対象を `CONFLICT` とする。
 - エラーコード（固定）: `OK / BAD_REQUEST / NOT_FOUND / CONFLICT / FORBIDDEN_SCOPE / STORE_UNAVAILABLE / LIMIT_EXCEEDED / TIMEOUT`。`message` は固定テンプレのみとし、記憶本文・クエリ原文を含めない。
@@ -89,7 +91,7 @@
 
 - 正本（SQLite）: `raw_events(seq PK, sessionId, body, observedAt, scope, createdAt)` 追記のみ。更新・削除なし。
 - 正本（SQLite）: `records(id PK, body, bodyHash, kind, source, observedAt, scope, status, supersedes NULL, revision, sessionRef, createdAt)`。
-- 正本（SQLite）: `record_tags(recordId, tag)` / `record_links(fromId, toName)` 正本 outbound（exact 保持。真性の未解決対象のみ dangling 可）。
+- 正本（SQLite）: `record_tags(recordId, tag)` / `record_links(fromId, toRef)` 正本 outbound（`links[]` は不透明な安定 record ref、通常は既存 record ID。未解決 ref は格納可だが、グラフ走査は active・同一 scope に解決する ref のみ辿り、Markdown は `[[ref]]` と描画）。
 - 正本（SQLite）: `note_heat(recordId, usedCount, lastUsedAt)` 利用（引用・採用）のみ加算。露出では加算しない。
 - 正本（SQLite）: `scopes(scope PK)`（起動時 config から初期投入）/ `operations(idempotencyKey PK, ...)` / `audit(...)`（本文なし）/ `usage(...)`（本文なし）。
 - 派生（再構築可）: `vault_md_projection`（Markdown 生成物）/ `record_backlinks` ビュー / `fts_notes(...)` / `vec_notes(...)`。欠落・再構築は正本に影響しない。
@@ -120,7 +122,7 @@ raw 現物は常に正本に保持。要約レコードから sessionRef で raw
 3. **ベクトル候補:** 埋め込み類似の上位 M 件（モデル・設定は M2 で選定・pin する。選定の柔軟性は残すが意味検索能力自体は計画完成に必須。欠落時は §8 の語彙＋グラフ縮退に従う）。安定順序は類似度 DESC・`createdAt DESC`・`id ASC`。
 4. **タグ/リンク種:** `tags[]` exact・`link` exact の種レコードを加える（`createdAt DESC, id ASC`）。
 5. **有界グラフ展開:** 種＋上位候補から正本 outbound・派生 backlink を深さ上限つきで展開する（dangling は無視して継続）。同距離は `createdAt DESC, id ASC`。
-6. **raw への下降（M1 必須）:** 要約レコードの `sessionRef` から raw 現物を上限つきで取得する。
+6. **raw への下降（M1 必須・操作的定義）:** `raw_events` は語彙索引対象とし、raw ヒットは `sessionRef` で active・同一 scope レコードへ写像して順位に加算する。応答はあくまでレコード snippet のみとし raw 本文は返さない。
 7. **重複排除・融合:** id で dedupe し、語彙順位・ベクトル順位・グラフ距離・`usedCount` を固定重みで融合する。同点は `createdAt DESC, id ASC` で打破する。
 8. **有界投影:** 本文先頭から最大 `snippetMaxCp` の前方切り出し＋ `truncated(bool)`。応答は `recallId + items[{id, snippet, truncated, tags, createdAt}]`。
 9. **予算:** アイテム数・トークン・バイト・グラフ深さ・raw 下降件数に上限を設け、超過は `LIMIT_EXCEEDED` で切詰めなし。
@@ -142,7 +144,7 @@ raw 現物は常に正本に保持。要約レコードから sessionRef で raw
 
 ## 8. 制限・タイムアウト・縮退
 
-以下の数値は**暫定既定値（config 化）**であり、製品の本質的決定ではない。変更は起動時 config のみで行い、要求 JSON による上書き・実行中の書換えは受け付けない。
+以下の数値は**暫定既定値（config 化）**であり、製品の本質的決定ではない。変更は起動時 config のみで行い、要求 JSON による上書き・実行中の書換えは受け付けない。`vaultPath`（ローカル Markdown 投影先）は必須の起動時 config とし、欠落時は起動失敗とする。
 
 - `body 2000cp / query 500cp / tags 5 / links 8 / limit 既定10・最大25 / snippet 200cp / 応答合計 8KB / 生要求 32KB`
 - `グラフ深さ 2 / グラフ展開上限 40 / raw 下降上限 3 / 融合候補上限 60`
@@ -165,10 +167,10 @@ raw 現物は常に正本に保持。要約レコードから sessionRef で raw
 - **R6 アーカイブ:** `archive` 後に想起・一覧に出ない。行は保持され、物理削除ではない。
 - **R7 冪等性:** 同一キー＋同一 params 再送は `deduplicated:true` で同一結果、params 改変は `CONFLICT`、キー欠落の書込は `BAD_REQUEST`。
 - **R8 分離と監査:** 他 scope の record は `recall/get/list` に出ない。`audit/usage`・エラー応答に本文原文を含まない。直接ファイル編集の無言取込み経路が存在しない。
-- **R9 育てる:** `note_heat` は引用・採用時のみ加算され、単なる露出では加算されない。保守バッチは有界・取消可能・同時実行 1 であり、直接書込みである。
+- **R9 育てる（feedback 検証）:** `note_heat` は `record.feedback` の検証通過分のみ加算し、mere recall では加算しない。露出集合外・他 scope ID を含む feedback は全体拒否し heat・usage 不変。保守バッチは有界・取消可能・同時実行 1 で直接書込み。
 - **R10 有界・決定論:** 同一正本・索引・heat 状態での同一 `recall` は同一順序（源泉ごとの安定順序・同点打破は §6）。超過は `LIMIT_EXCEEDED` で切詰めなし。グラフ深さ・候補上限を超過しない。
 - **R11 縮退:** DB 不可時は `STORE_UNAVAILABLE` を返し、呼出側は記憶なしで継続する。無監査の想起成功を作らない。投影・索引の失敗はコミット済み記憶を利用不可にしない。
-- **R12 単一正本:** 正本読取りは SQLite のみで完結する。Markdown・索引を消去・陳腐化させても正本から再構築でき、記憶内容は失われない。
+- **R12 単一正本・再構築:** 正本読取りは SQLite のみで完結する。必須 `vaultPath` への Markdown 投影を消去・陳腐化させても正本から再構築でき、内容・`[[ref]]`・backlink が復元される。再構築前後で正本内容は不変。
 
 ---
 
