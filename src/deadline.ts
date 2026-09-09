@@ -1,29 +1,32 @@
 /**
  * P1 fix: effective overall automated-CLI deadline for synchronous SQLite work.
  *
- * Honest constraint: node:sqlite DatabaseSync calls are synchronous. A plain
- * JS setTimeout on the same thread CANNOT interrupt a blocked BEGIN
- * IMMEDIATE (SQLite busy wait) or a long instr() scan while it runs. The two
- * effective mechanisms here are therefore:
+ * CLI-only contract (honest): the automated JSON path bounds the WHOLE
+ * operation by an INDEPENDENT parent timer followed by whole-process exit.
+ * There is no long-lived safe-cancellation promise: when the timer fires the
+ * CLI answers TIMEOUT (unknown commit outcome) and exits, letting the OS
+ * close handles. SQLite recovery then decides what committed; a TIMEOUT must
+ * never be read as "rolled back". Callers replay with the same idempotency
+ * key + params: a committed write replays the stored envelope with
+ * deduplicated:true, uncommitted work is resolved by re-execution.
+ *
+ * Two mechanisms:
  *  (1) bound the SQLite busy wait itself: effectiveBusyMs = min(busyMs,
  *      remaining cliMs), applied as PRAGMA busy_timeout before the op, so a
- *      held write lock can never block past the remaining CLI deadline; and
- *  (2) run the whole store op on a worker thread whose lifetime is bounded
- *      by an INDEPENDENT timer on the parent thread: on expiry the parent
- *      calls worker.terminate(), which stops a long scan even mid-query.
- *
- * Unknown-outcome rule: a terminated worker may have committed before
- * termination (or not). The CLI answers TIMEOUT and the caller replays with
- * the same idempotency key + params: committed write ops replay the stored
- * envelope deterministically; uncommitted work was rolled back by closing the
- * worker's connection (no orphan txn survives a terminated worker because
- * the worker always closes its own connection in a finally block, and
- * SQLite rolls back an open transaction on close).
+ *      held write lock cannot block past the remaining CLI deadline; and
+ *  (2) run the whole store op on a worker thread bounded by the independent
+ *      parent timer. On expiry the parent answers TIMEOUT; worker.terminate()
+ *      is attempted best-effort only: Worker.terminate does NOT reliably
+ *      unwind the worker's finally blocks nor promptly interrupt native
+ *      SQLite calls, so no rollback is promised. The reliable bound is the
+ *      parent's timely TIMEOUT response plus process exit (fs.writeSync +
+ *      process.exit), which closes the parent handle; the worker is an
+ *      OS-level thread whose handles close on process exit.
  */
 import { Worker } from "node:worker_threads";
 import * as path from "node:path";
 import type { AppConfig } from "./config.js";
-import type { ResponseEnvelope } from "./protocol.js";
+import { applyResponseBudget, fail, type ResponseEnvelope } from "./protocol.js";
 
 /** Bound a configured busy wait by the remaining overall deadline. */
 export function effectiveBusyMs(busyMs: number, remainingMs: number): number {
@@ -58,18 +61,33 @@ function workerEntryPath(): string {
   return path.join(process.cwd(), "dist", "src", "worker-op.js");
 }
 
+function storeUnavailable(req: WorkerOpRequest): ResponseEnvelope {
+  try {
+    return applyResponseBudget(fail("STORE_UNAVAILABLE"), req.config.limits.responseMaxBytes);
+  } catch {
+    return fail("STORE_UNAVAILABLE") as ResponseEnvelope;
+  }
+}
+
 /**
  * Run one validated store op in a worker thread bounded by remainingMs.
- * Resolves timedOut:true when the independent parent timer fires first
- * (worker terminated); otherwise the worker's envelope. Never throws: worker
- * errors/close without a message resolve to a STORE_UNAVAILABLE-shaped
- * outcome via the caller (here: timedOut:false is only for real replies; a
- * crash resolves as a thrown envelope the caller maps -- implemented as a
- * generic failure reply through `onError` below).
+ *
+ * Contract:
+ * - Real worker message before the deadline wins: resolves timedOut:false
+ *   with the worker's envelope (success or domain error preserved).
+ * - Deadline elapsed first: resolves timedOut:true (caller answers TIMEOUT,
+ *   unknown commit outcome). Late worker messages are ignored (no late OK).
+ * - Worker construction failure, worker 'error', or exit without a usable
+ *   message resolves IMMEDIATELY as timedOut:false with a STORE_UNAVAILABLE
+ *   envelope (never a false TIMEOUT). The timer stays live until settlement:
+ *   it is only cleared inside done(), i.e. once one of the above outcomes
+ *   has been chosen.
+ * - Termination after settlement is best-effort only (see header).
  */
 export function runStoreOpWithDeadline(
   req: WorkerOpRequest,
   remainingMs: number,
+  workerPathOverride?: string,
 ): Promise<WorkerOpOutcome> {
   const budget = Math.max(0, Math.floor(remainingMs));
   if (budget <= 0) return Promise.resolve({ timedOut: true });
@@ -84,8 +102,8 @@ export function runStoreOpWithDeadline(
       } catch {
         /* ignore */
       }
-      // Best-effort terminate: a finished worker may already have exited;
-      // a timed-out worker is killed here to interrupt a long scan.
+      // Best-effort terminate only: Worker.terminate() does not reliably
+      // unwind worker finally blocks nor interrupt native SQLite promptly.
       try {
         void worker?.terminate();
       } catch {
@@ -100,9 +118,9 @@ export function runStoreOpWithDeadline(
       /* ignore */
     }
     try {
-      worker = new Worker(workerEntryPath(), { workerData: req });
+      worker = new Worker(workerPathOverride ?? workerEntryPath(), { workerData: req });
     } catch {
-      done({ timedOut: true });
+      done({ timedOut: false, res: storeUnavailable(req) });
       return;
     }
     worker.once("message", (msg: unknown) => {
@@ -110,16 +128,17 @@ export function runStoreOpWithDeadline(
       if (res && typeof res === "object" && typeof (res as { ok?: unknown }).ok === "boolean") {
         done({ timedOut: false, res: res as ResponseEnvelope });
       } else {
-        // Worker replied without an envelope (should not happen): treat as
-        // an expired bound rather than fabricating success.
-        done({ timedOut: true });
+        // Worker replied without an envelope: immediate failure, not a
+        // deadline expiry.
+        done({ timedOut: false, res: storeUnavailable(req) });
       }
     });
-    worker.once("error", () => done({ timedOut: true }));
-    worker.once("exit", (code: number) => {
-      // A crash exit without a message must not hang: map to timeout
-      // (unknown outcome) so the CLI answers TIMEOUT, never a late OK.
-      if (!settled && code !== 0) done({ timedOut: true });
+    worker.once("error", () => done({ timedOut: false, res: storeUnavailable(req) }));
+    worker.once("exit", () => {
+      // Crash/normal exit without a usable message: immediate
+      // STORE_UNAVAILABLE so the CLI never hangs and never emits a false
+      // TIMEOUT. If a message already settled us, this is a no-op.
+      if (!settled) done({ timedOut: false, res: storeUnavailable(req) });
     });
   });
 }

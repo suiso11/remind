@@ -15,6 +15,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/tests/*.test.js",
     "smoke": "npm run build && node dist/scripts/smoke.js",
+    "acceptance": "npm run build && node --test dist/tests/acceptance.test.js",
     "cli": "node dist/src/cli.js",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },

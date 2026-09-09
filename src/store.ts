@@ -1,6 +1,8 @@
 /**
  * T2 domain: candidates + human review/approve/reject atop T1.
- * Plan ref: plan.md 14.2-14.5 (proposal adopted for T2 only).
+ * T4 adds: record.correct-request (correction candidate creation),
+ * correction approval (atomic conditional supersede), and human archive.
+ * Plan ref: plan.md 14.2/14.4-14.5/14.7 (proposal adopted for T2-T4).
  *
  * Notes / smallest explicit corrections to the plan text:
  * - candidate.get requires {id, scope}: plan 14.2 lists params {id} but 14.5
@@ -8,14 +10,19 @@
  *   vs stored scope. Without a request scope the check is impossible, so T2
  *   requires scope and answers BAD_REQUEST when absent, FORBIDDEN_SCOPE on
  *   mismatch. No body is ever returned on this path.
- * - Human review/approve/reject require --scope for the same reason: the id
- *   lookup must bind to a request scope. Missing scope is BAD_REQUEST.
- * - candidate.create with kind=correction or a supersedes pointer is answered
- *   NOT_IMPLEMENTED (honest T4 deferral): the supersedes column exists in the
- *   schema, but the T4 conditional-supersede transaction is not implemented.
- * - record.correct-request / archive stay NOT_IMPLEMENTED /
- *   FORBIDDEN-over-JSON exactly as before (T4 owns them). record.recall is
- *   implemented here (T3).
+ * - Human review/approve/reject/archive require --scope for the same reason:
+ *   the id lookup must bind to a request scope. Missing scope is BAD_REQUEST.
+ * - candidate.create with kind=correction requires a supersedes pointer to an
+ *   existing active same-scope record (same rule as record.correct-request);
+ *   missing target is NOT_FOUND, scope mismatch FORBIDDEN_SCOPE, inactive
+ *   target CONFLICT. Committed idempotent replays bypass the target check so
+ *   a stored envelope replays stably after later target moves.
+ * - record.recall is implemented here (T3): only status='active' rows match.
+ * - Local single-user error semantics (adopted plan, unchanged): id lookups
+ *   answer NOT_FOUND when the row is absent, FORBIDDEN_SCOPE on scope
+ *   mismatch, CONFLICT when present-but-inactive. This oracle can disclose
+ *   id existence to a same-scope caller; accepted as a residual limitation
+ *   for the local single-user CLI (no new semantics without agreement).
  */
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
@@ -321,14 +328,12 @@ interface StoredOp {
 }
 
 function readOperation(db: DatabaseSync, key: string): StoredOp | null {
-  try {
-    const row = db
-      .prepare(`SELECT op, requestHash, responseJson FROM operations WHERE idempotencyKey = ?`)
-      .get(key) as StoredOp | undefined;
-    return row ?? null;
-  } catch {
-    return null;
-  }
+  // Fail closed: DB I/O failures THROW so callers answer STORE_UNAVAILABLE.
+  // Never swallow to null (null means "no prior key", i.e. safe to insert).
+  const row = db
+    .prepare(`SELECT op, requestHash, responseJson FROM operations WHERE idempotencyKey = ?`)
+    .get(key) as StoredOp | undefined;
+  return row ?? null;
 }
 
 function replaySaved(savedJson: string, config: AppConfig): ResponseEnvelope {
@@ -364,6 +369,82 @@ export function readCandidate(db: DatabaseSync, id: string): CandidateRow | null
     return row ?? null;
   } catch {
     return null;
+  }
+}
+
+export interface RecordRow {
+  id: string;
+  candidateId: string;
+  body: string;
+  bodyHash: string;
+  kind: string;
+  source: string;
+  observedAt: string;
+  scope: string;
+  status: string;
+  supersedes: string | null;
+  createdAt: string;
+}
+
+/**
+ * Record read. THROWS on query failure (fail closed → STORE_UNAVAILABLE);
+ * returns null only when the row is genuinely absent. Never fabricate a row:
+ * a fabricated "active" target would let a correction approval supersede
+ * nothing while minting a new record.
+ */
+function readRecordOrThrow(db: DatabaseSync, id: string): RecordRow | null {
+  const row = db
+    .prepare(`SELECT id, candidateId, body, bodyHash, kind, source, observedAt, scope, status, supersedes, createdAt FROM records WHERE id = ?`)
+    .get(id) as RecordRow | undefined;
+  return row ?? null;
+}
+
+/**
+ * Correction target gate (creation-time fast path). The approval transaction
+ * re-checks atomically with a conditional UPDATE, so this is advisory only.
+ * Returns the target row, or an envelope for NOT_FOUND / FORBIDDEN_SCOPE /
+ * CONFLICT / STORE_UNAVAILABLE.
+ */
+function checkCorrectionTarget(
+  db: DatabaseSync,
+  config: AppConfig,
+  scope: string,
+  supersedes: string,
+): { ok: true; target: RecordRow } | { ok: false; res: ResponseEnvelope } {
+  let target: RecordRow | null;
+  try {
+    target = readRecordOrThrow(db, supersedes);
+  } catch {
+    return { ok: false, res: budgeted(fail("STORE_UNAVAILABLE"), config) };
+  }
+  if (!target) return { ok: false, res: budgeted(fail("NOT_FOUND"), config) };
+  if (target.scope !== scope) return { ok: false, res: budgeted(fail("FORBIDDEN_SCOPE"), config) };
+  if (target.status !== "active") return { ok: false, res: budgeted(fail("CONFLICT"), config) };
+  return { ok: true, target };
+}
+
+/** Run-result changes count for conditional UPDATEs (node:sqlite run payload). */
+function changedRows(result: unknown): number {
+  const c = (result as { changes?: unknown } | null)?.changes;
+  if (typeof c === "number" && Number.isSafeInteger(c)) return c;
+  if (typeof c === "bigint") return Number(c);
+  return 0;
+}
+
+/**
+ * Stored-body integrity: the committed bodyHash must equal the digest of the
+ * stored normalized body. Creation writes both consistently, so a mismatch
+ * means the row was tampered with outside the domain path (e.g. direct SQL
+ * UPDATE of body without bodyHash, or vice versa). Approval/rejection must
+ * refuse with CONFLICT and create no record rather than approve altered
+ * content under a stale hash. Checked outside AND inside the transaction
+ * (fresh re-read) so a concurrent tamper cannot slip through.
+ */
+function storedBodyHashIntact(row: CandidateRow): boolean {
+  try {
+    return safeEqual(row.bodyHash, bodyHashFor(normalizeBody(row.body)));
+  } catch {
+    return false;
   }
 }
 
@@ -449,9 +530,13 @@ export function createCandidate(
   if (!parsed.ok) return budgeted(parsed.res, config);
   const n = parsed.value;
 
-  // Honest T4 deferral: schema carries supersedes, behavior does not (yet).
+  // T4: correction candidates must name their target. kind=correction without
+  // supersedes (or vice versa) is BAD_REQUEST; the target must exist, be in
+  // the same scope, and be active. Committed replays below bypass this check.
   if (n.kind === "correction" || n.supersedes !== null) {
-    return budgeted(fail("NOT_IMPLEMENTED"), config);
+    if (n.kind !== "correction" || n.supersedes === null) {
+      return budgeted(fail("BAD_REQUEST"), config);
+    }
   }
 
   const reqHash = requestHashFor("candidate.create", normalizedParamsForHash(n));
@@ -475,6 +560,11 @@ export function createCandidate(
     const denied = scopeGate(db, config, n.scope);
     if (denied) return denied;
   }
+  // Creation-time target gate (advisory; approval re-checks atomically).
+  if (n.supersedes !== null) {
+    const gate = checkCorrectionTarget(db, config, n.scope, n.supersedes);
+    if (!gate.ok) return gate.res;
+  }
 
   const now = nowOverride ?? nowIso();
   const nowMs = Date.parse(now);
@@ -485,6 +575,13 @@ export function createCandidate(
 
   try {
     const response = withTransaction(db, (): ResponseEnvelope => {
+      // Transaction-time target recheck (mirrors record.correct-request):
+      // the advisory gate above ran before BEGIN IMMEDIATE, so a record
+      // archived/superseded in between must not gain a correction candidate.
+      if (n.supersedes !== null) {
+        const gateIn = checkCorrectionTarget(db, config, n.scope, n.supersedes);
+        if (!gateIn.ok) throw new Error("target moved");
+      }
       // Budget gate BEFORE any insert: an over-budget success must not
       // leave an orphan candidate row or a cached failure with mutation.
       const probe: ResponseEnvelope = ok({
@@ -493,8 +590,8 @@ export function createCandidate(
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
         `INSERT INTO candidates(id, body, bodyHash, kind, source, observedAt, scope, supersedes, status, idempotencyKey, requestHash, createdAt, expiresAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'candidate', ?, ?, ?, ?)`,
-      ).run(id, n.body, n.bodyHash, n.kind, n.source, n.observedAt, n.scope, idempotencyKey, reqHash, createdAt, expiresAt);
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'candidate', ?, ?, ?, ?)`,
+      ).run(id, n.body, n.bodyHash, n.kind, n.source, n.observedAt, n.scope, n.supersedes, idempotencyKey, reqHash, createdAt, expiresAt);
       for (const t of n.tags) {
         db.prepare(`INSERT INTO candidate_tags(candidateId, tag) VALUES (?, ?)`).run(id, t);
       }
@@ -532,10 +629,22 @@ export function createCandidate(
     const msg = e instanceof Error ? e.message : String(e);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "target moved") {
+      // Re-read outside the rolled-back transaction for the precise code
+      // (NOT_FOUND / FORBIDDEN_SCOPE / CONFLICT), mirroring correct-request.
+      const gate = checkCorrectionTarget(db, config, n.scope, n.supersedes as string);
+      if (!gate.ok) return gate.res;
+      return budgeted(fail("CONFLICT"), config);
+    }
     // Unique-key collision on the idempotency key means a concurrent commit
     // won the race: re-read and replay deterministically.
     if (/UNIQUE constraint failed: operations/.test(msg)) {
-      const again = readOperation(db, idempotencyKey);
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
       if (again && again.op === "candidate.create" && again.requestHash === reqHash) {
         return replaySaved(again.responseJson, config);
       }
@@ -726,12 +835,18 @@ export function approveCandidate(
     lazyExpire(db, args.id);
     return budgeted(fail("EXPIRED"), config);
   }
-  // Correction approvals need the T4 conditional-supersede transaction.
-  if (row.kind === "correction" || row.supersedes !== null) {
-    return budgeted(fail("NOT_IMPLEMENTED"), config);
+  // T4: correction approvals run the conditional-supersede transaction.
+  // A correction candidate without a supersedes pointer is malformed and can
+  // never approve (fail closed); creation always sets one.
+  const isCorrection = row.kind === "correction" || row.supersedes !== null;
+  if (isCorrection && (typeof row.supersedes !== "string" || row.supersedes.length === 0)) {
+    return budgeted(fail("CONFLICT"), config);
   }
   // A metadata read failure here is STORE_UNAVAILABLE: binding the token
   // against fabricated empty tags / null link could approve the wrong set.
+  // Tampered body/bodyHash (stored digest != digest of stored body) is
+  // CONFLICT with no record: the stale-hash approve path is closed here.
+  if (!storedBodyHashIntact(row)) return budgeted(fail("CONFLICT"), config);
   let expected: string;
   try {
     expected = tokenForStored(row, readTags(db, args.id), readLink(db, args.id));
@@ -739,6 +854,13 @@ export function approveCandidate(
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
   if (!safeEqual(args.token, expected)) return budgeted(fail("CONFLICT"), config);
+  // Creation-time advisory target gate for corrections: missing / foreign /
+  // inactive targets fail fast here; the transaction below is authoritative
+  // (conditional UPDATE picks exactly one winner on races).
+  if (isCorrection) {
+    const gate = checkCorrectionTarget(db, config, args.scope, row.supersedes as string);
+    if (!gate.ok) return gate.res;
+  }
 
   const approvedAt = nowOverride ?? nowIso();
   const recId = genId("rec");
@@ -747,6 +869,7 @@ export function approveCandidate(
       // Re-verify inside the transaction (fail closed on concurrent terminal move).
       const fresh = readCandidate(db, args.id);
       if (!fresh || fresh.status !== "candidate") throw new Error("state moved");
+      if (!storedBodyHashIntact(fresh)) throw new Error("token moved");
       if (Date.parse(fresh.expiresAt) <= Date.now()) throw new Error("expired now");
       if (!safeEqual(args.token, tokenForStored(fresh, readTags(db, args.id), readLink(db, args.id)))) {
         throw new Error("token moved");
@@ -755,10 +878,42 @@ export function approveCandidate(
       // on an over-budget success.
       const probe: ResponseEnvelope = ok({ record: { id: recId } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
-      db.prepare(
-        `INSERT INTO records(id, candidateId, body, bodyHash, kind, source, observedAt, scope, status, supersedes, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?)`,
-      ).run(recId, fresh.id, fresh.body, fresh.bodyHash, fresh.kind, fresh.source, fresh.observedAt, fresh.scope, approvedAt);
+      const freshIsCorrection = fresh.kind === "correction" || fresh.supersedes !== null;
+      if (freshIsCorrection) {
+        // Atomic correction commit: exactly one approval may move the old
+        // row active → superseded. The conditional UPDATE is the arbiter:
+        // 0 changed rows means a competing approval (or archive) won, or the
+        // scope moved — everything rolls back as CONFLICT / FORBIDDEN_SCOPE.
+        if (typeof fresh.supersedes !== "string" || fresh.supersedes.length === 0) {
+          throw new Error("supersede lost");
+        }
+        let target: RecordRow | null;
+        try {
+          target = readRecordOrThrow(db, fresh.supersedes);
+        } catch {
+          throw new Error("db over cap");
+        }
+        if (!target) throw new Error("supersede lost");
+        if (target.scope !== fresh.scope || target.scope !== args.scope) throw new Error("supersede scope");
+        let moved: unknown;
+        try {
+          moved = db
+            .prepare(`UPDATE records SET status='superseded' WHERE id=? AND status='active' AND scope=?`)
+            .run(target.id, fresh.scope);
+        } catch {
+          throw new Error("db over cap");
+        }
+        if (changedRows(moved) !== 1) throw new Error("supersede lost");
+        db.prepare(
+          `INSERT INTO records(id, candidateId, body, bodyHash, kind, source, observedAt, scope, status, supersedes, createdAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+        ).run(recId, fresh.id, fresh.body, fresh.bodyHash, fresh.kind, fresh.source, fresh.observedAt, fresh.scope, target.id, approvedAt);
+      } else {
+        db.prepare(
+          `INSERT INTO records(id, candidateId, body, bodyHash, kind, source, observedAt, scope, status, supersedes, createdAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?)`,
+        ).run(recId, fresh.id, fresh.body, fresh.bodyHash, fresh.kind, fresh.source, fresh.observedAt, fresh.scope, approvedAt);
+      }
       for (const t of readTags(db, args.id)) {
         db.prepare(`INSERT OR IGNORE INTO record_tags(recordId, tag) VALUES (?, ?)`).run(recId, t);
       }
@@ -766,7 +921,8 @@ export function approveCandidate(
       if (lk !== null) {
         db.prepare(`INSERT OR IGNORE INTO record_links(fromId, toName) VALUES (?, ?)`).run(recId, lk);
       }
-      db.prepare(`UPDATE candidates SET status='approved' WHERE id=? AND status='candidate'`).run(args.id);
+      const flipped = db.prepare(`UPDATE candidates SET status='approved' WHERE id=? AND status='candidate'`).run(args.id);
+      if (changedRows(flipped) !== 1) throw new Error("state moved");
       const res: ResponseEnvelope = ok({ record: { id: recId } });
       const stored = budgeted(res, config);
       db.prepare(`INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`).run(
@@ -798,14 +954,22 @@ export function approveCandidate(
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
-      const again = readOperation(db, args.idempotencyKey);
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, args.idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
       if (again && again.op === "approve" && again.requestHash === reqHash) {
         return replaySaved(again.responseJson, config);
       }
       return budgeted(fail("CONFLICT"), config);
     }
     if (msg === "expired now") return budgeted(fail("EXPIRED"), config);
-    if (msg === "state moved" || msg === "token moved") return budgeted(fail("CONFLICT"), config);
+    if (msg === "supersede scope") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "state moved" || msg === "token moved" || msg === "supersede lost") {
+      return budgeted(fail("CONFLICT"), config);
+    }
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }
@@ -870,7 +1034,8 @@ export function rejectCandidate(
     return budgeted(fail("EXPIRED"), config);
   }
   // Same fail-closed metadata rule as approve: never bind against
-  // fabricated empty tags / null link.
+  // fabricated empty tags / null link. Tampered body/bodyHash also CONFLICT.
+  if (!storedBodyHashIntact(row)) return budgeted(fail("CONFLICT"), config);
   try {
     if (!safeEqual(args.token, tokenForStored(row, readTags(db, args.id), readLink(db, args.id)))) {
       return budgeted(fail("CONFLICT"), config);
@@ -884,6 +1049,7 @@ export function rejectCandidate(
     const response = withTransaction(db, (): ResponseEnvelope => {
       const fresh = readCandidate(db, args.id);
       if (!fresh || fresh.status !== "candidate") throw new Error("state moved");
+      if (!storedBodyHashIntact(fresh)) throw new Error("token moved");
       if (Date.parse(fresh.expiresAt) <= Date.now()) throw new Error("expired now");
       if (!safeEqual(args.token, tokenForStored(fresh, readTags(db, args.id), readLink(db, args.id)))) {
         throw new Error("token moved");
@@ -922,7 +1088,12 @@ export function rejectCandidate(
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
-      const again = readOperation(db, args.idempotencyKey);
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, args.idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
       if (again && again.op === "reject" && again.requestHash === reqHash) {
         return replaySaved(again.responseJson, config);
       }
@@ -930,6 +1101,379 @@ export function rejectCandidate(
     }
     if (msg === "expired now") return budgeted(fail("EXPIRED"), config);
     if (msg === "state moved" || msg === "token moved") return budgeted(fail("CONFLICT"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* T4 correction-request + archive (plan 14.7 adopted subset)            */
+/* ------------------------------------------------------------------ */
+
+interface NormalizedCorrection {
+  recordId: string;
+  body: string;
+  bodyHash: string;
+  source: string;
+  observedAt: string;
+  scope: string;
+  tags: string[];
+  link: string | null;
+  runId: string | null;
+}
+
+type CorrectionParse =
+  | { ok: true; value: NormalizedCorrection }
+  | { ok: false; res: ResponseEnvelope };
+
+/**
+ * Validate + normalize record.correct-request params (no DB writes).
+ * Short form of candidate.create(kind=correction, supersedes=recordId):
+ * kind, when present, must be exactly "correction"; ttlSec is not accepted
+ * (corrections share the standard candidate TTL).
+ */
+export function parseCorrectRequestParams(
+  config: AppConfig,
+  params: Record<string, unknown>,
+): CorrectionParse {
+  if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
+  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "tags", "link", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return { ok: false, res: bad() };
+  }
+  if (containsLoneSurrogateDeep(Object.keys(params))) return { ok: false, res: bad() };
+  const { recordId, body, kind, provenance, scope, tags, link, runId } = params;
+
+  if (typeof recordId !== "string" || recordId.length === 0 || recordId.length > 256) {
+    return { ok: false, res: bad() };
+  }
+  if (hasControl(recordId)) return { ok: false, res: bad() };
+  if (kind !== undefined && kind !== "correction") return { ok: false, res: bad() };
+
+  if (typeof body !== "string") return { ok: false, res: bad() };
+  if (checkLenCp(body, 1, config.limits.bodyMaxCp) === "long") return { ok: false, res: limitExceeded() };
+  const nBody = normalizeBody(body);
+  const bodyLen = checkLenCp(nBody, 1, Math.min(2000, config.limits.bodyMaxCp));
+  if (bodyLen === "short") return { ok: false, res: bad() };
+  if (bodyLen === "long") return { ok: false, res: limitExceeded() };
+
+  if (!isPlainObject(provenance)) return { ok: false, res: bad() };
+  const pKeys = Object.keys(provenance);
+  if (pKeys.length !== 2 || !pKeys.includes("source") || !pKeys.includes("observedAt")) {
+    return { ok: false, res: bad() };
+  }
+  const source = provenance["source"];
+  const observedAt = provenance["observedAt"];
+  if (typeof source !== "string") return { ok: false, res: bad() };
+  const srcLen = checkLenCp(source, 1, 256);
+  if (srcLen === "long") return { ok: false, res: limitExceeded() };
+  if (srcLen === "short" || hasControl(source)) return { ok: false, res: bad() };
+  const canonObs = canonicalTime(observedAt);
+  if (canonObs === null) return { ok: false, res: bad() };
+
+  if (typeof scope !== "string") return { ok: false, res: bad() };
+  const scopeLen = checkLenCp(scope, 1, 256);
+  if (scopeLen === "long") return { ok: false, res: limitExceeded() };
+  if (scopeLen === "short" || hasControl(scope)) return { ok: false, res: bad() };
+
+  let nTags: string[] = [];
+  if (tags !== undefined) {
+    if (!Array.isArray(tags)) return { ok: false, res: bad() };
+    if (tags.length > config.limits.tagsMax) return { ok: false, res: limitExceeded() };
+    const seen = new Set<string>();
+    for (const t of tags) {
+      if (typeof t !== "string") return { ok: false, res: bad() };
+      const tl = checkLenCp(t, 1, 256);
+      if (tl === "long") return { ok: false, res: limitExceeded() };
+      if (tl === "short" || hasControl(t)) return { ok: false, res: bad() };
+      const nt = normalizeTag(t);
+      if (countCp(nt) < 1 || countCp(nt) > 256) return { ok: false, res: bad() };
+      seen.add(nt);
+    }
+    nTags = [...seen].sort();
+  }
+
+  let nLink: string | null = null;
+  if (link !== undefined && link !== null) {
+    if (typeof link !== "string") return { ok: false, res: bad() };
+    const ll = checkLenCp(link, 1, 256);
+    if (ll === "long") return { ok: false, res: limitExceeded() };
+    if (ll === "short" || hasControl(link)) return { ok: false, res: bad() };
+    const nl = normalizeLink(link);
+    if (countCp(nl) < 1 || countCp(nl) > 256) return { ok: false, res: bad() };
+    nLink = nl;
+  }
+
+  let nRunId: string | null = null;
+  if (runId !== undefined && runId !== null) {
+    if (typeof runId !== "string") return { ok: false, res: bad() };
+    const rl = checkLenCp(runId, 1, 256);
+    if (rl === "long") return { ok: false, res: limitExceeded() };
+    if (rl === "short" || hasControl(runId)) return { ok: false, res: bad() };
+    nRunId = runId;
+  }
+
+  return {
+    ok: true,
+    value: {
+      recordId,
+      body: nBody,
+      bodyHash: bodyHashFor(nBody),
+      source: source as string,
+      observedAt: canonObs,
+      scope: scope as string,
+      tags: nTags,
+      link: nLink,
+      runId: nRunId,
+    },
+  };
+}
+
+/**
+ * record.correct-request over JSON (write op, idempotencyKey mandatory).
+ * Creates a kind=correction candidate superseding an active same-scope
+ * record. The old record stays active (and recallable) until a human
+ * approves the correction; nothing here mutates records.
+ */
+export function correctRequest(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride?: string,
+): ResponseEnvelope {
+  const parsed = parseCorrectRequestParams(config, params);
+  if (!parsed.ok) return budgeted(parsed.res, config);
+  const n = parsed.value;
+
+  const reqHash = requestHashFor("record.correct-request", {
+    body: n.body,
+    kind: "correction",
+    observedAt: n.observedAt,
+    scope: n.scope,
+    source: n.source,
+    link: n.link,
+    recordId: n.recordId,
+    runId: n.runId,
+    tags: n.tags,
+  });
+
+  // Idempotent replay gate first: authorization recheck + hash match, then
+  // the committed envelope even if the target has since moved. EXPIRED is
+  // for fresh executions only, never for committed replay.
+  let saved: StoredOp | null = null;
+  try {
+    saved = readOperation(db, idempotencyKey);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (saved) {
+    if (saved.op !== "record.correct-request") return budgeted(fail("CONFLICT"), config);
+    const denied = scopeGate(db, config, n.scope);
+    if (denied) return denied;
+    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    return replaySaved(saved.responseJson, config);
+  }
+  {
+    const denied = scopeGate(db, config, n.scope);
+    if (denied) return denied;
+  }
+  // Creation-time advisory target gate (approval re-checks atomically).
+  {
+    const gate = checkCorrectionTarget(db, config, n.scope, n.recordId);
+    if (!gate.ok) return gate.res;
+  }
+
+  const now = nowOverride ?? nowIso();
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(nowMs)) return budgeted(fail("STORE_UNAVAILABLE"), config);
+  const createdAt = new Date(nowMs).toISOString();
+  const expiresAt = new Date(nowMs + config.candidateTtlSec * 1000).toISOString();
+  const id = genId("cand");
+
+  try {
+    const response = withTransaction(db, (): ResponseEnvelope => {
+      // Re-check the target inside the transaction: a record archived or
+      // superseded between the advisory gate and COMMIT must not gain a
+      // correction candidate.
+      const gate = checkCorrectionTarget(db, config, n.scope, n.recordId);
+      if (!gate.ok) throw new Error("target moved");
+      // Budget gate BEFORE any insert: no orphan candidate on overflow.
+      const probe: ResponseEnvelope = ok({
+        candidate: { id, bodyHash: n.bodyHash, status: "candidate", expiresAt },
+      });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      db.prepare(
+        `INSERT INTO candidates(id, body, bodyHash, kind, source, observedAt, scope, supersedes, status, idempotencyKey, requestHash, createdAt, expiresAt)
+         VALUES (?, ?, ?, 'correction', ?, ?, ?, ?, 'candidate', ?, ?, ?, ?)`,
+      ).run(id, n.body, n.bodyHash, n.source, n.observedAt, n.scope, n.recordId, idempotencyKey, reqHash, createdAt, expiresAt);
+      for (const t of n.tags) {
+        db.prepare(`INSERT INTO candidate_tags(candidateId, tag) VALUES (?, ?)`).run(id, t);
+      }
+      if (n.link !== null) {
+        db.prepare(`INSERT INTO candidate_links(fromId, toName) VALUES (?, ?)`).run(id, n.link);
+      }
+      const res: ResponseEnvelope = ok({
+        candidate: { id, bodyHash: n.bodyHash, status: "candidate", expiresAt },
+      });
+      const stored = budgeted(res, config);
+      db.prepare(
+        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
+      ).run(idempotencyKey, "record.correct-request", reqHash, JSON.stringify(stored), createdAt);
+      auditInsert(db, {
+        ts: createdAt,
+        op: "record.correct-request",
+        targetId: id,
+        code: stored.code,
+        scope: n.scope,
+        runId: n.runId,
+        approver: null,
+        approvedAt: null,
+        token: null,
+        reasonCode: null,
+      });
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+    return response;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "target moved") {
+      // Re-read outside the rolled-back transaction for the precise code.
+      const gate = checkCorrectionTarget(db, config, n.scope, n.recordId);
+      if (!gate.ok) return gate.res;
+      return budgeted(fail("CONFLICT"), config);
+    }
+    if (/UNIQUE constraint failed: operations/.test(msg)) {
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
+      if (again && again.op === "record.correct-request" && again.requestHash === reqHash) {
+        return replaySaved(again.responseJson, config);
+      }
+      return budgeted(fail("CONFLICT"), config);
+    }
+    if (/UNIQUE constraint failed: candidates/.test(msg)) {
+      return budgeted(fail("STORE_UNAVAILABLE"), config);
+    }
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/**
+ * Human archive (domain core; CLI adds TTY + yes-confirmation on top).
+ * Terminal transition active → archived: no restore, no physical deletion.
+ * Metadata-only audit + idempotency row commit atomically with the flip;
+ * audit/insert failure rolls everything back (fail closed).
+ */
+export function archiveRecord(
+  db: DatabaseSync,
+  config: AppConfig,
+  args: { id: string; scope: string; idempotencyKey: string; reasonCode: string },
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (!args.id || typeof args.id !== "string" || args.id.length > 256) return budgeted(fail("BAD_REQUEST"), config);
+  if (typeof args.scope !== "string" || countCp(args.scope) < 1 || countCp(args.scope) > 256 || hasControl(args.scope)) {
+    return budgeted(fail("BAD_REQUEST"), config);
+  }
+  if (typeof args.idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(args.idempotencyKey)) {
+    return budgeted(fail("BAD_REQUEST"), config);
+  }
+  if (args.reasonCode !== "USER_ARCHIVED") return budgeted(fail("BAD_REQUEST"), config);
+  const reqHash = sha256HexUtf8(
+    canonicalStringify({ op: "archive", id: args.id, scope: args.scope, reasonCode: args.reasonCode }),
+  );
+
+  let saved: StoredOp | null = null;
+  try {
+    saved = readOperation(db, args.idempotencyKey);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (saved) {
+    if (saved.op !== "archive") return budgeted(fail("CONFLICT"), config);
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
+    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    return replaySaved(saved.responseJson, config);
+  }
+  {
+    const denied = scopeGate(db, config, args.scope);
+    if (denied) return denied;
+  }
+
+  let target: RecordRow | null;
+  try {
+    target = readRecordOrThrow(db, args.id);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (!target) return budgeted(fail("NOT_FOUND"), config);
+  if (target.scope !== args.scope) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  if (target.status !== "active") return budgeted(fail("CONFLICT"), config);
+
+  const now = nowOverride ?? nowIso();
+  try {
+    const response = withTransaction(db, (): ResponseEnvelope => {
+      // Conditional flip is the arbiter: 0 rows means a competing approval
+      // (supersede) or archive won first — roll everything back as CONFLICT.
+      let moved: unknown;
+      try {
+        moved = db
+          .prepare(`UPDATE records SET status='archived' WHERE id=? AND status='active' AND scope=?`)
+          .run(args.id, args.scope);
+      } catch {
+        throw new Error("db over cap");
+      }
+      if (changedRows(moved) !== 1) throw new Error("archive lost");
+      const probe: ResponseEnvelope = ok({ record: { id: args.id, status: "archived" } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      const res: ResponseEnvelope = ok({ record: { id: args.id, status: "archived" } });
+      const stored = budgeted(res, config);
+      db.prepare(`INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`).run(
+        args.idempotencyKey,
+        "archive",
+        reqHash,
+        JSON.stringify(stored),
+        now,
+      );
+      auditInsert(db, {
+        ts: now,
+        op: "archive",
+        targetId: args.id,
+        code: stored.code,
+        scope: args.scope,
+        runId: null,
+        approver: currentApprover(),
+        approvedAt: null,
+        token: null,
+        reasonCode: "USER_ARCHIVED",
+      });
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+    return response;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (/UNIQUE constraint failed: operations/.test(msg)) {
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, args.idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
+      if (again && again.op === "archive" && again.requestHash === reqHash) {
+        return replaySaved(again.responseJson, config);
+      }
+      return budgeted(fail("CONFLICT"), config);
+    }
+    if (msg === "archive lost") return budgeted(fail("CONFLICT"), config);
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }

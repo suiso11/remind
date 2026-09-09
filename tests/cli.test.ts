@@ -41,10 +41,10 @@ function runCli(configPath: string, stdin: string) {
 }
 
 describe("cli smoke (T1 foundation)", () => {
-  it("boots, seeds scopes, and honestly reports unimplemented domain", () => {
+  it("boots, seeds scopes, and routes T4 domain ops (no NOT_IMPLEMENTED)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "remind-smoke-"));
     const cfg = writeConfig(dir);
-    // T4 stays deferred; T3 implements record.recall (empty params are BAD_REQUEST).
+    // T4 implements record.correct-request: empty params are strict BAD_REQUEST.
     const req =
       JSON.stringify({ v: 1, op: "record.correct-request", idempotencyKey: "k-smoke-1", params: {} }) + "\n";
     const r = runCli(cfg, req);
@@ -52,7 +52,7 @@ describe("cli smoke (T1 foundation)", () => {
     const res = JSON.parse(r.stdout.trim());
     assert.equal(res.v, 1);
     assert.equal(res.ok, false);
-    assert.equal(res.code, "NOT_IMPLEMENTED");
+    assert.equal(res.code, "BAD_REQUEST");
     const db = new DatabaseSync(path.join(dir, "smoke.db"));
     const rows = db
       .prepare("SELECT scope FROM scopes ORDER BY scope")
