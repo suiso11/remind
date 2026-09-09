@@ -1,8 +1,7 @@
 /**
- * T1 protocol foundation: JSON envelopes, fixed error codes/messages,
- * strict request validation, bounded sizes.
- * Plan reference: plan.md section 14.2 (proposal; T1 implements the
- * envelope/config/DB subset only, not the T2-T6 domain operations).
+ * M1 protocol: autonomous JSON ops, fixed error codes/messages, strict
+ * request validation, bounded sizes. No candidate/approval/TTY semantics:
+ * every write op commits directly with a caller-supplied idempotencyKey.
  */
 
 export const PROTOCOL_V = 1;
@@ -17,13 +16,10 @@ export type ErrorCode =
   | "BAD_REQUEST"
   | "NOT_FOUND"
   | "CONFLICT"
-  | "EXPIRED"
-  | "FORBIDDEN"
   | "FORBIDDEN_SCOPE"
   | "STORE_UNAVAILABLE"
   | "LIMIT_EXCEEDED"
-  | "TIMEOUT"
-  | "NOT_IMPLEMENTED";
+  | "TIMEOUT";
 
 export interface ResponseEnvelope {
   v: 1;
@@ -35,25 +31,29 @@ export interface ResponseEnvelope {
   deduplicated: boolean;
 }
 
-/** Fixed message templates (no input echo).
- * NOT_IMPLEMENTED is a temporary T1-only status: valid automated envelopes
- * are honestly rejected until T2-T4 implement the domain. Never ok:true. */
+/** Fixed message templates (no input echo). */
 export const MESSAGES: Record<ErrorCode, string> = {
   OK: "ok",
   BAD_REQUEST: "bad request",
   NOT_FOUND: "not found",
   CONFLICT: "conflict",
-  EXPIRED: "expired",
-  FORBIDDEN: "human operation only",
   FORBIDDEN_SCOPE: "forbidden scope",
   STORE_UNAVAILABLE: "store unavailable",
   LIMIT_EXCEEDED: "limit exceeded",
   TIMEOUT: "timeout",
-  NOT_IMPLEMENTED: "not implemented",
 };
 
-export function ok(data: Record<string, unknown> | null = null): ResponseEnvelope {
-  return { v: 1, ok: true, code: "OK", message: MESSAGES.OK, data, deduplicated: false };
+export function ok(
+  data: Record<string, unknown> | null = null,
+): ResponseEnvelope {
+  return {
+    v: 1,
+    ok: true,
+    code: "OK",
+    message: MESSAGES.OK,
+    data,
+    deduplicated: false,
+  };
 }
 
 export function fail(code: Exclude<ErrorCode, "OK">): ResponseEnvelope {
@@ -67,18 +67,16 @@ export function fail(code: Exclude<ErrorCode, "OK">): ResponseEnvelope {
   };
 }
 
-/** Automated JSON ops (domain implemented in T2-T4; T1 validates envelope only). */
-export const WRITE_OPS = new Set(["candidate.create", "record.correct-request"]);
-export const READ_OPS = new Set(["candidate.get", "record.recall"]);
-/** Human-terminal-only ops: rejected on the automated JSON path. */
-export const HUMAN_OPS = new Set([
-  "approve",
-  "reject",
-  "archive",
-  "candidate.approve",
-  "candidate.reject",
+/** Write ops: caller-supplied idempotencyKey mandatory, commit directly. */
+export const WRITE_OPS = new Set([
+  "event.append",
+  "record.remember",
+  "record.feedback",
+  "record.correct",
   "record.archive",
 ]);
+/** Read ops: no idempotency key. */
+export const READ_OPS = new Set(["record.get", "record.list", "record.recall"]);
 
 export interface ValidRequest {
   v: 1;
@@ -109,7 +107,6 @@ export function validateRequest(
   if (typeof op !== "string" || op.length === 0 || op.length > 64) {
     return { ok: false, res: fail("BAD_REQUEST") };
   }
-  if (HUMAN_OPS.has(op)) return { ok: false, res: fail("FORBIDDEN") };
   const known = WRITE_OPS.has(op) || READ_OPS.has(op);
   if (!known) return { ok: false, res: fail("BAD_REQUEST") };
 
@@ -127,7 +124,6 @@ export function validateRequest(
   if (!isPlainObject(params)) return { ok: false, res: fail("BAD_REQUEST") };
   // Strict well-formedness: any unpaired surrogate (including an escaped
   // "\ud800" that JSON.parse turns into a lone half) is BAD_REQUEST.
-  // Valid astral pairs pass. No mutation happens on this path.
   if (containsLoneSurrogateDeep(parsed)) return { ok: false, res: fail("BAD_REQUEST") };
 
   const req: ValidRequest = { v: 1, op, params };

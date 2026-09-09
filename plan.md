@@ -143,7 +143,7 @@ raw 現物は event.append で不変保持。record 本文に raw 複写なし�
 - `eventId/sessionId/turnId 1..128 文字・event body 2000cp / record body 2000cp / query 500cp / tags 5 / links 8 / sourceRefs 上限 8 / limit 既定10・最大25 / snippet 200cp / 応答合計 8KB / 生要求 32KB`
 - `グラフ深さ 2 / グラフ展開上限 40 / raw 下降上限 3 / 融合候補上限 60`
 - `CLI タイムアウト 5s / SQLite busy_timeout 2s / DB 上限 100MB`
-- 超過入力・超過応答は切詰めず `LIMIT_EXCEEDED` で拒否する。容量枯渇時は無言の削除・上書き・切詰めを行わず、想起・取得は継続する。回復は上限引上げまたは保持ポリシー（§12 U2）の解決による。
+- 超過入力・超過応答は切詰めず `LIMIT_EXCEEDED` で拒否する。容量枯渇時（DB 上限超過見込みの書込み）は `STORE_UNAVAILABLE` で巻き戻し、無言の削除・上書き・切詰めを行わず、想起・取得は継続する。回復は上限引上げまたは保持ポリシー（§12 U2）の解決による。
 - DB 利用不可・破損・タイムアウト時は `STORE_UNAVAILABLE` / `TIMEOUT` を返し、呼出側は**記憶なしの通常応答に縮退**する。記憶欠落を生成失敗の理由にしない。
 - ベクトル索引の欠落・無効時は**語彙＋グラフに縮退**して想起を継続する（エラーにしない）。意味検索能力自体は M2 で必須化（§10・§12 U3）。commit 対 timeout の未知結果は同一 `idempotencyKey`＋同一 params の再送で解決する（`deduplicated` で確定させる）。
 

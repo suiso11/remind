@@ -3,20 +3,23 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import { resolveDbPath } from "./config.js";
-import { ensureT2Schema } from "./store.js";
+import { ensureM1Schema, hasLegacyApprovalSchema } from "./store.js";
+
+/** Canonical M1 schema version. Fresh and compatible DBs carry exactly 2. */
+export const M1_USER_VERSION = 2;
 
 /**
- * T1 SQLite foundation: open/create the DB file, set busy_timeout from
- * startup config, create the `scopes` table, seed allowed scopes
- * additively (never delete existing rows). Later tasks (T2-T4) add
- * the remaining tables in this same module.
- *
- * P1 honesty: the configured busyMs is only the *initial* SQLite busy wait.
- * The automated CLI path passes effectiveBusyMs = min(busyMs, remaining
- * cliMs) into initDb (so DDL/seed never blocks past the deadline) and
- * runs the op on a bounded worker thread, so a busyMs > cliMs config can
- * never block past the overall deadline and a long scan is terminated.
+ * Fixed safe startup error for legacy approval-schema databases. Emitted on
+ * stderr with a non-zero exit; the old file is never mutated or deleted.
+ * Operator action: back up the old file, then point dbPath at a new file.
  */
+export const LEGACY_DB_MESSAGE =
+  "legacy approval schema detected: back up existing data and configure a new DB file";
+
+export function isLegacyDbError(e: unknown): boolean {
+  return e instanceof Error && e.message === LEGACY_DB_MESSAGE;
+}
+
 export function applyEffectiveBusyTimeout(
   db: DatabaseSync,
   busyMs: number,
@@ -29,6 +32,24 @@ export function applyEffectiveBusyTimeout(
   db.exec(`PRAGMA busy_timeout = ${eff}`);
   return eff;
 }
+
+function readUserVersion(db: DatabaseSync): number {
+  const row = db
+    .prepare(`PRAGMA user_version`)
+    .get() as { user_version: number } | undefined;
+  return row?.user_version ?? 0;
+}
+
+/**
+ * M1 SQLite foundation: open/create the DB file, set busy_timeout from
+ * startup config, seed allowed scopes additively (never delete rows),
+ * create the M1 v2 schema, stamp PRAGMA user_version=2.
+ *
+ * Legacy approval-schema databases (candidates table, candidateId records,
+ * or any unexpected user_version) FAIL STARTUP with the fixed legacy error
+ * and are NOT mutated: no DDL, no deletes, no silent migration. The caller
+ * maps this to a fixed stderr line + non-zero exit.
+ */
 export function initDb(
   config: AppConfig,
   configPath: string,
@@ -42,18 +63,8 @@ export function initDb(
     throw new Error(`cannot create db directory: ${String(e)}`);
   }
 
-  // Fail closed when the DB file already exceeds the configured max.
-  try {
-    const st = fs.statSync(dbFile);
-    if (st.size > config.dbMaxBytes) {
-      throw new Error("db file exceeds dbMaxBytes");
-    }
-  } catch (e) {
-    if (e instanceof Error && e.message === "db file exceeds dbMaxBytes") {
-      throw e;
-    }
-    // Missing file is fine (will be created on open).
-  }
+  // Over-cap DBs still open for reads: no startup refusal based solely on
+  // configured dbMaxBytes. Write paths enforce the cap per-operation.
 
   let db: DatabaseSync;
   try {
@@ -68,25 +79,53 @@ export function initDb(
       typeof busyMsOverride === "number" && Number.isFinite(busyMsOverride)
         ? Math.max(0, Math.floor(busyMsOverride))
         : config.timeouts.busyMs;
-    db.exec(
-      `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = ${busy};`,
-    );
+    // busy_timeout is per-connection (not persisted); set it before the
+    // legacy checks. journal_mode=WAL persists (header + sidecars), so it
+    // must stay after user_version/legacy approval-schema approval.
+    db.exec(`PRAGMA busy_timeout = ${busy};`);
+
+    const uv = readUserVersion(db);
+    if (uv !== 0 && uv !== M1_USER_VERSION) {
+      throw new Error(LEGACY_DB_MESSAGE);
+    }
+    // Any trace of the old candidate/approval architecture is legacy,
+    // including a version-0 file that already holds old tables (e.g. a
+    // pre-M1 database whose user_version was never stamped).
+    if (hasLegacyApprovalSchema(db)) {
+      throw new Error(LEGACY_DB_MESSAGE);
+    }
+    if (uv === 0) {
+      // A version-0 file that already holds M1-shaped tables without the
+      // stamp is unexpected: refuse rather than guess (no silent adoption).
+      const names = db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
+        )
+        .all() as Array<{ name: string }>;
+      const nonScope = names.filter((r) => r.name !== "scopes");
+      if (nonScope.length > 0) {
+        throw new Error(LEGACY_DB_MESSAGE);
+      }
+    }
+
+    // Persistent WAL mode only after the file is approved as M1-compatible,
+    // so rejected legacy files are never mutated by startup.
+    db.exec(`PRAGMA journal_mode = WAL;`);
     db.exec(`CREATE TABLE IF NOT EXISTS scopes(scope TEXT PRIMARY KEY)`);
-    const ins = db.prepare(
-      `INSERT OR IGNORE INTO scopes(scope) VALUES (?)`,
-    );
+    const ins = db.prepare(`INSERT OR IGNORE INTO scopes(scope) VALUES (?)`);
     for (const s of config.allowedScopes) {
       ins.run(s);
     }
-    // T2+ domain tables (candidates/records/operations/audit/exposures).
-    // Additive only; never drops existing rows.
-    ensureT2Schema(db);
+    // M1 canonical + derived tables. Additive only; never drops rows.
+    ensureM1Schema(db);
+    db.exec(`PRAGMA user_version = ${M1_USER_VERSION}`);
   } catch (e) {
     try {
       db.close();
     } catch {
       /* ignore */
     }
+    if (isLegacyDbError(e)) throw e;
     throw new Error(
       `db init failed: ${e instanceof Error ? e.message : String(e)}`,
     );
