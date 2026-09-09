@@ -1,7 +1,7 @@
 {
   "name": "remind-memory-cli",
   "version": "0.1.0",
-  "description": "External long-term memory local CLI foundation (T1). Planning: plan.md section 14.",
+  "description": "Autonomous associative memory local CLI (M1 store).",
   "type": "commonjs",
   "main": "dist/src/cli.js",
   "bin": {
@@ -13,11 +13,11 @@
   "packageManager": "npm@11.6.2",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/tests/*.test.js",
+    "test": "npm run clean && npm run build && node --test dist/tests/*.test.js",
     "smoke": "npm run build && node dist/scripts/smoke.js",
-    "acceptance": "npm run build && node --test dist/tests/acceptance.test.js",
+    "acceptance": "npm run clean && npm run build && node --test dist/tests/acceptance.test.js",
     "cli": "node dist/src/cli.js",
-    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+    "clean": "node -e \"require('fs').rm('dist',{recursive:true,force:true},()=>{})\""
   },
   "dependencies": {},
   "devDependencies": {

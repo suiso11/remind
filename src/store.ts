@@ -1,35 +1,27 @@
 /**
- * T2 domain: candidates + human review/approve/reject atop T1.
- * T4 adds: record.correct-request (correction candidate creation),
- * correction approval (atomic conditional supersede), and human archive.
- * Plan ref: plan.md 14.2/14.4-14.5/14.7 (proposal adopted for T2-T4).
+ * M1 autonomous memory store (replaces the old candidate/approval architecture).
  *
- * Notes / smallest explicit corrections to the plan text:
- * - candidate.get requires {id, scope}: plan 14.2 lists params {id} but 14.5
- *   requires every id lookup (review + candidate.get) to check request scope
- *   vs stored scope. Without a request scope the check is impossible, so T2
- *   requires scope and answers BAD_REQUEST when absent, FORBIDDEN_SCOPE on
- *   mismatch. No body is ever returned on this path.
- * - Human review/approve/reject/archive require --scope for the same reason:
- *   the id lookup must bind to a request scope. Missing scope is BAD_REQUEST.
- * - candidate.create with kind=correction requires a supersedes pointer to an
- *   existing active same-scope record (same rule as record.correct-request);
- *   missing target is NOT_FOUND, scope mismatch FORBIDDEN_SCOPE, inactive
- *   target CONFLICT. Committed idempotent replays bypass the target check so
- *   a stored envelope replays stably after later target moves.
- * - record.recall is implemented here (T3): only status='active' rows match.
- * - Local single-user error semantics (adopted plan, unchanged): id lookups
- *   answer NOT_FOUND when the row is absent, FORBIDDEN_SCOPE on scope
- *   mismatch, CONFLICT when present-but-inactive. This oracle can disclose
- *   id existence to a same-scope caller; accepted as a residual limitation
- *   for the local single-user CLI (no new semantics without agreement).
+ * Direct autonomous writes, no candidates, no approvals, no TTY path:
+ * - event.append: immutable raw append (single txn: raw_events + FTS + bigrams + operations + audit)
+ * - record.remember: direct active write with sourceRefs validation (single txn)
+ * - record.get / record.list: same-scope reads (get returns any status; list defaults active)
+ * - record.recall: bounded hybrid lexical (FTS5 BM25 + char-bigram) + raw descent
+ *   + exact tag/link seeds + depth-2 graph expansion, deterministic fusion
+ * - record.feedback: exposure-verified usage + heat in a single txn (mere recall adds no heat)
+ * - record.correct: new revision + conditional active->superseded in one txn (one winner)
+ * - record.archive: conditional active->archived (terminal, row kept)
+ *
+ * Vector search is NOT implemented in M1: recall degrades to lexical+graph
+ * by construction (§8). maintain.distill is NOT implemented (M3).
+ * Links are opaque refs (max 8); graph follows only active same-scope
+ * resolved refs; dangling refs are kept and skipped during expansion.
+ * Raw bodies never leave through recall items (snippets only), audit, or errors.
  */
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import {
-  approvalTokenFor,
   bodyHashFor,
   canonicalStringify,
   canonicalTime,
@@ -37,60 +29,132 @@ import {
   countCp,
   hasControl,
   normalizeBody,
+  normalizeField,
   normalizeLink,
   normalizeTag,
   nowIso,
   requestHashFor,
-  safeEqual,
   sha256HexUtf8,
 } from "./normalize.js";
-import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
+import { enqueueProjection } from "./projection.js";
+import {
+  applyResponseBudget,
+  fail,
+  ok,
+  type ResponseEnvelope,
+} from "./protocol.js";
 
-export const CANDIDATE_KINDS = ["user_fact", "model_inference", "correction"] as const;
-export const CANDIDATE_STATUSES = ["candidate", "approved", "rejected", "expired"] as const;
+export const RECORD_KINDS = [
+  "user_fact",
+  "model_inference",
+  "summary",
+  "correction",
+] as const;
 
-export function ensureT2Schema(db: DatabaseSync): void {
-  db.exec(`CREATE TABLE IF NOT EXISTS candidates(
-    id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyHash TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','correction')),
-    source TEXT NOT NULL, observedAt TEXT NOT NULL, scope TEXT NOT NULL,
-    supersedes TEXT NULL, status TEXT NOT NULL CHECK(status IN ('candidate','approved','rejected','expired')),
-    idempotencyKey TEXT NULL, requestHash TEXT NULL,
-    createdAt TEXT NOT NULL, expiresAt TEXT NOT NULL)`);
-  db.exec(`CREATE TABLE IF NOT EXISTS candidate_tags(candidateId TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(candidateId, tag))`);
-  db.exec(`CREATE TABLE IF NOT EXISTS candidate_links(fromId TEXT PRIMARY KEY, toName TEXT NOT NULL)`);
+export const ARCHIVE_REASONS = [
+  "USER_ARCHIVED",
+  "OBSOLETE",
+  "DUPLICATE",
+] as const;
+
+/** Recall/graph bounds (plan §8 defaults; fixed, documented, deterministic). */
+export const GRAPH_DEPTH_MAX = 2;
+export const GRAPH_EXPAND_MAX = 40;
+export const RAW_DESCENT_MAX = 3;
+export const FUSION_CANDIDATE_MAX = 60;
+/** Exposures ledger cap: oldest rows pruned beyond this (feedback stays verifiable while fresh). */
+export const EXPOSURES_CAP = 1000;
+
+const ID_RE = /^[A-Za-z0-9_-]+$/;
+
+/* ------------------------------------------------------------------ */
+/* Schema                                                              */
+/* ------------------------------------------------------------------ */
+
+export function ensureM1Schema(db: DatabaseSync): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_events(
+    eventId TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT NOT NULL,
+    body TEXT NOT NULL, bodyNorm TEXT NOT NULL,
+    source TEXT NOT NULL, observedAt TEXT NOT NULL,
+    scope TEXT NOT NULL, runId TEXT NULL, createdAt TEXT NOT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS records(
-    id TEXT PRIMARY KEY, candidateId TEXT UNIQUE NOT NULL, body TEXT NOT NULL, bodyHash TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','correction')),
+    id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyNorm TEXT NOT NULL, bodyHash TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','summary','correction')),
     source TEXT NOT NULL, observedAt TEXT NOT NULL, scope TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('active','superseded','archived')),
-    supersedes TEXT NULL, createdAt TEXT NOT NULL)`);
+    supersedes TEXT NULL, revision INTEGER NOT NULL, createdAt TEXT NOT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS record_tags(recordId TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(recordId, tag))`);
-  db.exec(`CREATE TABLE IF NOT EXISTS record_links(fromId TEXT PRIMARY KEY, toName TEXT NOT NULL)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS record_links(fromId TEXT NOT NULL, toRef TEXT NOT NULL, PRIMARY KEY(fromId, toRef))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS record_source_refs(recordId TEXT NOT NULL, eventId TEXT NOT NULL, PRIMARY KEY(recordId, eventId))`);
   db.exec(`CREATE TABLE IF NOT EXISTS operations(
     idempotencyKey TEXT PRIMARY KEY, op TEXT NOT NULL, requestHash TEXT NOT NULL,
     responseJson TEXT NOT NULL, createdAt TEXT NOT NULL)`);
-  // Metadata-only audit (no body / query / snippet text). Token/approver kept.
   db.exec(`CREATE TABLE IF NOT EXISTS audit(
     ts TEXT NOT NULL, op TEXT NOT NULL, targetId TEXT NULL, code TEXT NOT NULL,
     scope TEXT NULL, bytes INTEGER NULL, limitN INTEGER NULL, runId TEXT NULL,
-    recallId TEXT NULL, approver TEXT NULL, approvedAt TEXT NULL, token TEXT NULL,
-    reasonCode TEXT NULL)`);
-  // T3-owned exposure ledger: created now so T2 commits never need a later migration.
+    recallId TEXT NULL, reasonCode TEXT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS exposures(
     ts TEXT NOT NULL, recallId TEXT NOT NULL, runId TEXT NULL, scope TEXT NULL,
     recordId TEXT NOT NULL, snippetBytes INTEGER NULL, truncated INTEGER NULL, limitN INTEGER NULL)`);
-  // T3 bounded-retrieval indexes (additive migration; existing rows untouched).
-  // records(scope,status,createdAt,id) covers the recall pre-filter + fixed
-  // order; tag/link PKs already bind (recordId,tag)/(fromId), the extra
-  // indexes cover the reverse exact-match direction.
-  // Honest note: this bounds host variables and result materialization, but
-  // the SQL scan may still examine every row in the scope window (instr
-  // predicate); it is not hard constant latency.
+  db.exec(`CREATE TABLE IF NOT EXISTS usage(
+    ts TEXT NOT NULL, recallId TEXT NOT NULL, recordId TEXT NOT NULL, scope TEXT NOT NULL, runId TEXT NULL)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS note_heat(recordId TEXT PRIMARY KEY, usedCount INTEGER NOT NULL, lastUsedAt TEXT NOT NULL)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS projection_queue(recordId TEXT PRIMARY KEY, attempts INTEGER NOT NULL, nextAt TEXT NOT NULL)`);
+  // Derived lexical indexes (rebuildable; never canonical).
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_raw USING fts5(eventId UNINDEXED, body)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS char_bigrams(kind TEXT NOT NULL, id TEXT NOT NULL, bigram TEXT NOT NULL, PRIMARY KEY(kind, id, bigram))`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_records_scope_status_created_id ON records(scope, status, createdAt, id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_record_tags_tag_record ON record_tags(tag, recordId)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_record_links_toname_from ON record_links(toName, fromId)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_record_links_toref_from ON record_links(toRef, fromId)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_source_refs_event ON record_source_refs(eventId, recordId)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_bigrams_lookup ON char_bigrams(kind, bigram, id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_exposures_recall ON exposures(recallId, recordId)`);
+  try {
+    db.exec(`DELETE FROM usage WHERE rowid NOT IN (SELECT MIN(rowid) FROM usage GROUP BY recallId, recordId)`);
+  } catch {
+    /* best-effort dedupe before enforcing uniqueness */
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_recall_record ON usage(recallId, recordId)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_raw_scope_created ON raw_events(scope, createdAt, eventId)`);
+  // Self-heal derived indexes when they are obviously out of sync with
+  // canonical tables (empty or smaller than canonical). Best-effort only:
+  // never throws, never touches canonical rows; recall's bodyNorm fallback
+  // covers reads even when repair fails.
+  maybeRebuildDerivedIndexes(db);
 }
+
+/**
+ * Legacy approval-schema detector. True when ANY trace of the old
+ * candidate/approval architecture exists: candidates tables, a records table
+ * carrying candidateId, approval tokens, TTL columns. Fresh/empty DBs (no
+ * tables, or scopes-only) are NOT legacy. Read-only: never mutates.
+ */
+export function hasLegacyApprovalSchema(db: DatabaseSync): boolean {
+  let names: Array<{ name: string; sql: string | null }>;
+  try {
+    names = db
+      .prepare(`SELECT name, sql FROM sqlite_master WHERE type IN ('table','view')`)
+      .all() as Array<{ name: string; sql: string | null }>;
+  } catch {
+    return true; // Unreadable catalog: refuse rather than guess.
+  }
+  const set = new Set(names.map((r) => r.name));
+  if (set.has("candidates") || set.has("candidate_tags") || set.has("candidate_links")) {
+    return true;
+  }
+  for (const r of names) {
+    const sql = r.sql ?? "";
+    if (/candidateId/i.test(sql) || /approvalToken/i.test(sql) || /expiresAt/i.test(sql)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Small helpers                                                       */
+/* ------------------------------------------------------------------ */
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -100,207 +164,10 @@ function genId(prefix: string): string {
   return `${prefix}_${randomBytes(8).toString("hex")}`;
 }
 
-/** Scope authorization tri-state (P2 fix).
- *
- * - Scope absent from startup config => genuine denial (returns false).
- * - Scope present in config but missing from the scopes table => genuine
- *   denial (returns false; the row may have been revoked).
- * - Any scopes-table I/O failure (closed DB, missing/corrupt table, I/O
- *   error) THROWS Error("scope check unavailable"): callers must answer
- *   STORE_UNAVAILABLE, never FORBIDDEN_SCOPE. Returning false here used to
- *   misclassify STORE_UNAVAILABLE as FORBIDDEN_SCOPE.
- */
-export function isScopeAuthorized(db: DatabaseSync, config: AppConfig, scope: string): boolean {
-  if (!config.allowedScopes.includes(scope)) return false;
-  let row: { scope: string } | undefined;
-  try {
-    row = db.prepare(`SELECT scope FROM scopes WHERE scope = ?`).get(scope) as
-      | { scope: string }
-      | undefined;
-  } catch {
-    throw new Error("scope check unavailable");
-  }
-  return !!row;
-}
-
-/** Scope gate for envelope-returning ops: false => FORBIDDEN_SCOPE, throw => STORE_UNAVAILABLE. */
-function scopeGate(db: DatabaseSync, config: AppConfig, scope: string): ResponseEnvelope | null {
-  try {
-    if (!isScopeAuthorized(db, config, scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
-    return null;
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-}
-
-interface NormalizedCreate {
-  body: string;
-  bodyHash: string;
-  kind: string;
-  source: string;
-  observedAt: string;
-  scope: string;
-  tags: string[];
-  link: string | null;
-  ttlSec: number;
-  runId: string | null;
-  supersedes: string | null;
-}
-
-type ParseResult =
-  | { ok: true; value: NormalizedCreate }
-  | { ok: false; res: ResponseEnvelope };
-
-function limitExceeded(): ResponseEnvelope {
-  return fail("LIMIT_EXCEEDED");
-}
-function bad(): ResponseEnvelope {
-  return fail("BAD_REQUEST");
-}
-
-function checkLenCp(s: string, min: number, max: number): "ok" | "short" | "long" {
-  const n = countCp(s);
-  if (n < min) return "short";
-  if (n > max) return "long";
-  return "ok";
-}
-
-/** Validate + normalize candidate.create params (no DB writes). */
-export function parseCreateParams(
-  config: AppConfig,
-  params: Record<string, unknown>,
-): ParseResult {
-  // Direct-call hardening (mirrors the protocol envelope): any unpaired
-  // surrogate in any param string is BAD_REQUEST with no mutation.
-  if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
-  const allowed = new Set(["body", "kind", "provenance", "scope", "tags", "link", "ttlSec", "runId", "supersedes"]);
-  for (const k of Object.keys(params)) {
-    if (!allowed.has(k)) return { ok: false, res: bad() };
-  }
-  if (containsLoneSurrogateDeep(Object.keys(params))) return { ok: false, res: bad() };
-  const { body, kind, provenance, scope, tags, link, ttlSec, runId, supersedes } = params;
-
-  if (typeof body !== "string") return { ok: false, res: bad() };
-  if (checkLenCp(body, 1, config.limits.bodyMaxCp) === "long") return { ok: false, res: limitExceeded() };
-  const nBody = normalizeBody(body);
-  const bodyLen = checkLenCp(nBody, 1, Math.min(2000, config.limits.bodyMaxCp));
-  if (bodyLen === "short") return { ok: false, res: bad() };
-  if (bodyLen === "long") return { ok: false, res: limitExceeded() };
-
-  if (typeof kind !== "string" || !(CANDIDATE_KINDS as readonly string[]).includes(kind)) {
-    return { ok: false, res: bad() };
-  }
-  if (!isPlainObject(provenance)) return { ok: false, res: bad() };
-  const pKeys = Object.keys(provenance);
-  if (pKeys.length !== 2 || !pKeys.includes("source") || !pKeys.includes("observedAt")) {
-    return { ok: false, res: bad() };
-  }
-  const source = provenance["source"];
-  const observedAt = provenance["observedAt"];
-  if (typeof source !== "string") return { ok: false, res: bad() };
-  const srcLen = checkLenCp(source, 1, 256);
-  if (srcLen === "long") return { ok: false, res: limitExceeded() };
-  if (srcLen === "short" || hasControl(source)) return { ok: false, res: bad() };
-  const canonObs = canonicalTime(observedAt);
-  if (canonObs === null) return { ok: false, res: bad() };
-
-  if (typeof scope !== "string") return { ok: false, res: bad() };
-  const scopeLen = checkLenCp(scope, 1, 256);
-  if (scopeLen === "long") return { ok: false, res: limitExceeded() };
-  if (scopeLen === "short" || hasControl(scope)) return { ok: false, res: bad() };
-
-  let nTags: string[] = [];
-  if (tags !== undefined) {
-    if (!Array.isArray(tags)) return { ok: false, res: bad() };
-    if (tags.length > config.limits.tagsMax) return { ok: false, res: limitExceeded() };
-    const seen = new Set<string>();
-    for (const t of tags) {
-      if (typeof t !== "string") return { ok: false, res: bad() };
-      const tl = checkLenCp(t, 1, 256);
-      if (tl === "long") return { ok: false, res: limitExceeded() };
-      if (tl === "short" || hasControl(t)) return { ok: false, res: bad() };
-      const nt = normalizeTag(t);
-      if (countCp(nt) < 1 || countCp(nt) > 256) return { ok: false, res: bad() };
-      seen.add(nt);
-    }
-    nTags = [...seen].sort();
-  }
-
-  let nLink: string | null = null;
-  if (link !== undefined && link !== null) {
-    if (typeof link !== "string") return { ok: false, res: bad() };
-    const ll = checkLenCp(link, 1, 256);
-    if (ll === "long") return { ok: false, res: limitExceeded() };
-    if (ll === "short" || hasControl(link)) return { ok: false, res: bad() };
-    const nl = normalizeLink(link);
-    if (countCp(nl) < 1 || countCp(nl) > 256) return { ok: false, res: bad() };
-    nLink = nl;
-  }
-
-  let ttl = config.candidateTtlSec;
-  if (ttlSec !== undefined) {
-    if (typeof ttlSec !== "number" || !Number.isInteger(ttlSec)) return { ok: false, res: bad() };
-    if (ttlSec < 1) return { ok: false, res: bad() };
-    if (ttlSec > config.candidateTtlSec) return { ok: false, res: limitExceeded() };
-    ttl = ttlSec;
-  }
-
-  let nRunId: string | null = null;
-  if (runId !== undefined && runId !== null) {
-    if (typeof runId !== "string") return { ok: false, res: bad() };
-    const rl = checkLenCp(runId, 1, 256);
-    if (rl === "long") return { ok: false, res: limitExceeded() };
-    if (rl === "short" || hasControl(runId)) return { ok: false, res: bad() };
-    nRunId = runId;
-  }
-
-  let nSup: string | null = null;
-  if (supersedes !== undefined && supersedes !== null) {
-    if (typeof supersedes !== "string" || supersedes.length === 0 || supersedes.length > 256) {
-      return { ok: false, res: bad() };
-    }
-    if (hasControl(supersedes)) return { ok: false, res: bad() };
-    nSup = supersedes;
-  }
-
-  return {
-    ok: true,
-    value: {
-      body: nBody,
-      bodyHash: bodyHashFor(nBody),
-      kind: kind as string,
-      source: source as string,
-      observedAt: canonObs,
-      scope: scope as string,
-      tags: nTags,
-      link: nLink,
-      ttlSec: ttl,
-      runId: nRunId,
-      supersedes: nSup,
-    },
-  };
-}
-
-export function normalizedParamsForHash(n: NormalizedCreate): Record<string, unknown> {
-  return {
-    body: n.body,
-    kind: n.kind,
-    observedAt: n.observedAt,
-    scope: n.scope,
-    source: n.source,
-    link: n.link,
-    runId: n.runId,
-    supersedes: n.supersedes,
-    tags: n.tags,
-    ttlSec: n.ttlSec,
-  };
-}
-
 function budgeted(res: ResponseEnvelope, config: AppConfig): ResponseEnvelope {
   return applyResponseBudget(res, config.limits.responseMaxBytes);
 }
 
-/** Pre-commit budget gate: success envelopes must fit before any mutation commits. */
 function successFits(res: ResponseEnvelope, maxBytes: number): boolean {
   return Buffer.byteLength(JSON.stringify(res), "utf8") <= maxBytes;
 }
@@ -328,8 +195,6 @@ interface StoredOp {
 }
 
 function readOperation(db: DatabaseSync, key: string): StoredOp | null {
-  // Fail closed: DB I/O failures THROW so callers answer STORE_UNAVAILABLE.
-  // Never swallow to null (null means "no prior key", i.e. safe to insert).
   const row = db
     .prepare(`SELECT op, requestHash, responseJson FROM operations WHERE idempotencyKey = ?`)
     .get(key) as StoredOp | undefined;
@@ -343,147 +208,58 @@ function replaySaved(savedJson: string, config: AppConfig): ResponseEnvelope {
   } catch {
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
-  const out: ResponseEnvelope = { ...parsed, deduplicated: true };
-  return budgeted(out, config);
+  return budgeted({ ...parsed, deduplicated: true }, config);
 }
 
-export interface CandidateRow {
-  id: string;
-  body: string;
-  bodyHash: string;
-  kind: string;
-  source: string;
-  observedAt: string;
-  scope: string;
-  supersedes: string | null;
-  status: string;
-  createdAt: string;
-  expiresAt: string;
-}
-
-export function readCandidate(db: DatabaseSync, id: string): CandidateRow | null {
-  try {
-    const row = db
-      .prepare(`SELECT id, body, bodyHash, kind, source, observedAt, scope, supersedes, status, createdAt, expiresAt FROM candidates WHERE id = ?`)
-      .get(id) as CandidateRow | undefined;
-    return row ?? null;
-  } catch {
-    return null;
-  }
-}
-
-export interface RecordRow {
-  id: string;
-  candidateId: string;
-  body: string;
-  bodyHash: string;
-  kind: string;
-  source: string;
-  observedAt: string;
-  scope: string;
-  status: string;
-  supersedes: string | null;
-  createdAt: string;
-}
-
-/**
- * Record read. THROWS on query failure (fail closed → STORE_UNAVAILABLE);
- * returns null only when the row is genuinely absent. Never fabricate a row:
- * a fabricated "active" target would let a correction approval supersede
- * nothing while minting a new record.
- */
-function readRecordOrThrow(db: DatabaseSync, id: string): RecordRow | null {
-  const row = db
-    .prepare(`SELECT id, candidateId, body, bodyHash, kind, source, observedAt, scope, status, supersedes, createdAt FROM records WHERE id = ?`)
-    .get(id) as RecordRow | undefined;
-  return row ?? null;
-}
-
-/**
- * Correction target gate (creation-time fast path). The approval transaction
- * re-checks atomically with a conditional UPDATE, so this is advisory only.
- * Returns the target row, or an envelope for NOT_FOUND / FORBIDDEN_SCOPE /
- * CONFLICT / STORE_UNAVAILABLE.
- */
-function checkCorrectionTarget(
+export function isScopeAuthorized(
   db: DatabaseSync,
   config: AppConfig,
   scope: string,
-  supersedes: string,
-): { ok: true; target: RecordRow } | { ok: false; res: ResponseEnvelope } {
-  let target: RecordRow | null;
+): boolean {
+  if (!config.allowedScopes.includes(scope)) return false;
+  let row: { scope: string } | undefined;
   try {
-    target = readRecordOrThrow(db, supersedes);
+    row = db.prepare(`SELECT scope FROM scopes WHERE scope = ?`).get(scope) as
+      | { scope: string }
+      | undefined;
   } catch {
-    return { ok: false, res: budgeted(fail("STORE_UNAVAILABLE"), config) };
+    throw new Error("scope check unavailable");
   }
-  if (!target) return { ok: false, res: budgeted(fail("NOT_FOUND"), config) };
-  if (target.scope !== scope) return { ok: false, res: budgeted(fail("FORBIDDEN_SCOPE"), config) };
-  if (target.status !== "active") return { ok: false, res: budgeted(fail("CONFLICT"), config) };
-  return { ok: true, target };
+  return !!row;
 }
 
-/** Run-result changes count for conditional UPDATEs (node:sqlite run payload). */
+function scopeGate(
+  db: DatabaseSync,
+  config: AppConfig,
+  scope: string,
+): ResponseEnvelope | null {
+  try {
+    if (!isScopeAuthorized(db, config, scope)) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    return null;
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+function bad(): ResponseEnvelope {
+  return fail("BAD_REQUEST");
+}
+function limitExceeded(): ResponseEnvelope {
+  return fail("LIMIT_EXCEEDED");
+}
+
+function checkLenCp(s: string, min: number, max: number): "ok" | "short" | "long" {
+  const n = countCp(s);
+  if (n < min) return "short";
+  if (n > max) return "long";
+  return "ok";
+}
+
 function changedRows(result: unknown): number {
   const c = (result as { changes?: unknown } | null)?.changes;
   if (typeof c === "number" && Number.isSafeInteger(c)) return c;
   if (typeof c === "bigint") return Number(c);
   return 0;
-}
-
-/**
- * Stored-body integrity: the committed bodyHash must equal the digest of the
- * stored normalized body. Creation writes both consistently, so a mismatch
- * means the row was tampered with outside the domain path (e.g. direct SQL
- * UPDATE of body without bodyHash, or vice versa). Approval/rejection must
- * refuse with CONFLICT and create no record rather than approve altered
- * content under a stale hash. Checked outside AND inside the transaction
- * (fresh re-read) so a concurrent tamper cannot slip through.
- */
-function storedBodyHashIntact(row: CandidateRow): boolean {
-  try {
-    return safeEqual(row.bodyHash, bodyHashFor(normalizeBody(row.body)));
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Candidate metadata reads. These THROW on query failure (corruption,
- * incompatible pre-existing table, I/O error) so every public boundary
- * answers STORE_UNAVAILABLE. They must never substitute an empty tag list
- * / null link: that would report incomplete metadata as success and, worse,
- * bind the approval token to the wrong tag/link set and commit tag-less
- * records. Callers catch the throw and fail closed.
- */
-function readTags(db: DatabaseSync, candidateId: string): string[] {
-  const rows = db.prepare(`SELECT tag FROM candidate_tags WHERE candidateId = ? ORDER BY tag ASC`).all(candidateId) as Array<{ tag: string }>;
-  return rows.map((r) => r.tag);
-}
-
-function readLink(db: DatabaseSync, fromId: string): string | null {
-  const row = db.prepare(`SELECT toName FROM candidate_links WHERE fromId = ?`).get(fromId) as { toName: string } | undefined;
-  return row ? row.toName : null;
-}
-
-export function tokenForStored(
-  row: CandidateRow,
-  tags: string[],
-  link: string | null,
-): string {
-  return approvalTokenFor({
-    id: row.id,
-    bodyHash: row.bodyHash,
-    kind: row.kind,
-    source: row.source,
-    observedAt: row.observedAt,
-    scope: row.scope,
-    supersedes: row.supersedes,
-    tags: [...tags].sort(),
-    link,
-    createdAt: row.createdAt,
-    expiresAt: row.expiresAt,
-  });
 }
 
 function auditInsert(
@@ -494,1111 +270,31 @@ function auditInsert(
     targetId: string | null;
     code: string;
     scope: string | null;
+    bytes: number | null;
+    limitN: number | null;
     runId: string | null;
-    approver: string | null;
-    approvedAt: string | null;
-    token: string | null;
+    recallId: string | null;
     reasonCode: string | null;
   },
 ): void {
   db.prepare(
-    `INSERT INTO audit(ts, op, targetId, code, scope, bytes, limitN, runId, recallId, approver, approvedAt, token, reasonCode)
-     VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?)`,
+    `INSERT INTO audit(ts, op, targetId, code, scope, bytes, limitN, runId, recallId, reasonCode)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     entry.ts,
     entry.op,
     entry.targetId,
     entry.code,
     entry.scope,
+    entry.bytes,
+    entry.limitN,
     entry.runId,
-    entry.approver,
-    entry.approvedAt,
-    entry.token,
+    entry.recallId,
     entry.reasonCode,
   );
 }
 
-/** candidate.create over JSON (write op, idempotencyKey mandatory). */
-export function createCandidate(
-  db: DatabaseSync,
-  config: AppConfig,
-  params: Record<string, unknown>,
-  idempotencyKey: string,
-  nowOverride?: string,
-): ResponseEnvelope {
-  const parsed = parseCreateParams(config, params);
-  if (!parsed.ok) return budgeted(parsed.res, config);
-  const n = parsed.value;
-
-  // T4: correction candidates must name their target. kind=correction without
-  // supersedes (or vice versa) is BAD_REQUEST; the target must exist, be in
-  // the same scope, and be active. Committed replays below bypass this check.
-  if (n.kind === "correction" || n.supersedes !== null) {
-    if (n.kind !== "correction" || n.supersedes === null) {
-      return budgeted(fail("BAD_REQUEST"), config);
-    }
-  }
-
-  const reqHash = requestHashFor("candidate.create", normalizedParamsForHash(n));
-
-  // Idempotent replay gate: authorization recheck + hash match first, then
-  // committed replay even if the candidate has since expired.
-  let saved: StoredOp | null = null;
-  try {
-    saved = readOperation(db, idempotencyKey);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (saved) {
-    if (saved.op !== "candidate.create") return budgeted(fail("CONFLICT"), config);
-    const denied = scopeGate(db, config, n.scope);
-    if (denied) return denied;
-    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
-    return replaySaved(saved.responseJson, config);
-  }
-  {
-    const denied = scopeGate(db, config, n.scope);
-    if (denied) return denied;
-  }
-  // Creation-time target gate (advisory; approval re-checks atomically).
-  if (n.supersedes !== null) {
-    const gate = checkCorrectionTarget(db, config, n.scope, n.supersedes);
-    if (!gate.ok) return gate.res;
-  }
-
-  const now = nowOverride ?? nowIso();
-  const nowMs = Date.parse(now);
-  if (!Number.isFinite(nowMs)) return budgeted(fail("STORE_UNAVAILABLE"), config);
-  const createdAt = new Date(nowMs).toISOString();
-  const expiresAt = new Date(nowMs + n.ttlSec * 1000).toISOString();
-  const id = genId("cand");
-
-  try {
-    const response = withTransaction(db, (): ResponseEnvelope => {
-      // Transaction-time target recheck (mirrors record.correct-request):
-      // the advisory gate above ran before BEGIN IMMEDIATE, so a record
-      // archived/superseded in between must not gain a correction candidate.
-      if (n.supersedes !== null) {
-        const gateIn = checkCorrectionTarget(db, config, n.scope, n.supersedes);
-        if (!gateIn.ok) throw new Error("target moved");
-      }
-      // Budget gate BEFORE any insert: an over-budget success must not
-      // leave an orphan candidate row or a cached failure with mutation.
-      const probe: ResponseEnvelope = ok({
-        candidate: { id, bodyHash: n.bodyHash, status: "candidate", expiresAt },
-      });
-      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
-      db.prepare(
-        `INSERT INTO candidates(id, body, bodyHash, kind, source, observedAt, scope, supersedes, status, idempotencyKey, requestHash, createdAt, expiresAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'candidate', ?, ?, ?, ?)`,
-      ).run(id, n.body, n.bodyHash, n.kind, n.source, n.observedAt, n.scope, n.supersedes, idempotencyKey, reqHash, createdAt, expiresAt);
-      for (const t of n.tags) {
-        db.prepare(`INSERT INTO candidate_tags(candidateId, tag) VALUES (?, ?)`).run(id, t);
-      }
-      if (n.link !== null) {
-        db.prepare(`INSERT INTO candidate_links(fromId, toName) VALUES (?, ?)`).run(id, n.link);
-      }
-      const res: ResponseEnvelope = ok({
-        candidate: { id, bodyHash: n.bodyHash, status: "candidate", expiresAt },
-      });
-      const stored = budgeted(res, config);
-      // Fail closed: if the budgeted envelope collapsed to LIMIT_EXCEEDED the
-      // candidate row must not survive alone; persist the exact envelope sent.
-      db.prepare(
-        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
-      ).run(idempotencyKey, "candidate.create", reqHash, JSON.stringify(stored), createdAt);
-      auditInsert(db, {
-        ts: createdAt,
-        op: "candidate.create",
-        targetId: id,
-        code: stored.code,
-        scope: n.scope,
-        runId: n.runId,
-        approver: null,
-        approvedAt: null,
-        token: null,
-        reasonCode: null,
-      });
-      // Pre-commit cap: the write that crosses dbMaxBytes rolls back here
-      // (STORE_UNAVAILABLE) instead of leaving an oversized database.
-      assertDbUnderCap(db, config);
-      return stored;
-    });
-    return response;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
-    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
-    if (msg === "target moved") {
-      // Re-read outside the rolled-back transaction for the precise code
-      // (NOT_FOUND / FORBIDDEN_SCOPE / CONFLICT), mirroring correct-request.
-      const gate = checkCorrectionTarget(db, config, n.scope, n.supersedes as string);
-      if (!gate.ok) return gate.res;
-      return budgeted(fail("CONFLICT"), config);
-    }
-    // Unique-key collision on the idempotency key means a concurrent commit
-    // won the race: re-read and replay deterministically.
-    if (/UNIQUE constraint failed: operations/.test(msg)) {
-      let again: StoredOp | null = null;
-      try {
-        again = readOperation(db, idempotencyKey);
-      } catch {
-        return budgeted(fail("STORE_UNAVAILABLE"), config);
-      }
-      if (again && again.op === "candidate.create" && again.requestHash === reqHash) {
-        return replaySaved(again.responseJson, config);
-      }
-      return budgeted(fail("CONFLICT"), config);
-    }
-    if (/UNIQUE constraint failed: candidates/.test(msg)) {
-      return budgeted(fail("STORE_UNAVAILABLE"), config);
-    }
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-}
-
-/** candidate.get over JSON: metadata only, never the body. Requires {id, scope}. */
-export function getCandidateMeta(
-  db: DatabaseSync,
-  config: AppConfig,
-  params: Record<string, unknown>,
-): ResponseEnvelope {
-  const keys = Object.keys(params);
-  for (const k of keys) {
-    if (k !== "id" && k !== "scope") return budgeted(fail("BAD_REQUEST"), config);
-  }
-  const { id, scope } = params;
-  if (typeof id !== "string" || id.length === 0 || id.length > 256) return budgeted(fail("BAD_REQUEST"), config);
-  if (typeof scope !== "string" || countCp(scope) < 1 || countCp(scope) > 256 || hasControl(scope)) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  {
-    const denied = scopeGate(db, config, scope);
-    if (denied) return denied;
-  }
-  let row: CandidateRow | null;
-  try {
-    row = readCandidate(db, id);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (!row) return budgeted(fail("NOT_FOUND"), config);
-  if (row.scope !== scope) return budgeted(fail("FORBIDDEN_SCOPE"), config);
-  // Terminal states stay readable as metadata; expiry is lazy-marked here.
-  const nowMs = Date.now();
-  if (row.status === "candidate" && Date.parse(row.expiresAt) <= nowMs) {
-    try {
-      db.prepare(`UPDATE candidates SET status='expired' WHERE id=? AND status='candidate'`).run(id);
-      row = { ...row, status: "expired" };
-    } catch {
-      return budgeted(fail("STORE_UNAVAILABLE"), config);
-    }
-  }
-  // Metadata query failure is STORE_UNAVAILABLE, never a fabricated
-  // empty tag list / null link (readTags/readLink throw on failure).
-  let tags: string[];
-  let link: string | null;
-  try {
-    tags = readTags(db, id);
-    link = readLink(db, id);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  return budgeted(
-    ok({
-      candidate: {
-        id: row.id,
-        bodyHash: row.bodyHash,
-        kind: row.kind,
-        scope: row.scope,
-        status: row.status,
-        expiresAt: row.expiresAt,
-        createdAt: row.createdAt,
-        supersedes: row.supersedes,
-        tags,
-        link,
-      },
-    }),
-    config,
-  );
-}
-
-/** Human review read model (TTY path + direct-call tests). No body leak outside TTY. */
-export function getCandidateForReview(
-  db: DatabaseSync,
-  config: AppConfig,
-  id: string,
-  scope: string,
-): { ok: true; row: CandidateRow; tags: string[]; link: string | null; token: string } | { ok: false; code: "BAD_REQUEST" | "FORBIDDEN_SCOPE" | "NOT_FOUND" | "STORE_UNAVAILABLE" } {
-  if (!id || typeof id !== "string" || id.length > 256) return { ok: false, code: "BAD_REQUEST" };
-  if (typeof scope !== "string" || countCp(scope) < 1 || countCp(scope) > 256 || hasControl(scope)) {
-    return { ok: false, code: "BAD_REQUEST" };
-  }
-  // Authorize BEFORE disclosing the full body/token: a revoked scope
-  // (removed from startup config or the scopes table) must not review.
-  // A scopes-table I/O failure is STORE_UNAVAILABLE, never FORBIDDEN_SCOPE.
-  try {
-    if (!isScopeAuthorized(db, config, scope)) return { ok: false, code: "FORBIDDEN_SCOPE" };
-  } catch {
-    return { ok: false, code: "STORE_UNAVAILABLE" };
-  }
-  let row: CandidateRow | null;
-  try {
-    row = readCandidate(db, id);
-  } catch {
-    return { ok: false, code: "STORE_UNAVAILABLE" };
-  }
-  if (!row) return { ok: false, code: "NOT_FOUND" };
-  if (row.scope !== scope) return { ok: false, code: "FORBIDDEN_SCOPE" };
-  // Metadata query failure must not disclose a row with fabricated
-  // empty tags / null link (and a token bound to that wrong set).
-  try {
-    const tags = readTags(db, id);
-    const link = readLink(db, id);
-    return { ok: true, row, tags, link, token: tokenForStored(row, tags, link) };
-  } catch {
-    return { ok: false, code: "STORE_UNAVAILABLE" };
-  }
-}
-
-function lazyExpire(db: DatabaseSync, id: string): void {
-  try {
-    db.prepare(`UPDATE candidates SET status='expired' WHERE id=? AND status='candidate' AND expiresAt <= ?`).run(id, nowIso());
-  } catch {
-    /* ignore: caller re-reads */
-  }
-}
-
-function currentApprover(): string {
-  try {
-    const u = (process.env["USER"] || process.env["USERNAME"] || "terminal-user").slice(0, 64);
-    return u.length > 0 ? u : "terminal-user";
-  } catch {
-    return "terminal-user";
-  }
-}
-
-/** Human approve (domain core; CLI adds TTY + yes-confirmation on top). */
-export function approveCandidate(
-  db: DatabaseSync,
-  config: AppConfig,
-  args: { id: string; scope: string; token: string; idempotencyKey: string },
-  nowOverride?: string,
-): ResponseEnvelope {
-  if (!args.id || typeof args.id !== "string" || args.id.length > 256) return budgeted(fail("BAD_REQUEST"), config);
-  if (typeof args.scope !== "string" || countCp(args.scope) < 1 || countCp(args.scope) > 256 || hasControl(args.scope)) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  if (typeof args.token !== "string" || args.token.length === 0 || args.token.length > 512) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  if (typeof args.idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(args.idempotencyKey)) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  const reqHash = sha256HexUtf8(canonicalStringify({ op: "approve", id: args.id, scope: args.scope, token: args.token }));
-
-  let saved: StoredOp | null = null;
-  try {
-    saved = readOperation(db, args.idempotencyKey);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (saved) {
-    if (saved.op !== "approve") return budgeted(fail("CONFLICT"), config);
-    const denied = scopeGate(db, config, args.scope);
-    if (denied) return denied;
-    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
-    return replaySaved(saved.responseJson, config);
-  }
-  {
-    const denied = scopeGate(db, config, args.scope);
-    if (denied) return denied;
-  }
-
-  lazyExpire(db, args.id);
-  let row: CandidateRow | null;
-  try {
-    row = readCandidate(db, args.id);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (!row) return budgeted(fail("NOT_FOUND"), config);
-  if (row.scope !== args.scope) return budgeted(fail("FORBIDDEN_SCOPE"), config);
-  if (row.status !== "candidate") {
-    // Approved/rejected are terminal; an expired row reports EXPIRED.
-    if (row.status === "expired" || Date.parse(row.expiresAt) <= Date.now()) {
-      return budgeted(fail("EXPIRED"), config);
-    }
-    return budgeted(fail("CONFLICT"), config);
-  }
-  if (Date.parse(row.expiresAt) <= Date.now()) {
-    lazyExpire(db, args.id);
-    return budgeted(fail("EXPIRED"), config);
-  }
-  // T4: correction approvals run the conditional-supersede transaction.
-  // A correction candidate without a supersedes pointer is malformed and can
-  // never approve (fail closed); creation always sets one.
-  const isCorrection = row.kind === "correction" || row.supersedes !== null;
-  if (isCorrection && (typeof row.supersedes !== "string" || row.supersedes.length === 0)) {
-    return budgeted(fail("CONFLICT"), config);
-  }
-  // A metadata read failure here is STORE_UNAVAILABLE: binding the token
-  // against fabricated empty tags / null link could approve the wrong set.
-  // Tampered body/bodyHash (stored digest != digest of stored body) is
-  // CONFLICT with no record: the stale-hash approve path is closed here.
-  if (!storedBodyHashIntact(row)) return budgeted(fail("CONFLICT"), config);
-  let expected: string;
-  try {
-    expected = tokenForStored(row, readTags(db, args.id), readLink(db, args.id));
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (!safeEqual(args.token, expected)) return budgeted(fail("CONFLICT"), config);
-  // Creation-time advisory target gate for corrections: missing / foreign /
-  // inactive targets fail fast here; the transaction below is authoritative
-  // (conditional UPDATE picks exactly one winner on races).
-  if (isCorrection) {
-    const gate = checkCorrectionTarget(db, config, args.scope, row.supersedes as string);
-    if (!gate.ok) return gate.res;
-  }
-
-  const approvedAt = nowOverride ?? nowIso();
-  const recId = genId("rec");
-  try {
-    const response = withTransaction(db, (): ResponseEnvelope => {
-      // Re-verify inside the transaction (fail closed on concurrent terminal move).
-      const fresh = readCandidate(db, args.id);
-      if (!fresh || fresh.status !== "candidate") throw new Error("state moved");
-      if (!storedBodyHashIntact(fresh)) throw new Error("token moved");
-      if (Date.parse(fresh.expiresAt) <= Date.now()) throw new Error("expired now");
-      if (!safeEqual(args.token, tokenForStored(fresh, readTags(db, args.id), readLink(db, args.id)))) {
-        throw new Error("token moved");
-      }
-      // Budget gate BEFORE any insert: no orphan record / candidate mutation
-      // on an over-budget success.
-      const probe: ResponseEnvelope = ok({ record: { id: recId } });
-      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
-      const freshIsCorrection = fresh.kind === "correction" || fresh.supersedes !== null;
-      if (freshIsCorrection) {
-        // Atomic correction commit: exactly one approval may move the old
-        // row active → superseded. The conditional UPDATE is the arbiter:
-        // 0 changed rows means a competing approval (or archive) won, or the
-        // scope moved — everything rolls back as CONFLICT / FORBIDDEN_SCOPE.
-        if (typeof fresh.supersedes !== "string" || fresh.supersedes.length === 0) {
-          throw new Error("supersede lost");
-        }
-        let target: RecordRow | null;
-        try {
-          target = readRecordOrThrow(db, fresh.supersedes);
-        } catch {
-          throw new Error("db over cap");
-        }
-        if (!target) throw new Error("supersede lost");
-        if (target.scope !== fresh.scope || target.scope !== args.scope) throw new Error("supersede scope");
-        let moved: unknown;
-        try {
-          moved = db
-            .prepare(`UPDATE records SET status='superseded' WHERE id=? AND status='active' AND scope=?`)
-            .run(target.id, fresh.scope);
-        } catch {
-          throw new Error("db over cap");
-        }
-        if (changedRows(moved) !== 1) throw new Error("supersede lost");
-        db.prepare(
-          `INSERT INTO records(id, candidateId, body, bodyHash, kind, source, observedAt, scope, status, supersedes, createdAt)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
-        ).run(recId, fresh.id, fresh.body, fresh.bodyHash, fresh.kind, fresh.source, fresh.observedAt, fresh.scope, target.id, approvedAt);
-      } else {
-        db.prepare(
-          `INSERT INTO records(id, candidateId, body, bodyHash, kind, source, observedAt, scope, status, supersedes, createdAt)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?)`,
-        ).run(recId, fresh.id, fresh.body, fresh.bodyHash, fresh.kind, fresh.source, fresh.observedAt, fresh.scope, approvedAt);
-      }
-      for (const t of readTags(db, args.id)) {
-        db.prepare(`INSERT OR IGNORE INTO record_tags(recordId, tag) VALUES (?, ?)`).run(recId, t);
-      }
-      const lk = readLink(db, args.id);
-      if (lk !== null) {
-        db.prepare(`INSERT OR IGNORE INTO record_links(fromId, toName) VALUES (?, ?)`).run(recId, lk);
-      }
-      const flipped = db.prepare(`UPDATE candidates SET status='approved' WHERE id=? AND status='candidate'`).run(args.id);
-      if (changedRows(flipped) !== 1) throw new Error("state moved");
-      const res: ResponseEnvelope = ok({ record: { id: recId } });
-      const stored = budgeted(res, config);
-      db.prepare(`INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`).run(
-        args.idempotencyKey,
-        "approve",
-        reqHash,
-        JSON.stringify(stored),
-        approvedAt,
-      );
-      auditInsert(db, {
-        ts: approvedAt,
-        op: "approve",
-        targetId: args.id,
-        code: stored.code,
-        scope: fresh.scope,
-        runId: null,
-        approver: currentApprover(),
-        approvedAt,
-        token: args.token,
-        reasonCode: null,
-      });
-      // Pre-commit cap: crossing dbMaxBytes rolls back record + status flip.
-      assertDbUnderCap(db, config);
-      return stored;
-    });
-    return response;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
-    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
-    if (/UNIQUE constraint failed: operations/.test(msg)) {
-      let again: StoredOp | null = null;
-      try {
-        again = readOperation(db, args.idempotencyKey);
-      } catch {
-        return budgeted(fail("STORE_UNAVAILABLE"), config);
-      }
-      if (again && again.op === "approve" && again.requestHash === reqHash) {
-        return replaySaved(again.responseJson, config);
-      }
-      return budgeted(fail("CONFLICT"), config);
-    }
-    if (msg === "expired now") return budgeted(fail("EXPIRED"), config);
-    if (msg === "supersede scope") return budgeted(fail("FORBIDDEN_SCOPE"), config);
-    if (msg === "state moved" || msg === "token moved" || msg === "supersede lost") {
-      return budgeted(fail("CONFLICT"), config);
-    }
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-}
-
-/** Human reject (domain core; CLI adds TTY + yes-confirmation on top). */
-export function rejectCandidate(
-  db: DatabaseSync,
-  config: AppConfig,
-  args: { id: string; scope: string; token: string; idempotencyKey: string; reasonCode: string },
-  nowOverride?: string,
-): ResponseEnvelope {
-  if (!args.id || typeof args.id !== "string" || args.id.length > 256) return budgeted(fail("BAD_REQUEST"), config);
-  if (typeof args.scope !== "string" || countCp(args.scope) < 1 || countCp(args.scope) > 256 || hasControl(args.scope)) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  if (typeof args.token !== "string" || args.token.length === 0 || args.token.length > 512) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  if (typeof args.idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(args.idempotencyKey)) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  if (args.reasonCode !== "USER_REJECTED") return budgeted(fail("BAD_REQUEST"), config);
-  const reqHash = sha256HexUtf8(
-    canonicalStringify({ op: "reject", id: args.id, scope: args.scope, token: args.token, reasonCode: args.reasonCode }),
-  );
-
-  let saved: StoredOp | null = null;
-  try {
-    saved = readOperation(db, args.idempotencyKey);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (saved) {
-    if (saved.op !== "reject") return budgeted(fail("CONFLICT"), config);
-    const denied = scopeGate(db, config, args.scope);
-    if (denied) return denied;
-    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
-    return replaySaved(saved.responseJson, config);
-  }
-  {
-    const denied = scopeGate(db, config, args.scope);
-    if (denied) return denied;
-  }
-
-  lazyExpire(db, args.id);
-  let row: CandidateRow | null;
-  try {
-    row = readCandidate(db, args.id);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (!row) return budgeted(fail("NOT_FOUND"), config);
-  if (row.scope !== args.scope) return budgeted(fail("FORBIDDEN_SCOPE"), config);
-  if (row.status !== "candidate") {
-    if (row.status === "expired" || Date.parse(row.expiresAt) <= Date.now()) {
-      return budgeted(fail("EXPIRED"), config);
-    }
-    return budgeted(fail("CONFLICT"), config);
-  }
-  if (Date.parse(row.expiresAt) <= Date.now()) {
-    lazyExpire(db, args.id);
-    return budgeted(fail("EXPIRED"), config);
-  }
-  // Same fail-closed metadata rule as approve: never bind against
-  // fabricated empty tags / null link. Tampered body/bodyHash also CONFLICT.
-  if (!storedBodyHashIntact(row)) return budgeted(fail("CONFLICT"), config);
-  try {
-    if (!safeEqual(args.token, tokenForStored(row, readTags(db, args.id), readLink(db, args.id)))) {
-      return budgeted(fail("CONFLICT"), config);
-    }
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-
-  const now = nowOverride ?? nowIso();
-  try {
-    const response = withTransaction(db, (): ResponseEnvelope => {
-      const fresh = readCandidate(db, args.id);
-      if (!fresh || fresh.status !== "candidate") throw new Error("state moved");
-      if (!storedBodyHashIntact(fresh)) throw new Error("token moved");
-      if (Date.parse(fresh.expiresAt) <= Date.now()) throw new Error("expired now");
-      if (!safeEqual(args.token, tokenForStored(fresh, readTags(db, args.id), readLink(db, args.id)))) {
-        throw new Error("token moved");
-      }
-      const probe: ResponseEnvelope = ok({ candidate: { id: args.id, status: "rejected" } });
-      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
-      db.prepare(`UPDATE candidates SET status='rejected' WHERE id=? AND status='candidate'`).run(args.id);
-      const res: ResponseEnvelope = ok({ candidate: { id: args.id, status: "rejected" } });
-      const stored = budgeted(res, config);
-      db.prepare(`INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`).run(
-        args.idempotencyKey,
-        "reject",
-        reqHash,
-        JSON.stringify(stored),
-        now,
-      );
-      auditInsert(db, {
-        ts: now,
-        op: "reject",
-        targetId: args.id,
-        code: stored.code,
-        scope: fresh.scope,
-        runId: null,
-        approver: currentApprover(),
-        approvedAt: now,
-        token: args.token,
-        reasonCode: "USER_REJECTED",
-      });
-      // Pre-commit cap: crossing dbMaxBytes rolls back the status flip.
-      assertDbUnderCap(db, config);
-      return stored;
-    });
-    return response;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
-    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
-    if (/UNIQUE constraint failed: operations/.test(msg)) {
-      let again: StoredOp | null = null;
-      try {
-        again = readOperation(db, args.idempotencyKey);
-      } catch {
-        return budgeted(fail("STORE_UNAVAILABLE"), config);
-      }
-      if (again && again.op === "reject" && again.requestHash === reqHash) {
-        return replaySaved(again.responseJson, config);
-      }
-      return budgeted(fail("CONFLICT"), config);
-    }
-    if (msg === "expired now") return budgeted(fail("EXPIRED"), config);
-    if (msg === "state moved" || msg === "token moved") return budgeted(fail("CONFLICT"), config);
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* T4 correction-request + archive (plan 14.7 adopted subset)            */
-/* ------------------------------------------------------------------ */
-
-interface NormalizedCorrection {
-  recordId: string;
-  body: string;
-  bodyHash: string;
-  source: string;
-  observedAt: string;
-  scope: string;
-  tags: string[];
-  link: string | null;
-  runId: string | null;
-}
-
-type CorrectionParse =
-  | { ok: true; value: NormalizedCorrection }
-  | { ok: false; res: ResponseEnvelope };
-
-/**
- * Validate + normalize record.correct-request params (no DB writes).
- * Short form of candidate.create(kind=correction, supersedes=recordId):
- * kind, when present, must be exactly "correction"; ttlSec is not accepted
- * (corrections share the standard candidate TTL).
- */
-export function parseCorrectRequestParams(
-  config: AppConfig,
-  params: Record<string, unknown>,
-): CorrectionParse {
-  if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
-  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "tags", "link", "runId"]);
-  for (const k of Object.keys(params)) {
-    if (!allowed.has(k)) return { ok: false, res: bad() };
-  }
-  if (containsLoneSurrogateDeep(Object.keys(params))) return { ok: false, res: bad() };
-  const { recordId, body, kind, provenance, scope, tags, link, runId } = params;
-
-  if (typeof recordId !== "string" || recordId.length === 0 || recordId.length > 256) {
-    return { ok: false, res: bad() };
-  }
-  if (hasControl(recordId)) return { ok: false, res: bad() };
-  if (kind !== undefined && kind !== "correction") return { ok: false, res: bad() };
-
-  if (typeof body !== "string") return { ok: false, res: bad() };
-  if (checkLenCp(body, 1, config.limits.bodyMaxCp) === "long") return { ok: false, res: limitExceeded() };
-  const nBody = normalizeBody(body);
-  const bodyLen = checkLenCp(nBody, 1, Math.min(2000, config.limits.bodyMaxCp));
-  if (bodyLen === "short") return { ok: false, res: bad() };
-  if (bodyLen === "long") return { ok: false, res: limitExceeded() };
-
-  if (!isPlainObject(provenance)) return { ok: false, res: bad() };
-  const pKeys = Object.keys(provenance);
-  if (pKeys.length !== 2 || !pKeys.includes("source") || !pKeys.includes("observedAt")) {
-    return { ok: false, res: bad() };
-  }
-  const source = provenance["source"];
-  const observedAt = provenance["observedAt"];
-  if (typeof source !== "string") return { ok: false, res: bad() };
-  const srcLen = checkLenCp(source, 1, 256);
-  if (srcLen === "long") return { ok: false, res: limitExceeded() };
-  if (srcLen === "short" || hasControl(source)) return { ok: false, res: bad() };
-  const canonObs = canonicalTime(observedAt);
-  if (canonObs === null) return { ok: false, res: bad() };
-
-  if (typeof scope !== "string") return { ok: false, res: bad() };
-  const scopeLen = checkLenCp(scope, 1, 256);
-  if (scopeLen === "long") return { ok: false, res: limitExceeded() };
-  if (scopeLen === "short" || hasControl(scope)) return { ok: false, res: bad() };
-
-  let nTags: string[] = [];
-  if (tags !== undefined) {
-    if (!Array.isArray(tags)) return { ok: false, res: bad() };
-    if (tags.length > config.limits.tagsMax) return { ok: false, res: limitExceeded() };
-    const seen = new Set<string>();
-    for (const t of tags) {
-      if (typeof t !== "string") return { ok: false, res: bad() };
-      const tl = checkLenCp(t, 1, 256);
-      if (tl === "long") return { ok: false, res: limitExceeded() };
-      if (tl === "short" || hasControl(t)) return { ok: false, res: bad() };
-      const nt = normalizeTag(t);
-      if (countCp(nt) < 1 || countCp(nt) > 256) return { ok: false, res: bad() };
-      seen.add(nt);
-    }
-    nTags = [...seen].sort();
-  }
-
-  let nLink: string | null = null;
-  if (link !== undefined && link !== null) {
-    if (typeof link !== "string") return { ok: false, res: bad() };
-    const ll = checkLenCp(link, 1, 256);
-    if (ll === "long") return { ok: false, res: limitExceeded() };
-    if (ll === "short" || hasControl(link)) return { ok: false, res: bad() };
-    const nl = normalizeLink(link);
-    if (countCp(nl) < 1 || countCp(nl) > 256) return { ok: false, res: bad() };
-    nLink = nl;
-  }
-
-  let nRunId: string | null = null;
-  if (runId !== undefined && runId !== null) {
-    if (typeof runId !== "string") return { ok: false, res: bad() };
-    const rl = checkLenCp(runId, 1, 256);
-    if (rl === "long") return { ok: false, res: limitExceeded() };
-    if (rl === "short" || hasControl(runId)) return { ok: false, res: bad() };
-    nRunId = runId;
-  }
-
-  return {
-    ok: true,
-    value: {
-      recordId,
-      body: nBody,
-      bodyHash: bodyHashFor(nBody),
-      source: source as string,
-      observedAt: canonObs,
-      scope: scope as string,
-      tags: nTags,
-      link: nLink,
-      runId: nRunId,
-    },
-  };
-}
-
-/**
- * record.correct-request over JSON (write op, idempotencyKey mandatory).
- * Creates a kind=correction candidate superseding an active same-scope
- * record. The old record stays active (and recallable) until a human
- * approves the correction; nothing here mutates records.
- */
-export function correctRequest(
-  db: DatabaseSync,
-  config: AppConfig,
-  params: Record<string, unknown>,
-  idempotencyKey: string,
-  nowOverride?: string,
-): ResponseEnvelope {
-  const parsed = parseCorrectRequestParams(config, params);
-  if (!parsed.ok) return budgeted(parsed.res, config);
-  const n = parsed.value;
-
-  const reqHash = requestHashFor("record.correct-request", {
-    body: n.body,
-    kind: "correction",
-    observedAt: n.observedAt,
-    scope: n.scope,
-    source: n.source,
-    link: n.link,
-    recordId: n.recordId,
-    runId: n.runId,
-    tags: n.tags,
-  });
-
-  // Idempotent replay gate first: authorization recheck + hash match, then
-  // the committed envelope even if the target has since moved. EXPIRED is
-  // for fresh executions only, never for committed replay.
-  let saved: StoredOp | null = null;
-  try {
-    saved = readOperation(db, idempotencyKey);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (saved) {
-    if (saved.op !== "record.correct-request") return budgeted(fail("CONFLICT"), config);
-    const denied = scopeGate(db, config, n.scope);
-    if (denied) return denied;
-    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
-    return replaySaved(saved.responseJson, config);
-  }
-  {
-    const denied = scopeGate(db, config, n.scope);
-    if (denied) return denied;
-  }
-  // Creation-time advisory target gate (approval re-checks atomically).
-  {
-    const gate = checkCorrectionTarget(db, config, n.scope, n.recordId);
-    if (!gate.ok) return gate.res;
-  }
-
-  const now = nowOverride ?? nowIso();
-  const nowMs = Date.parse(now);
-  if (!Number.isFinite(nowMs)) return budgeted(fail("STORE_UNAVAILABLE"), config);
-  const createdAt = new Date(nowMs).toISOString();
-  const expiresAt = new Date(nowMs + config.candidateTtlSec * 1000).toISOString();
-  const id = genId("cand");
-
-  try {
-    const response = withTransaction(db, (): ResponseEnvelope => {
-      // Re-check the target inside the transaction: a record archived or
-      // superseded between the advisory gate and COMMIT must not gain a
-      // correction candidate.
-      const gate = checkCorrectionTarget(db, config, n.scope, n.recordId);
-      if (!gate.ok) throw new Error("target moved");
-      // Budget gate BEFORE any insert: no orphan candidate on overflow.
-      const probe: ResponseEnvelope = ok({
-        candidate: { id, bodyHash: n.bodyHash, status: "candidate", expiresAt },
-      });
-      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
-      db.prepare(
-        `INSERT INTO candidates(id, body, bodyHash, kind, source, observedAt, scope, supersedes, status, idempotencyKey, requestHash, createdAt, expiresAt)
-         VALUES (?, ?, ?, 'correction', ?, ?, ?, ?, 'candidate', ?, ?, ?, ?)`,
-      ).run(id, n.body, n.bodyHash, n.source, n.observedAt, n.scope, n.recordId, idempotencyKey, reqHash, createdAt, expiresAt);
-      for (const t of n.tags) {
-        db.prepare(`INSERT INTO candidate_tags(candidateId, tag) VALUES (?, ?)`).run(id, t);
-      }
-      if (n.link !== null) {
-        db.prepare(`INSERT INTO candidate_links(fromId, toName) VALUES (?, ?)`).run(id, n.link);
-      }
-      const res: ResponseEnvelope = ok({
-        candidate: { id, bodyHash: n.bodyHash, status: "candidate", expiresAt },
-      });
-      const stored = budgeted(res, config);
-      db.prepare(
-        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
-      ).run(idempotencyKey, "record.correct-request", reqHash, JSON.stringify(stored), createdAt);
-      auditInsert(db, {
-        ts: createdAt,
-        op: "record.correct-request",
-        targetId: id,
-        code: stored.code,
-        scope: n.scope,
-        runId: n.runId,
-        approver: null,
-        approvedAt: null,
-        token: null,
-        reasonCode: null,
-      });
-      assertDbUnderCap(db, config);
-      return stored;
-    });
-    return response;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
-    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
-    if (msg === "target moved") {
-      // Re-read outside the rolled-back transaction for the precise code.
-      const gate = checkCorrectionTarget(db, config, n.scope, n.recordId);
-      if (!gate.ok) return gate.res;
-      return budgeted(fail("CONFLICT"), config);
-    }
-    if (/UNIQUE constraint failed: operations/.test(msg)) {
-      let again: StoredOp | null = null;
-      try {
-        again = readOperation(db, idempotencyKey);
-      } catch {
-        return budgeted(fail("STORE_UNAVAILABLE"), config);
-      }
-      if (again && again.op === "record.correct-request" && again.requestHash === reqHash) {
-        return replaySaved(again.responseJson, config);
-      }
-      return budgeted(fail("CONFLICT"), config);
-    }
-    if (/UNIQUE constraint failed: candidates/.test(msg)) {
-      return budgeted(fail("STORE_UNAVAILABLE"), config);
-    }
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-}
-
-/**
- * Human archive (domain core; CLI adds TTY + yes-confirmation on top).
- * Terminal transition active → archived: no restore, no physical deletion.
- * Metadata-only audit + idempotency row commit atomically with the flip;
- * audit/insert failure rolls everything back (fail closed).
- */
-export function archiveRecord(
-  db: DatabaseSync,
-  config: AppConfig,
-  args: { id: string; scope: string; idempotencyKey: string; reasonCode: string },
-  nowOverride?: string,
-): ResponseEnvelope {
-  if (!args.id || typeof args.id !== "string" || args.id.length > 256) return budgeted(fail("BAD_REQUEST"), config);
-  if (typeof args.scope !== "string" || countCp(args.scope) < 1 || countCp(args.scope) > 256 || hasControl(args.scope)) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  if (typeof args.idempotencyKey !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(args.idempotencyKey)) {
-    return budgeted(fail("BAD_REQUEST"), config);
-  }
-  if (args.reasonCode !== "USER_ARCHIVED") return budgeted(fail("BAD_REQUEST"), config);
-  const reqHash = sha256HexUtf8(
-    canonicalStringify({ op: "archive", id: args.id, scope: args.scope, reasonCode: args.reasonCode }),
-  );
-
-  let saved: StoredOp | null = null;
-  try {
-    saved = readOperation(db, args.idempotencyKey);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (saved) {
-    if (saved.op !== "archive") return budgeted(fail("CONFLICT"), config);
-    const denied = scopeGate(db, config, args.scope);
-    if (denied) return denied;
-    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
-    return replaySaved(saved.responseJson, config);
-  }
-  {
-    const denied = scopeGate(db, config, args.scope);
-    if (denied) return denied;
-  }
-
-  let target: RecordRow | null;
-  try {
-    target = readRecordOrThrow(db, args.id);
-  } catch {
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-  if (!target) return budgeted(fail("NOT_FOUND"), config);
-  if (target.scope !== args.scope) return budgeted(fail("FORBIDDEN_SCOPE"), config);
-  if (target.status !== "active") return budgeted(fail("CONFLICT"), config);
-
-  const now = nowOverride ?? nowIso();
-  try {
-    const response = withTransaction(db, (): ResponseEnvelope => {
-      // Conditional flip is the arbiter: 0 rows means a competing approval
-      // (supersede) or archive won first — roll everything back as CONFLICT.
-      let moved: unknown;
-      try {
-        moved = db
-          .prepare(`UPDATE records SET status='archived' WHERE id=? AND status='active' AND scope=?`)
-          .run(args.id, args.scope);
-      } catch {
-        throw new Error("db over cap");
-      }
-      if (changedRows(moved) !== 1) throw new Error("archive lost");
-      const probe: ResponseEnvelope = ok({ record: { id: args.id, status: "archived" } });
-      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
-      const res: ResponseEnvelope = ok({ record: { id: args.id, status: "archived" } });
-      const stored = budgeted(res, config);
-      db.prepare(`INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`).run(
-        args.idempotencyKey,
-        "archive",
-        reqHash,
-        JSON.stringify(stored),
-        now,
-      );
-      auditInsert(db, {
-        ts: now,
-        op: "archive",
-        targetId: args.id,
-        code: stored.code,
-        scope: args.scope,
-        runId: null,
-        approver: currentApprover(),
-        approvedAt: null,
-        token: null,
-        reasonCode: "USER_ARCHIVED",
-      });
-      assertDbUnderCap(db, config);
-      return stored;
-    });
-    return response;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
-    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
-    if (/UNIQUE constraint failed: operations/.test(msg)) {
-      let again: StoredOp | null = null;
-      try {
-        again = readOperation(db, args.idempotencyKey);
-      } catch {
-        return budgeted(fail("STORE_UNAVAILABLE"), config);
-      }
-      if (again && again.op === "archive" && again.requestHash === reqHash) {
-        return replaySaved(again.responseJson, config);
-      }
-      return budgeted(fail("CONFLICT"), config);
-    }
-    if (msg === "archive lost") return budgeted(fail("CONFLICT"), config);
-    return budgeted(fail("STORE_UNAVAILABLE"), config);
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* T3 deterministic recall (plan 14.6 + 14.4/14.8/14.10 adopted subset) */
-/* ------------------------------------------------------------------ */
-
-interface ParsedRecall {
-  query: string;
-  tags: string[];
-  link: string | null;
-  since: string | null;
-  until: string | null;
-  limit: number;
-  scope: string;
-  runId: string | null;
-}
-
-type RecallParse =
-  | { ok: true; value: ParsedRecall }
-  | { ok: false; res: ResponseEnvelope };
-
-function parseRecallParams(config: AppConfig, params: Record<string, unknown>): RecallParse {
-  // Direct-call hardening: unpaired surrogates (incl. escaped lone halves
-  // that bypass UTF-8 checks) are BAD_REQUEST with no audit/exposure write.
-  if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
-  const allowed = new Set(["query", "tags", "link", "since", "until", "limit", "scope", "runId"]);
-  for (const k of Object.keys(params)) {
-    if (!allowed.has(k)) return { ok: false, res: bad() };
-  }
-  if (containsLoneSurrogateDeep(Object.keys(params))) return { ok: false, res: bad() };
-  const { query, tags, link, since, until, limit, scope, runId } = params;
-
-  if (typeof query !== "string") return { ok: false, res: bad() };
-  if (countCp(query) > config.limits.queryMaxCp) return { ok: false, res: limitExceeded() };
-  const nq = normalizeBody(query);
-  const nqLen = countCp(nq);
-  if (nqLen < 1) return { ok: false, res: bad() };
-  if (nqLen > config.limits.queryMaxCp) return { ok: false, res: limitExceeded() };
-
-  let nTags: string[] = [];
-  if (tags !== undefined) {
-    if (!Array.isArray(tags)) return { ok: false, res: bad() };
-    if (tags.length > config.limits.tagsMax) return { ok: false, res: limitExceeded() };
-    const seen = new Set<string>();
-    for (const t of tags) {
-      if (typeof t !== "string") return { ok: false, res: bad() };
-      if (countCp(t) > 256) return { ok: false, res: limitExceeded() };
-      if (countCp(t) < 1 || hasControl(t)) return { ok: false, res: bad() };
-      const nt = normalizeTag(t);
-      if (countCp(nt) < 1 || countCp(nt) > 256) return { ok: false, res: bad() };
-      seen.add(nt);
-    }
-    nTags = [...seen].sort();
-  }
-
-  let nLink: string | null = null;
-  if (link !== undefined && link !== null) {
-    if (typeof link !== "string") return { ok: false, res: bad() };
-    if (countCp(link) > 256) return { ok: false, res: limitExceeded() };
-    if (countCp(link) < 1 || hasControl(link)) return { ok: false, res: bad() };
-    const nl = normalizeLink(link);
-    if (countCp(nl) < 1 || countCp(nl) > 256) return { ok: false, res: bad() };
-    nLink = nl;
-  }
-
-  let nSince: string | null = null;
-  if (since !== undefined && since !== null) {
-    const c = canonicalTime(since);
-    if (c === null) return { ok: false, res: bad() };
-    nSince = c;
-  }
-  let nUntil: string | null = null;
-  if (until !== undefined && until !== null) {
-    const c = canonicalTime(until);
-    if (c === null) return { ok: false, res: bad() };
-    nUntil = c;
-  }
-
-  let nLimit = config.limits.limitDefault;
-  if (limit !== undefined) {
-    if (typeof limit !== "number" || !Number.isInteger(limit)) return { ok: false, res: bad() };
-    if (limit < 1) return { ok: false, res: bad() };
-    if (limit > config.limits.limitMax) return { ok: false, res: limitExceeded() };
-    nLimit = limit;
-  }
-
-  if (typeof scope !== "string") return { ok: false, res: bad() };
-  if (countCp(scope) > 256) return { ok: false, res: limitExceeded() };
-  if (countCp(scope) < 1 || hasControl(scope)) return { ok: false, res: bad() };
-
-  let nRunId: string | null = null;
-  if (runId !== undefined && runId !== null) {
-    if (typeof runId !== "string") return { ok: false, res: bad() };
-    if (countCp(runId) > 256) return { ok: false, res: limitExceeded() };
-    if (countCp(runId) < 1 || hasControl(runId)) return { ok: false, res: bad() };
-    nRunId = runId;
-  }
-
-  return { ok: true, value: { query: nq, tags: nTags, link: nLink, since: nSince, until: nUntil, limit: nLimit, scope: scope as string, runId: nRunId } };
-}
-
-function snippetFor(body: string, maxCp: number): { snippet: string; truncated: boolean } {
-  const cps = [...body];
-  if (cps.length <= maxCp) return { snippet: body, truncated: false };
-  return { snippet: cps.slice(0, maxCp).join(""), truncated: true };
-}
-
-/**
- * DB cap gate (dbMaxBytes). Effective size = max(logical, physical):
- * - Logical: PRAGMA page_count * page_size of the main image (includes
- *   freelist pages, so conservative; also the only signal for :memory:
- *   databases, which have no file path).
- * - Physical: filesystem bytes of the main file + WAL (-wal) + SHM (-shm)
- *   sidecars. In WAL mode uncheckpointed writes live in -wal, so the file
- *   sum is what actually grows before COMMIT; the logical view alone would
- *   miss it. Summing logical + physical would double-count the main image,
- *   hence max(), not the sum.
- * Oversize -> true (fail closed, STORE_UNAVAILABLE). Unknown/unreadable
- * sizes never block (fail-open on measurement only). Checked at transaction
- * entry (cheap reject) AND after mutations before COMMIT: the write that
- * crosses the cap throws inside withTransaction, rolls back, and leaves no
- * oversized database behind.
- */
+/** DB cap gate (best-effort max of logical vs physical WAL-inclusive size). */
 function isDbOverCap(db: DatabaseSync, config: AppConfig): boolean {
   try {
     let logical = 0;
@@ -1634,18 +330,1246 @@ function isDbOverCap(db: DatabaseSync, config: AppConfig): boolean {
   }
 }
 
-/** Post-mutation gate: call inside the transaction after all writes, before COMMIT. */
 function assertDbUnderCap(db: DatabaseSync, config: AppConfig): void {
   if (isDbOverCap(db, config)) throw new Error("db over cap");
 }
 
-interface RecallCandidate {
-  id: string;
-  body: string;
-  createdAt: string;
+/* ---------------- char bigrams (CJK-safe lexical path) --------------- */
+
+/** Adjacent code-point pairs of the normalized text (pure, deterministic). */
+export function bigramsOf(normalized: string): string[] {
+  const cps = [...normalized].filter((c) => c !== " ");
+  const out = new Set<string>();
+  for (let i = 0; i + 1 < cps.length; i++) {
+    out.add((cps[i] as string) + (cps[i + 1] as string));
+  }
+  return [...out].sort();
 }
 
-/** record.recall over JSON (read-only selection + metadata-only audit in one txn). */
+function indexBigrams(
+  db: DatabaseSync,
+  kind: "note" | "raw",
+  id: string,
+  normalized: string,
+): void {
+  const ins = db.prepare(`INSERT OR IGNORE INTO char_bigrams(kind, id, bigram) VALUES (?, ?, ?)`);
+  for (const b of bigramsOf(normalized)) ins.run(kind, id, b);
+}
+
+/**
+ * Bounded best-effort post-commit index maintenance (never throws).
+ * Derived FTS/bigram rows are rebuildable; a failure here must never roll
+ * back the already-committed canonical raw/record write. Recall always
+ * keeps a canonical bodyNorm instr fallback, so memory stays findable
+ * when these derived rows are absent.
+ */
+function bestEffortIndexNote(db: DatabaseSync, recordId: string, bodyNorm: string): void {
+  try {
+    db.prepare(`INSERT INTO fts_notes(recordId, body) VALUES (?, ?)`).run(recordId, bodyNorm);
+  } catch {
+    /* derived only; canonical commit already succeeded */
+  }
+  try {
+    indexBigrams(db, "note", recordId, bodyNorm);
+  } catch {
+    /* ignore */
+  }
+}
+
+function bestEffortIndexRaw(db: DatabaseSync, eventId: string, bodyNorm: string): void {
+  try {
+    db.prepare(`INSERT INTO fts_raw(eventId, body) VALUES (?, ?)`).run(eventId, bodyNorm);
+  } catch {
+    /* derived only; canonical commit already succeeded */
+  }
+  try {
+    indexBigrams(db, "raw", eventId, bodyNorm);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Post-commit projection enqueue (best-effort, never throws, never affects
+ * the already-committed envelope). Must run OUTSIDE canonical transactions:
+ * canonical commits must not depend on queue/index success.
+ */
+function outboundRefsOf(db: DatabaseSync, fromId: string): string[] {
+  try {
+    const rows = db.prepare(`SELECT toRef FROM record_links WHERE fromId = ?`).all(fromId) as Array<{
+      toRef: string;
+    }>;
+    return rows.map((r) => r.toRef);
+  } catch {
+    return [];
+  }
+}
+
+/** Resolve outbound refs to existing same-scope record IDs (best-effort). */
+function resolvedSameScopeIds(db: DatabaseSync, scope: string, refs: string[]): string[] {
+  const out: string[] = [];
+  try {
+    const stmt = db.prepare(`SELECT id FROM records WHERE id = ? AND scope = ?`);
+    for (const r of refs) {
+      try {
+        const row = stmt.get(r, scope) as { id: string } | undefined;
+        if (row) out.push(row.id);
+      } catch {
+        /* per-ref best effort */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+
+/**
+ * Enqueue changed records plus resolved same-scope outbound targets whose
+ * rendered Backlinks section may have changed. Unresolved/dangling refs stay
+ * canonical links but are never enqueued as files. Best-effort: never throws.
+ */
+function postCommitEnqueueProjections(
+  db: DatabaseSync,
+  scope: string,
+  changedIds: string[],
+  outboundRefs: string[],
+): void {
+  try {
+    const seen = new Set<string>();
+    const targets = resolvedSameScopeIds(db, scope, outboundRefs);
+    for (const id of [...changedIds, ...targets]) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      enqueueProjection(db, id);
+    }
+  } catch {
+    /* projection is best-effort; the commit already succeeded */
+  }
+}
+
+/**
+ * Exported rebuild of derived lexical indexes from canonical tables.
+ * Reads raw_events.bodyNorm / records.bodyNorm (canonical), clears only
+ * the derived tables (fts_notes, fts_raw, char_bigrams), and re-inserts.
+ * Bounded by the existing canonical row count; never deletes or mutates
+ * canonical rows. On failure the canonical tables are untouched (derived
+ * tables may be partially rebuilt; recall's bodyNorm fallback still works).
+ */
+export function rebuildDerivedIndexes(db: DatabaseSync): { notes: number; raw: number; bigrams: number } {
+  const noteRows = db
+    .prepare(`SELECT id, bodyNorm FROM records ORDER BY createdAt ASC, id ASC`)
+    .all() as Array<{ id: string; bodyNorm: string }>;
+  const rawRows = db
+    .prepare(`SELECT eventId, bodyNorm FROM raw_events ORDER BY createdAt ASC, eventId ASC`)
+    .all() as Array<{ eventId: string; bodyNorm: string }>;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`DELETE FROM fts_notes`);
+    db.exec(`DELETE FROM fts_raw`);
+    db.exec(`DELETE FROM char_bigrams`);
+    const ftsNote = db.prepare(`INSERT INTO fts_notes(recordId, body) VALUES (?, ?)`);
+    for (const r of noteRows) {
+      try {
+        ftsNote.run(r.id, r.bodyNorm);
+      } catch {
+        /* per-row best effort; continue */
+      }
+    }
+    const ftsRaw = db.prepare(`INSERT INTO fts_raw(eventId, body) VALUES (?, ?)`);
+    for (const r of rawRows) {
+      try {
+        ftsRaw.run(r.eventId, r.bodyNorm);
+      } catch {
+        /* per-row best effort; continue */
+      }
+    }
+    const bi = db.prepare(`INSERT OR IGNORE INTO char_bigrams(kind, id, bigram) VALUES (?, ?, ?)`);
+    let bigrams = 0;
+    for (const r of noteRows) {
+      for (const b of bigramsOf(r.bodyNorm)) {
+        try {
+          bi.run("note", r.id, b);
+          bigrams++;
+        } catch {
+          break;
+        }
+      }
+    }
+    for (const r of rawRows) {
+      for (const b of bigramsOf(r.bodyNorm)) {
+        try {
+          bi.run("raw", r.eventId, b);
+          bigrams++;
+        } catch {
+          break;
+        }
+      }
+    }
+    db.exec("COMMIT");
+    return { notes: noteRows.length, raw: rawRows.length, bigrams };
+  } catch (e) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+}
+
+function countTable(db: DatabaseSync, sql: string): number | null {
+  try {
+    const row = db.prepare(sql).get() as { n: number } | undefined;
+    return typeof row?.n === "number" ? row.n : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort repair hook for schema init: rebuild on obvious mismatch only. Never throws. */
+function maybeRebuildDerivedIndexes(db: DatabaseSync): void {
+  try {
+    const notes = countTable(db, `SELECT COUNT(*) AS n FROM records`);
+    const ftsNotes = countTable(db, `SELECT COUNT(*) AS n FROM fts_notes`);
+    const raws = countTable(db, `SELECT COUNT(*) AS n FROM raw_events`);
+    const ftsRaws = countTable(db, `SELECT COUNT(*) AS n FROM fts_raw`);
+    const bigrams = countTable(db, `SELECT COUNT(*) AS n FROM char_bigrams`);
+    if (notes === null || ftsNotes === null || raws === null || ftsRaws === null || bigrams === null) return;
+    const missing =
+      (notes > 0 && ftsNotes === 0) ||
+      (raws > 0 && ftsRaws === 0) ||
+      (notes + raws > 0 && bigrams === 0) ||
+      ftsNotes < notes ||
+      ftsRaws < raws;
+    if (!missing) return;
+    try {
+      rebuildDerivedIndexes(db);
+    } catch {
+      /* recall bodyNorm fallback covers; never fail init */
+    }
+  } catch {
+    /* never fail schema init on index repair */
+  }
+}
+
+function ftsEscapeTerm(t: string): string {
+  return t.replace(/"/g, '""');
+}
+
+/** FTS5 BM25 candidates over notes; empty array when FTS errors (bigram path covers). */
+function ftsNoteHits(
+  db: DatabaseSync,
+  scope: string,
+  normalizedQuery: string,
+  since: string | null,
+  until: string | null,
+  cap: number,
+): Array<{ id: string; rank: number }> {
+  const terms = normalizedQuery.split(" ").map((t) => t.trim()).filter((t) => t.length > 0).slice(0, 8);
+  if (terms.length === 0) return [];
+  const match = terms.map((t) => `"${ftsEscapeTerm(t)}"*`).join(" OR ");
+  try {
+    let sql = `SELECT f.recordId AS id, bm25(fts_notes) AS r FROM fts_notes f
+      JOIN records ON records.id = f.recordId
+      WHERE f.body MATCH ? AND records.scope = ? AND records.status = 'active'`;
+    const args: Array<string | number> = [match, scope];
+    if (since !== null) {
+      sql += ` AND records.createdAt >= ?`;
+      args.push(since);
+    }
+    if (until !== null) {
+      sql += ` AND records.createdAt < ?`;
+      args.push(until);
+    }
+    sql += ` ORDER BY r ASC LIMIT ?`;
+    args.push(cap);
+    return db.prepare(sql).all(...args) as Array<{ id: string; rank: number }>;
+  } catch {
+    return [];
+  }
+}
+
+/** Bigram-overlap candidates over notes (deterministic, CJK-safe). */
+function bigramNoteHits(
+  db: DatabaseSync,
+  scope: string,
+  normalizedQuery: string,
+  since: string | null,
+  until: string | null,
+  cap: number,
+): Array<{ id: string; overlap: number }> {
+  const bigrams = bigramsOf(normalizedQuery);
+  if (bigrams.length === 0) {
+    // Single-char query: exact substring scan fallback (bounded by scope window).
+    try {
+      let sql = `SELECT id FROM records WHERE scope = ? AND status = 'active' AND instr(bodyNorm, ?) > 0`;
+      const args: Array<string | number> = [scope, normalizedQuery];
+      if (since !== null) {
+        sql += ` AND createdAt >= ?`;
+        args.push(since);
+      }
+      if (until !== null) {
+        sql += ` AND createdAt < ?`;
+        args.push(until);
+      }
+      sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
+      args.push(cap);
+      return (db.prepare(sql).all(...args) as Array<{ id: string }>).map((r) => ({ id: r.id, overlap: 1 }));
+    } catch {
+      return [];
+    }
+  }
+  try {
+    const placeholders = bigrams.map(() => "?").join(",");
+    let sql = `SELECT b.id AS id, COUNT(*) AS overlap FROM char_bigrams b
+      JOIN records ON records.id = b.id
+      WHERE b.kind = 'note' AND b.bigram IN (${placeholders}) AND records.scope = ? AND records.status = 'active'`;
+    const args: Array<string | number> = [...bigrams, scope];
+    if (since !== null) {
+      sql += ` AND records.createdAt >= ?`;
+      args.push(since);
+    }
+    if (until !== null) {
+      sql += ` AND records.createdAt < ?`;
+      args.push(until);
+    }
+    sql += ` GROUP BY b.id ORDER BY overlap DESC, records.createdAt DESC, b.id ASC LIMIT ?`;
+    args.push(cap);
+    return db.prepare(sql).all(...args) as Array<{ id: string; overlap: number }>;
+  } catch {
+    return [];
+  }
+}
+
+/** Raw lexical hits mapped to records via source refs (active, same scope, time-windowed). */
+function rawDescentHits(
+  db: DatabaseSync,
+  scope: string,
+  normalizedQuery: string,
+  since: string | null,
+  until: string | null,
+): Array<{ id: string }> {
+  const terms = normalizedQuery.split(" ").map((t) => t.trim()).filter((t) => t.length > 0).slice(0, 8);
+  let eventIds: string[] = [];
+  if (terms.length > 0) {
+    const match = terms.map((t) => `"${ftsEscapeTerm(t)}"*`).join(" OR ");
+    try {
+      const rows = db
+        .prepare(
+          `SELECT f.eventId AS eventId FROM fts_raw f
+           JOIN raw_events ON raw_events.eventId = f.eventId
+           WHERE f.body MATCH ? AND raw_events.scope = ?
+           ORDER BY bm25(fts_raw) ASC LIMIT ?`,
+        )
+        .all(match, scope, RAW_DESCENT_MAX) as Array<{ eventId: string }>;
+      eventIds = rows.map((r) => r.eventId);
+    } catch {
+      eventIds = [];
+    }
+  }
+  if (eventIds.length === 0) {
+    // Bigram fallback over raw bodies for CJK/short queries.
+    const bigrams = bigramsOf(normalizedQuery);
+    try {
+      if (bigrams.length > 0) {
+        const placeholders = bigrams.map(() => "?").join(",");
+        const rows = db
+          .prepare(
+            `SELECT b.id AS eventId, COUNT(*) AS overlap FROM char_bigrams b
+             JOIN raw_events ON raw_events.eventId = b.id
+             WHERE b.kind = 'raw' AND b.bigram IN (${placeholders}) AND raw_events.scope = ?
+             GROUP BY b.id ORDER BY overlap DESC, raw_events.createdAt DESC, b.id ASC LIMIT ?`,
+          )
+          .all(...[...bigrams, scope, RAW_DESCENT_MAX]) as Array<{ eventId: string }>;
+        eventIds = rows.map((r) => r.eventId);
+      } else {
+        const rows = db
+          .prepare(
+            `SELECT eventId FROM raw_events WHERE scope = ? AND instr(bodyNorm, ?) > 0
+             ORDER BY createdAt DESC, eventId ASC LIMIT ?`,
+          )
+          .all(scope, normalizedQuery, RAW_DESCENT_MAX) as Array<{ eventId: string }>;
+        eventIds = rows.map((r) => r.eventId);
+      }
+    } catch {
+      eventIds = [];
+    }
+  }
+  if (eventIds.length === 0) return [];
+  try {
+    const placeholders = eventIds.map(() => "?").join(",");
+    let sql = `SELECT DISTINCT s.recordId AS id FROM record_source_refs s
+         JOIN records ON records.id = s.recordId
+         WHERE s.eventId IN (${placeholders}) AND records.scope = ? AND records.status = 'active'`;
+    const args: Array<string | number> = [...eventIds, scope];
+    if (since !== null) {
+      sql += ` AND records.createdAt >= ?`;
+      args.push(since);
+    }
+    if (until !== null) {
+      sql += ` AND records.createdAt < ?`;
+      args.push(until);
+    }
+    const rows = db.prepare(sql).all(...args) as Array<{ id: string }>;
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Bounded canonical fallback over records.bodyNorm (never FTS/bigrams).
+ * Guarantees committed memory stays findable when derived indexes are
+ * absent or stale. Whole-query instr first, then per-term OR when the
+ * query has multiple tokens. Deterministic, scope/status/window bounded.
+ */
+function canonicalBodyNormHits(
+  db: DatabaseSync,
+  scope: string,
+  normalizedQuery: string,
+  since: string | null,
+  until: string | null,
+  cap: number,
+): Array<{ id: string }> {
+  const terms = normalizedQuery.split(" ").map((t) => t.trim()).filter((t) => t.length > 0).slice(0, 8);
+  if (terms.length === 0) return [];
+  try {
+    const window = (alias: string): { frag: string; args: Array<string | number> } => {
+      let frag = "";
+      const args: Array<string | number> = [];
+      if (since !== null) {
+        frag += ` AND ${alias}.createdAt >= ?`;
+        args.push(since);
+      }
+      if (until !== null) {
+        frag += ` AND ${alias}.createdAt < ?`;
+        args.push(until);
+      }
+      return { frag, args };
+    };
+    const w = window("records");
+    const whole = db
+      .prepare(
+        `SELECT id FROM records WHERE scope = ? AND status = 'active' AND instr(bodyNorm, ?) > 0${w.frag}
+         ORDER BY createdAt DESC, id ASC LIMIT ?`,
+      )
+      .all(scope, normalizedQuery, ...w.args, cap) as Array<{ id: string }>;
+    if (whole.length > 0 || terms.length === 1) return whole;
+    const conds = terms.map(() => `instr(bodyNorm, ?) > 0`).join(" OR ");
+    const w2 = window("records");
+    const perTerm = db
+      .prepare(
+        `SELECT id FROM records WHERE scope = ? AND status = 'active' AND (${conds})${w2.frag}
+         ORDER BY createdAt DESC, id ASC LIMIT ?`,
+      )
+      .all(scope, ...terms, ...w2.args, cap) as Array<{ id: string }>;
+    return perTerm;
+  } catch {
+    return [];
+  }
+}
+
+/* ---------------- shared param validation ---------------- */
+
+function parseProvenance(
+  provenance: unknown,
+): { source: string; observedAt: string } | null {
+  if (!isPlainObject(provenance)) return null;
+  const keys = Object.keys(provenance);
+  if (keys.length !== 2 || !keys.includes("source") || !keys.includes("observedAt")) return null;
+  const source = provenance["source"];
+  const observedAt = provenance["observedAt"];
+  if (typeof source !== "string") return null;
+  const srcLen = checkLenCp(source, 1, 256);
+  if (srcLen !== "ok" || hasControl(source)) return null;
+  const canonObs = canonicalTime(observedAt);
+  if (canonObs === null) return null;
+  return { source: source as string, observedAt: canonObs };
+}
+
+function parseScope(scope: unknown): string | null {
+  if (typeof scope !== "string") return null;
+  if (checkLenCp(scope, 1, 256) !== "ok" || hasControl(scope)) return null;
+  return scope;
+}
+
+function parseRunId(runId: unknown): string | null | "invalid" {
+  if (runId === undefined || runId === null) return null;
+  if (typeof runId !== "string") return "invalid";
+  if (checkLenCp(runId, 1, 256) !== "ok" || hasControl(runId)) return "invalid";
+  return runId;
+}
+
+function parseTags(tags: unknown, max: number): string[] | "bad" | "over" {
+  if (tags === undefined) return [];
+  if (!Array.isArray(tags)) return "bad";
+  if (tags.length > max) return "over";
+  const seen = new Set<string>();
+  for (const t of tags) {
+    if (typeof t !== "string") return "bad";
+    const tl = checkLenCp(t, 1, 256);
+    if (tl === "long") return "over";
+    if (tl === "short" || hasControl(t)) return "bad";
+    const nt = normalizeTag(t);
+    if (countCp(nt) < 1 || countCp(nt) > 256) return "bad";
+    seen.add(nt);
+  }
+  return [...seen].sort();
+}
+
+/** Opaque outbound link refs: non-empty, bounded, control-free, case preserved. */
+function parseLinks(links: unknown, max: number): string[] | "bad" | "over" {
+  if (links === undefined) return [];
+  if (!Array.isArray(links)) return "bad";
+  if (links.length > max) return "over";
+  const seen = new Set<string>();
+  for (const l of links) {
+    if (typeof l !== "string") return "bad";
+    const ll = checkLenCp(l, 1, 256);
+    if (ll === "long") return "over";
+    if (ll === "short" || hasControl(l)) return "bad";
+    const nl = normalizeLink(l);
+    if (countCp(nl) < 1 || countCp(nl) > 256) return "bad";
+    seen.add(nl);
+  }
+  return [...seen].sort();
+}
+
+function parseSourceRefs(refs: unknown, max: number): string[] | "bad" | "over" {
+  if (refs === undefined) return [];
+  if (!Array.isArray(refs)) return "bad";
+  if (refs.length > max) return "over";
+  const seen = new Set<string>();
+  for (const r of refs) {
+    if (typeof r !== "string") return "bad";
+    if (countCp(r) < 1 || countCp(r) > 256 || hasControl(r)) return "bad";
+    seen.add(r);
+  }
+  return [...seen].sort();
+}
+
+/* ------------------------------------------------------------------ */
+/* event.append                                                        */
+/* ------------------------------------------------------------------ */
+
+export function eventAppend(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["eventId", "sessionId", "turnId", "body", "provenance", "scope", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { eventId, sessionId, turnId, body, provenance, scope, runId } = params;
+  for (const f of [eventId, sessionId, turnId]) {
+    if (typeof f !== "string" || checkLenCp(f, 1, 128) !== "ok" || hasControl(f as string)) {
+      return budgeted(bad(), config);
+    }
+  }
+  if (typeof body !== "string") return budgeted(bad(), config);
+  if (countCp(body) > config.limits.bodyMaxCp) return budgeted(limitExceeded(), config);
+  const nBody = normalizeBody(body);
+  if (countCp(nBody) < 1) return budgeted(bad(), config);
+  if (countCp(nBody) > config.limits.bodyMaxCp) return budgeted(limitExceeded(), config);
+  const prov = parseProvenance(provenance);
+  if (!prov) return budgeted(bad(), config);
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  const nRunId = parseRunId(runId);
+  if (nRunId === "invalid") return budgeted(bad(), config);
+
+  const reqHash = requestHashFor("event.append", {
+    body: body as string,
+    eventId,
+    observedAt: prov.observedAt,
+    runId: nRunId,
+    scope: nScope,
+    sessionId,
+    source: prov.source,
+    turnId,
+  });
+
+  let saved: StoredOp | null = null;
+  try {
+    saved = readOperation(db, idempotencyKey);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (saved) {
+    if (saved.op !== "event.append") return budgeted(fail("CONFLICT"), config);
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    return replaySaved(saved.responseJson, config);
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+
+  const now = nowOverride ?? nowIso();
+  if (!Number.isFinite(Date.parse(now))) return budgeted(fail("STORE_UNAVAILABLE"), config);
+  const rawBody = body as string;
+  let committed: ResponseEnvelope;
+  try {
+    committed = withTransaction(db, (): ResponseEnvelope => {
+      const probe: ResponseEnvelope = ok({ event: { eventId } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      db.prepare(
+        `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(eventId as string, sessionId as string, turnId as string, rawBody, nBody, prov.source, prov.observedAt, nScope, nRunId, now);
+      const stored = budgeted(probe, config);
+      db.prepare(
+        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
+      ).run(idempotencyKey, "event.append", reqHash, JSON.stringify(stored), now);
+      auditInsert(db, {
+        ts: now,
+        op: "event.append",
+        targetId: eventId as string,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: null,
+        runId: nRunId,
+        recallId: null,
+        reasonCode: null,
+      });
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+    // Derived indexes post-commit, best-effort: failure never rolls back canonical.
+    bestEffortIndexRaw(db, eventId as string, nBody);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (/UNIQUE constraint failed: operations/.test(msg)) {
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
+      if (again && again.op === "event.append" && again.requestHash === reqHash) {
+        return replaySaved(again.responseJson, config);
+      }
+      return budgeted(fail("CONFLICT"), config);
+    }
+    if (/UNIQUE constraint failed: raw_events/.test(msg)) {
+      // Same eventId re-appended under a fresh key: immutable raw, no update.
+      return budgeted(fail("CONFLICT"), config);
+    }
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  return committed;
+}
+
+/* ------------------------------------------------------------------ */
+/* record.remember                                                     */
+/* ------------------------------------------------------------------ */
+
+interface NormalizedRemember {
+  body: string;
+  bodyNorm: string;
+  kind: string;
+  source: string;
+  observedAt: string;
+  scope: string;
+  tags: string[];
+  links: string[];
+  sourceRefs: string[];
+  runId: string | null;
+}
+
+/**
+ * Empty sourceRefs are allowed ONLY for kind=model_inference/summary whose
+ * provenance source carries an explicit derivation marker ("derived",
+ * case-insensitive). Everything else with empty sourceRefs is BAD_REQUEST.
+ */
+function emptyRefsAllowed(kind: string, source: string): boolean {
+  if (kind !== "model_inference" && kind !== "summary") return false;
+  return /derived/i.test(source);
+}
+
+function parseRememberParams(
+  config: AppConfig,
+  params: Record<string, unknown>,
+): { ok: true; value: NormalizedRemember } | { ok: false; res: ResponseEnvelope } {
+  if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
+  const allowed = new Set(["body", "kind", "provenance", "scope", "tags", "links", "sourceRefs", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return { ok: false, res: bad() };
+  }
+  const { body, kind, provenance, scope, tags, links, sourceRefs, runId } = params;
+  if (typeof body !== "string") return { ok: false, res: bad() };
+  if (countCp(body) > config.limits.bodyMaxCp) return { ok: false, res: limitExceeded() };
+  const nBody = normalizeBody(body);
+  if (countCp(nBody) < 1) return { ok: false, res: bad() };
+  if (countCp(nBody) > config.limits.bodyMaxCp) return { ok: false, res: limitExceeded() };
+  if (typeof kind !== "string" || !(RECORD_KINDS as readonly string[]).includes(kind)) {
+    return { ok: false, res: bad() };
+  }
+  const prov = parseProvenance(provenance);
+  if (!prov) return { ok: false, res: bad() };
+  const nScope = parseScope(scope);
+  if (!nScope) return { ok: false, res: bad() };
+  const nTags = parseTags(tags, config.limits.tagsMax);
+  if (nTags === "bad") return { ok: false, res: bad() };
+  if (nTags === "over") return { ok: false, res: limitExceeded() };
+  const nLinks = parseLinks(links, config.limits.linksMax);
+  if (nLinks === "bad") return { ok: false, res: bad() };
+  if (nLinks === "over") return { ok: false, res: limitExceeded() };
+  const nRefs = parseSourceRefs(sourceRefs, config.limits.sourceRefsMax);
+  if (nRefs === "bad") return { ok: false, res: bad() };
+  if (nRefs === "over") return { ok: false, res: limitExceeded() };
+  if (nRefs.length === 0 && !emptyRefsAllowed(kind as string, prov.source)) {
+    return { ok: false, res: bad() };
+  }
+  const nRunId = parseRunId(runId);
+  if (nRunId === "invalid") return { ok: false, res: bad() };
+  return {
+    ok: true,
+    value: {
+      body: body as string,
+      bodyNorm: nBody,
+      kind: kind as string,
+      source: prov.source,
+      observedAt: prov.observedAt,
+      scope: nScope,
+      tags: nTags,
+      links: nLinks,
+      sourceRefs: nRefs,
+      runId: nRunId,
+    },
+  };
+}
+
+/** Verify every sourceRef exists as same-scope raw; returns error envelope or null. */
+function checkSourceRefs(
+  db: DatabaseSync,
+  config: AppConfig,
+  scope: string,
+  refs: string[],
+): ResponseEnvelope | null {
+  for (const r of refs) {
+    let row: { scope: string } | undefined;
+    try {
+      row = db.prepare(`SELECT scope FROM raw_events WHERE eventId = ?`).get(r) as
+        | { scope: string }
+        | undefined;
+    } catch {
+      return budgeted(fail("STORE_UNAVAILABLE"), config);
+    }
+    if (!row) return budgeted(fail("NOT_FOUND"), config);
+    if (row.scope !== scope) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+  }
+  return null;
+}
+
+export function rememberRecord(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride?: string,
+): ResponseEnvelope {
+  const parsed = parseRememberParams(config, params);
+  if (!parsed.ok) return budgeted(parsed.res, config);
+  const n = parsed.value;
+  const reqHash = requestHashFor("record.remember", {
+    body: n.body,
+    kind: n.kind,
+    links: n.links,
+    observedAt: n.observedAt,
+    runId: n.runId,
+    scope: n.scope,
+    source: n.source,
+    sourceRefs: n.sourceRefs,
+    tags: n.tags,
+  });
+
+  let saved: StoredOp | null = null;
+  try {
+    saved = readOperation(db, idempotencyKey);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (saved) {
+    if (saved.op !== "record.remember") return budgeted(fail("CONFLICT"), config);
+    const denied = scopeGate(db, config, n.scope);
+    if (denied) return denied;
+    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    return replaySaved(saved.responseJson, config);
+  }
+  {
+    const denied = scopeGate(db, config, n.scope);
+    if (denied) return denied;
+  }
+  {
+    const refErr = checkSourceRefs(db, config, n.scope, n.sourceRefs);
+    if (refErr) return refErr;
+  }
+
+  const now = nowOverride ?? nowIso();
+  if (!Number.isFinite(Date.parse(now))) return budgeted(fail("STORE_UNAVAILABLE"), config);
+  const id = genId("rec");
+  let committed: ResponseEnvelope;
+  try {
+    committed = withTransaction(db, (): ResponseEnvelope => {
+      // Re-verify refs inside the txn (fail closed on concurrent change).
+      for (const r of n.sourceRefs) {
+        const row = db.prepare(`SELECT scope FROM raw_events WHERE eventId = ?`).get(r) as
+          | { scope: string }
+          | undefined;
+        if (!row) throw new Error("source lost");
+        if (row.scope !== n.scope) throw new Error("source scope");
+      }
+      const probe: ResponseEnvelope = ok({ record: { id } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      db.prepare(
+        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1, ?)`,
+      ).run(id, n.body, n.bodyNorm, bodyHashFor(n.body), n.kind, n.source, n.observedAt, n.scope, now);
+      for (const t of n.tags) {
+        db.prepare(`INSERT INTO record_tags(recordId, tag) VALUES (?, ?)`).run(id, t);
+      }
+      for (const l of n.links) {
+        db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(id, l);
+      }
+      for (const r of n.sourceRefs) {
+        db.prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES (?, ?)`).run(id, r);
+      }
+      db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(id, now);
+      const stored = budgeted(probe, config);
+      db.prepare(
+        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
+      ).run(idempotencyKey, "record.remember", reqHash, JSON.stringify(stored), now);
+      auditInsert(db, {
+        ts: now,
+        op: "record.remember",
+        targetId: id,
+        code: stored.code,
+        scope: n.scope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: null,
+        runId: n.runId,
+        recallId: null,
+        reasonCode: null,
+      });
+      // Canonical txn ends here: projection queue is post-commit only so the
+      // commit never depends on queue/index success.
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+    // Post-commit, best-effort: the new record plus resolved same-scope
+    // outbound targets whose Backlinks section now includes the new record.
+    // Never changes the committed response.
+    postCommitEnqueueProjections(db, n.scope, [id], n.links);
+    // Derived indexes post-commit, best-effort: failure never rolls back canonical.
+    bestEffortIndexNote(db, id, n.bodyNorm);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "source lost") return budgeted(fail("NOT_FOUND"), config);
+    if (msg === "source scope") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (/UNIQUE constraint failed: operations/.test(msg)) {
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
+      if (again && again.op === "record.remember" && again.requestHash === reqHash) {
+        return replaySaved(again.responseJson, config);
+      }
+      return budgeted(fail("CONFLICT"), config);
+    }
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  return committed;
+}
+
+/* ------------------------------------------------------------------ */
+/* record.get / record.list                                            */
+/* ------------------------------------------------------------------ */
+
+export interface RecordView {
+  id: string;
+  body: string;
+  bodyHash: string;
+  kind: string;
+  source: string;
+  observedAt: string;
+  scope: string;
+  status: string;
+  supersedes: string | null;
+  revision: number;
+  createdAt: string;
+  tags: string[];
+  links: string[];
+  sourceRefs: string[];
+}
+
+function readRecordView(db: DatabaseSync, id: string): RecordView | null {
+  const row = db
+    .prepare(
+      `SELECT id, body, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt
+       FROM records WHERE id = ?`,
+    )
+    .get(id) as
+    | {
+        id: string;
+        body: string;
+        bodyHash: string;
+        kind: string;
+        source: string;
+        observedAt: string;
+        scope: string;
+        status: string;
+        supersedes: string | null;
+        revision: number;
+        createdAt: string;
+      }
+    | undefined;
+  if (!row) return null;
+  const tags = (
+    db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
+  ).map((r) => r.tag);
+  const links = (
+    db.prepare(`SELECT toRef FROM record_links WHERE fromId = ? ORDER BY toRef ASC`).all(id) as Array<{ toRef: string }>
+  ).map((r) => r.toRef);
+  const sourceRefs = (
+    db.prepare(`SELECT eventId FROM record_source_refs WHERE recordId = ? ORDER BY eventId ASC`).all(id) as Array<{ eventId: string }>
+  ).map((r) => r.eventId);
+  return { ...row, tags, links, sourceRefs };
+}
+
+export function getRecord(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const keys = Object.keys(params);
+  for (const k of keys) {
+    if (k !== "id" && k !== "scope") return budgeted(bad(), config);
+  }
+  const { id, scope } = params;
+  if (typeof id !== "string" || id.length === 0 || id.length > 256) return budgeted(bad(), config);
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      let view: RecordView | null;
+      try {
+        view = readRecordView(db, id as string);
+      } catch {
+        throw new Error("read failed");
+      }
+      if (!view) throw new Error("missing");
+      if (view.scope !== nScope) throw new Error("scope mismatch");
+      const stored = budgeted(ok({ record: view }), config);
+      if (!stored.ok) throw new Error("response over budget");
+      auditInsert(db, {
+        ts: now,
+        op: "record.get",
+        targetId: id as string,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: null,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      // Reads stay available over configured cap; audit still commits.
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "missing") return budgeted(fail("NOT_FOUND"), config);
+    if (msg === "scope mismatch") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+export function listRecords(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["scope", "limit", "since", "until", "status"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { scope, limit, since, until, status } = params;
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  let nLimit = config.limits.limitDefault;
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
+    if (limit < 1) return budgeted(bad(), config);
+    if (limit > config.limits.limitMax) return budgeted(limitExceeded(), config);
+    nLimit = limit;
+  }
+  let nSince: string | null = null;
+  if (since !== undefined && since !== null) {
+    const c = canonicalTime(since);
+    if (c === null) return budgeted(bad(), config);
+    nSince = c;
+  }
+  let nUntil: string | null = null;
+  if (until !== undefined && until !== null) {
+    const c = canonicalTime(until);
+    if (c === null) return budgeted(bad(), config);
+    nUntil = c;
+  }
+  let nStatus = "active";
+  if (status !== undefined && status !== null) {
+    if (status !== "active" && status !== "superseded" && status !== "archived") {
+      return budgeted(bad(), config);
+    }
+    nStatus = status as string;
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      let rows: Array<{ id: string; kind: string; status: string; body: string; createdAt: string }>;
+      try {
+        let sql = `SELECT id, kind, status, body, createdAt FROM records WHERE scope = ? AND status = ?`;
+        const args: Array<string | number> = [nScope, nStatus];
+        if (nSince !== null) {
+          sql += ` AND createdAt >= ?`;
+          args.push(nSince);
+        }
+        if (nUntil !== null) {
+          sql += ` AND createdAt < ?`;
+          args.push(nUntil);
+        }
+        sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
+        args.push(nLimit);
+        rows = db.prepare(sql).all(...args) as Array<{ id: string; kind: string; status: string; body: string; createdAt: string }>;
+      } catch {
+        throw new Error("read failed");
+      }
+      const items = rows.map((r) => {
+        const cps = [...r.body];
+        const max = config.limits.snippetMaxCp;
+        return {
+          id: r.id,
+          kind: r.kind,
+          status: r.status,
+          snippet: cps.length <= max ? r.body : cps.slice(0, max).join(""),
+          truncated: cps.length > max,
+          createdAt: r.createdAt,
+        };
+      });
+      const stored = budgeted(ok({ items }), config);
+      if (!stored.ok) throw new Error("response over budget");
+      auditInsert(db, {
+        ts: now,
+        op: "record.list",
+        targetId: null,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: nLimit,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      // Reads stay available over configured cap; audit still commits.
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* record.recall (bounded hybrid: lexical + raw descent + graph)        */
+/* ------------------------------------------------------------------ */
+
+interface ParsedRecall {
+  query: string;
+  tags: string[];
+  link: string | null;
+  since: string | null;
+  until: string | null;
+  limit: number;
+  scope: string;
+  runId: string | null;
+}
+
+function parseRecallParams(
+  config: AppConfig,
+  params: Record<string, unknown>,
+): { ok: true; value: ParsedRecall } | { ok: false; res: ResponseEnvelope } {
+  if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
+  const allowed = new Set(["query", "tags", "link", "since", "until", "limit", "scope", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return { ok: false, res: bad() };
+  }
+  const { query, tags, link, since, until, limit, scope, runId } = params;
+  if (typeof query !== "string") return { ok: false, res: bad() };
+  if (countCp(query) > config.limits.queryMaxCp) return { ok: false, res: limitExceeded() };
+  const nq = normalizeBody(query);
+  if (countCp(nq) < 1) return { ok: false, res: bad() };
+  if (countCp(nq) > config.limits.queryMaxCp) return { ok: false, res: limitExceeded() };
+  const nTags = parseTags(tags, config.limits.tagsMax);
+  if (nTags === "bad") return { ok: false, res: bad() };
+  if (nTags === "over") return { ok: false, res: limitExceeded() };
+  let nLink: string | null = null;
+  if (link !== undefined && link !== null) {
+    if (typeof link !== "string") return { ok: false, res: bad() };
+    const ll = checkLenCp(link, 1, 256);
+    if (ll === "long") return { ok: false, res: limitExceeded() };
+    if (ll === "short" || hasControl(link)) return { ok: false, res: bad() };
+    const nl = normalizeField(link, false);
+    if (countCp(nl) < 1 || countCp(nl) > 256) return { ok: false, res: bad() };
+    nLink = nl;
+  }
+  let nSince: string | null = null;
+  if (since !== undefined && since !== null) {
+    const c = canonicalTime(since);
+    if (c === null) return { ok: false, res: bad() };
+    nSince = c;
+  }
+  let nUntil: string | null = null;
+  if (until !== undefined && until !== null) {
+    const c = canonicalTime(until);
+    if (c === null) return { ok: false, res: bad() };
+    nUntil = c;
+  }
+  let nLimit = config.limits.limitDefault;
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return { ok: false, res: bad() };
+    if (limit < 1) return { ok: false, res: bad() };
+    if (limit > config.limits.limitMax) return { ok: false, res: limitExceeded() };
+    nLimit = limit;
+  }
+  const nScope = parseScope(scope);
+  if (!nScope) return { ok: false, res: bad() };
+  const nRunId = parseRunId(runId);
+  if (nRunId === "invalid") return { ok: false, res: bad() };
+  return { ok: true, value: { query: nq, tags: nTags, link: nLink, since: nSince, until: nUntil, limit: nLimit, scope: nScope, runId: nRunId } };
+}
+
+function snippetFor(body: string, maxCp: number): { snippet: string; truncated: boolean } {
+  const cps = [...body];
+  if (cps.length <= maxCp) return { snippet: body, truncated: false };
+  return { snippet: cps.slice(0, maxCp).join(""), truncated: true };
+}
+
+/** Records matching ALL given tags (active, same scope, ordered deterministically). */
+function tagSeedIds(
+  db: DatabaseSync,
+  scope: string,
+  tags: string[],
+  since: string | null,
+  until: string | null,
+): string[] {
+  if (tags.length === 0) return [];
+  let sql = `SELECT records.id AS id FROM records WHERE scope = ? AND status = 'active'`;
+  const args: Array<string | number> = [scope];
+  if (since !== null) {
+    sql += ` AND createdAt >= ?`;
+    args.push(since);
+  }
+  if (until !== null) {
+    sql += ` AND createdAt < ?`;
+    args.push(until);
+  }
+  for (const t of tags) {
+    sql += ` AND EXISTS (SELECT 1 FROM record_tags WHERE recordId = records.id AND tag = ?)`;
+    args.push(t);
+  }
+  sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
+  args.push(FUSION_CANDIDATE_MAX);
+  try {
+    return (db.prepare(sql).all(...args) as Array<{ id: string }>).map((r) => r.id);
+  } catch {
+    return [];
+  }
+}
+
+/** Bounded depth-2 expansion over resolved active same-scope refs + backlinks. */
+function expandGraph(
+  db: DatabaseSync,
+  scope: string,
+  frontier0: string[],
+): Map<string, number> {
+  const dist = new Map<string, number>();
+  for (const id of frontier0) {
+    if (!dist.has(id)) dist.set(id, 0);
+  }
+  let frontier = [...frontier0];
+  for (let d = 0; d < GRAPH_DEPTH_MAX && frontier.length > 0; d++) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      if (dist.size >= GRAPH_EXPAND_MAX) break;
+      let outs: Array<{ toRef: string }>;
+      let backs: Array<{ fromId: string }>;
+      try {
+        outs = db.prepare(`SELECT toRef FROM record_links WHERE fromId = ?`).all(id) as Array<{ toRef: string }>;
+        backs = db
+          .prepare(
+            `SELECT l.fromId AS fromId FROM record_links l
+             JOIN records r ON r.id = l.fromId
+             WHERE l.toRef = ? AND r.scope = ? AND r.status = 'active'`,
+          )
+          .all(id, scope) as Array<{ fromId: string }>;
+      } catch {
+        continue;
+      }
+      const neighbors = [...outs.map((o) => o.toRef), ...backs.map((b) => b.fromId)];
+      for (const nb of neighbors) {
+        if (dist.has(nb) || dist.size >= GRAPH_EXPAND_MAX) continue;
+        // Resolve: only active same-scope records are followed (dangling skipped).
+        let okRow: { id: string } | undefined;
+        try {
+          okRow = db
+            .prepare(`SELECT id FROM records WHERE id = ? AND scope = ? AND status = 'active'`)
+            .get(nb, scope) as { id: string } | undefined;
+        } catch {
+          continue;
+        }
+        if (!okRow) continue;
+        dist.set(nb, d + 1);
+        next.push(nb);
+      }
+    }
+    // Deterministic order within a distance level.
+    next.sort();
+    frontier = next;
+  }
+  return dist;
+}
+
 export function recallRecords(
   db: DatabaseSync,
   config: AppConfig,
@@ -1659,123 +1583,644 @@ export function recallRecords(
     const denied = scopeGate(db, config, p.scope);
     if (denied) return denied;
   }
-
   const now = nowOverride ?? nowIso();
   const recallId = genId("recall");
 
   try {
-    const response = withTransaction(db, (): ResponseEnvelope => {
-      if (isDbOverCap(db, config)) throw new Error("db over cap");
-      // Bounded SQL retrieval (T3 fix): every predicate is parameterized,
-      // the literal substring uses instr(body, ?)>0 (no LIKE/wildcards), tag
-      // ALL uses one EXISTS per tag, the optional link uses one EXISTS, and
-      // SQL LIMIT enforces the bound (<= limitMax <= 100, recall <= 25 here).
-      // Host variables are therefore O(tags)+O(1) (<= ~20), never O(matches),
-      // so a 32k+ match window cannot hit the SQLite variable cap. Tags for
-      // the response are fetched only for the <= limit selected ids, so the
-      // second IN list is bounded by LIMIT too.
-      // Honest note: this bounds variables + materialization, but the instr
-      // scan may still examine every row in the scope/time window; it is not
-      // hard constant latency.
-      // Canonical millis strings sort lexicographically, so >= / < match
-      // since-inclusive / until-exclusive numerically.
-      let sql = `SELECT id, body, createdAt FROM records WHERE scope = ? AND status = 'active'`;
-      const args: Array<string | number> = [p.scope];
-      if (p.since !== null) {
-        sql += ` AND createdAt >= ?`;
-        args.push(p.since);
-      }
-      if (p.until !== null) {
-        sql += ` AND createdAt < ?`;
-        args.push(p.until);
-      }
-      sql += ` AND instr(body, ?) > 0`;
-      args.push(p.query);
-      for (const t of p.tags) {
-        sql += ` AND EXISTS (SELECT 1 FROM record_tags WHERE recordId = records.id AND tag = ?)`;
-        args.push(t);
-      }
-      if (p.link !== null) {
-        sql += ` AND EXISTS (SELECT 1 FROM record_links WHERE fromId = records.id AND toName = ?)`;
-        args.push(p.link);
-      }
-      sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
-      args.push(p.limit);
-      let rows: RecallCandidate[];
-      try {
-        rows = db.prepare(sql).all(...args) as unknown as RecallCandidate[];
-      } catch {
-        throw new Error("recall select failed");
-      }
+    return withTransaction(db, (): ResponseEnvelope => {
+      // Reads/recall stay available over configured cap; audit + exposures
+      // still commit. Real SQLite failures still throw -> STORE_UNAVAILABLE.
 
-      // Tags for the bounded selected ids only (<= limit placeholders).
-      const tagMap = new Map<string, Set<string>>();
-      if (rows.length > 0) {
+      // 1) Lexical candidates: FTS5/BM25 + char-bigram overlap.
+      const ftsHits = ftsNoteHits(db, p.scope, p.query, p.since, p.until, FUSION_CANDIDATE_MAX);
+      const biHits = bigramNoteHits(db, p.scope, p.query, p.since, p.until, FUSION_CANDIDATE_MAX);
+      // 2) Raw descent: raw lexical hits mapped to records via source refs.
+      const rawHits = rawDescentHits(db, p.scope, p.query, p.since, p.until);
+      const rawSet = new Set(rawHits.map((r) => r.id));
+      // 2b) Bounded canonical fallback over bodyNorm: committed memory stays
+      // findable when derived FTS/bigram indexes are absent or stale.
+      const canonHits = canonicalBodyNormHits(db, p.scope, p.query, p.since, p.until, FUSION_CANDIDATE_MAX);
+      const canonSet = new Set(canonHits.map((r) => r.id));
+      // 3) Exact tag/link seeds.
+      const seedIds = new Set<string>(tagSeedIds(db, p.scope, p.tags, p.since, p.until));
+      if (p.link !== null) {
         try {
-          const ids = rows.map((r) => r.id);
-          const placeholders = ids.map(() => "?").join(",");
-          const trows = db
-            .prepare(`SELECT recordId, tag FROM record_tags WHERE recordId IN (${placeholders})`)
-            .all(...(ids as [])) as Array<{ recordId: string; tag: string }>;
-          for (const t of trows) {
-            let s = tagMap.get(t.recordId);
-            if (!s) {
-              s = new Set<string>();
-              tagMap.set(t.recordId, s);
+          const target = db
+            .prepare(`SELECT id, createdAt FROM records WHERE id = ? AND scope = ? AND status = 'active'`)
+            .get(p.link, p.scope) as { id: string; createdAt: string } | undefined;
+          if (target) {
+            if (p.since !== null && target.createdAt < p.since) {
+              /* window excludes the seed */
+            } else if (p.until !== null && target.createdAt >= p.until) {
+              /* window excludes the seed */
+            } else {
+              seedIds.add(target.id);
             }
-            s.add(t.tag);
           }
         } catch {
-          throw new Error("tag read failed");
+          /* seed lookup failure: continue with other signals */
         }
       }
 
-      const top = rows;
-      const items = top.map((r) => {
-        const { snippet, truncated } = snippetFor(r.body, config.limits.snippetMaxCp);
-        const tags = [...(tagMap.get(r.id) ?? new Set<string>())].sort();
-        return { id: r.id, snippet, truncated, tags, createdAt: r.createdAt };
+      // Score accumulation (fixed weights; deterministic).
+      const lexRank = new Map<string, number>();
+      ftsHits.forEach((h, i) => {
+        if (!lexRank.has(h.id)) lexRank.set(h.id, i);
       });
+      const biRank = new Map<string, number>();
+      biHits.forEach((h, i) => {
+        if (!biRank.has(h.id)) biRank.set(h.id, i);
+      });
+      const pool = new Set<string>([...lexRank.keys(), ...biRank.keys(), ...rawSet, ...canonSet, ...seedIds]);
+      // Pool cap: keep top 60 by lexical pre-order (lex rank, then id).
+      let poolIds = [...pool];
+      if (poolIds.length > FUSION_CANDIDATE_MAX) {
+        const preScore = (id: string): number => {
+          const lr = lexRank.has(id) ? 1 / (1 + (lexRank.get(id) as number)) : 0;
+          const br = biRank.has(id) ? 0.5 / (1 + (biRank.get(id) as number)) : 0;
+          return lr + br + (seedIds.has(id) ? 0.25 : 0);
+        };
+        poolIds.sort((a, b) => preScore(b) - preScore(a) || (a < b ? -1 : a > b ? 1 : 0));
+        poolIds = poolIds.slice(0, FUSION_CANDIDATE_MAX);
+      }
+      // 4) Bounded graph expansion from seeds + top lexical ids.
+      const frontier0 = [...new Set<string>([...seedIds, ...poolIds.slice(0, 10)])].slice(0, 20);
+      const graphDist = expandGraph(db, p.scope, frontier0);
 
-      // Full-response budget BEFORE any audit/exposure write: no partial
-      // shaving, no orphan exposure rows on overflow.
+      // Heat lookup for the bounded pool only.
+      const heat = new Map<string, number>();
+      if (poolIds.length > 0 || graphDist.size > 0) {
+        const allIds = [...new Set<string>([...poolIds, ...graphDist.keys()])];
+        try {
+          const placeholders = allIds.map(() => "?").join(",");
+          const rows = db
+            .prepare(`SELECT recordId, usedCount FROM note_heat WHERE recordId IN (${placeholders})`)
+            .all(...allIds) as Array<{ recordId: string; usedCount: number }>;
+          for (const r of rows) heat.set(r.recordId, r.usedCount);
+        } catch {
+          /* heat unavailable: score without it */
+        }
+      }
+
+      const score = (id: string): number => {
+        let s = 0;
+        if (lexRank.has(id)) s += 3 / (1 + (lexRank.get(id) as number));
+        if (biRank.has(id)) s += 1.5 / (1 + (biRank.get(id) as number));
+        if (rawSet.has(id)) s += 2;
+        if (canonSet.has(id)) s += 1;
+        if (seedIds.has(id)) s += 1;
+        const d = graphDist.get(id);
+        if (d !== undefined && d > 0) s += (GRAPH_DEPTH_MAX + 1 - d) * 0.5;
+        s += Math.min(heat.get(id) ?? 0, 20) * 0.02;
+        return s;
+      };
+
+      // Candidate metadata for final ordering (createdAt for tie-break).
+      const meta = new Map<string, { createdAt: string }>();
+      const orderIds = [...new Set<string>([...poolIds, ...graphDist.keys()])];
+      if (orderIds.length > 0) {
+        try {
+          const placeholders = orderIds.map(() => "?").join(",");
+          const rows = db
+            .prepare(`SELECT id, createdAt FROM records WHERE id IN (${placeholders})`)
+            .all(...orderIds) as Array<{ id: string; createdAt: string }>;
+          for (const r of rows) meta.set(r.id, { createdAt: r.createdAt });
+        } catch {
+          throw new Error("read failed");
+        }
+      }
+      const ranked = orderIds
+        .filter((id) => meta.has(id))
+        .sort((a, b) => {
+          const sa = score(a);
+          const sb = score(b);
+          if (sa !== sb) return sb - sa;
+          const ca = (meta.get(a) as { createdAt: string }).createdAt;
+          const cb = (meta.get(b) as { createdAt: string }).createdAt;
+          if (ca !== cb) return ca < cb ? 1 : -1; // createdAt DESC
+          return a < b ? -1 : a > b ? 1 : 0; // id ASC
+        })
+        .slice(0, p.limit);
+
+      // Bounded projection: snippets only, never raw bodies.
+      let items: Array<{ id: string; snippet: string; truncated: boolean; tags: string[]; createdAt: string }>;
+      try {
+        items = ranked.map((id) => {
+          const row = db
+            .prepare(`SELECT body, createdAt FROM records WHERE id = ?`)
+            .get(id) as { body: string; createdAt: string };
+          const { snippet, truncated } = snippetFor(row.body, config.limits.snippetMaxCp);
+          const tags = (
+            db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
+          ).map((r) => r.tag);
+          return { id, snippet, truncated, tags, createdAt: row.createdAt };
+        });
+      } catch {
+        throw new Error("read failed");
+      }
+
       const probe: ResponseEnvelope = ok({ recallId, items });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       const stored = budgeted(probe, config);
       if (!stored.ok) throw new Error("response over budget");
       const responseBytes = Buffer.byteLength(JSON.stringify(stored), "utf8");
 
-      // Metadata-only audit + per-item exposures (no query/body/snippet text).
-      db.prepare(
-        `INSERT INTO audit(ts, op, targetId, code, scope, bytes, limitN, runId, recallId, approver, approvedAt, token, reasonCode)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)`,
-      ).run(now, "record.recall", recallId, stored.code, p.scope, responseBytes, p.limit, p.runId, recallId);
+      // Fail-closed ledger: audit + exposures commit with the response.
+      auditInsert(db, {
+        ts: now,
+        op: "record.recall",
+        targetId: recallId,
+        code: stored.code,
+        scope: p.scope,
+        bytes: responseBytes,
+        limitN: p.limit,
+        runId: p.runId,
+        recallId,
+        reasonCode: null,
+      });
       const exp = db.prepare(
         `INSERT INTO exposures(ts, recallId, runId, scope, recordId, snippetBytes, truncated, limitN)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const it of items) {
-        exp.run(
-          now,
-          recallId,
-          p.runId,
-          p.scope,
-          it.id,
-          Buffer.byteLength(it.snippet, "utf8"),
-          it.truncated ? 1 : 0,
-          p.limit,
-        );
+        exp.run(now, recallId, p.runId, p.scope, it.id, Buffer.byteLength(it.snippet, "utf8"), it.truncated ? 1 : 0, p.limit);
       }
-      // Pre-commit cap: audit/exposure growth that crosses dbMaxBytes rolls
-      // back the whole recall (no partial ledger rows survive).
-      assertDbUnderCap(db, config);
+      // Bounded exposures ledger (prune oldest beyond cap).
+      try {
+        db.prepare(
+          `DELETE FROM exposures WHERE rowid NOT IN (SELECT rowid FROM exposures ORDER BY ts DESC, rowid DESC LIMIT ?)`,
+        ).run(EXPOSURES_CAP);
+      } catch {
+        /* prune failure must not fail the recall */
+      }
+      // Recall metadata (audit + exposures) may exceed configured cap;
+      // only real SQLite failures fail closed via the catch below.
       return stored;
     });
-    return response;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* record.feedback (cited-only heat)                                   */
+/* ------------------------------------------------------------------ */
+
+export function feedbackRecords(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["recallId", "recordIds", "scope", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { recallId, recordIds, scope, runId } = params;
+  if (typeof recallId !== "string" || recallId.length === 0 || recallId.length > 256) {
+    return budgeted(bad(), config);
+  }
+  if (!Array.isArray(recordIds) || recordIds.length === 0) return budgeted(bad(), config);
+  if (recordIds.length > config.limits.limitMax) return budgeted(limitExceeded(), config);
+  const seen = new Set<string>();
+  for (const r of recordIds) {
+    if (typeof r !== "string" || r.length === 0 || r.length > 256 || hasControl(r)) {
+      return budgeted(bad(), config);
+    }
+    seen.add(r);
+  }
+  const ids = [...seen].sort();
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  const nRunId = parseRunId(runId);
+  if (nRunId === "invalid") return budgeted(bad(), config);
+
+  const reqHash = requestHashFor("record.feedback", {
+    recallId,
+    recordIds: ids,
+    runId: nRunId,
+    scope: nScope,
+  });
+
+  let saved: StoredOp | null = null;
+  try {
+    saved = readOperation(db, idempotencyKey);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (saved) {
+    if (saved.op !== "record.feedback") return budgeted(fail("CONFLICT"), config);
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    return replaySaved(saved.responseJson, config);
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+
+  const now = nowOverride ?? nowIso();
+  if (!Number.isFinite(Date.parse(now))) return budgeted(fail("STORE_UNAVAILABLE"), config);
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      // Exposure verification: the recall must exist in this scope, and every
+      // reported id must be a member of its exposure set. Any deviation
+      // rejects the WHOLE report with no usage/heat change.
+      let exposed: Array<{ recordId: string; scope: string | null }>;
+      try {
+        exposed = db
+          .prepare(`SELECT recordId, scope FROM exposures WHERE recallId = ?`)
+          .all(recallId) as Array<{ recordId: string; scope: string | null }>;
+      } catch {
+        throw new Error("read failed");
+      }
+      if (exposed.length === 0) throw new Error("unknown recall");
+      if (exposed.some((e) => e.scope !== nScope)) throw new Error("recall scope");
+      const exposedSet = new Set(exposed.map((e) => e.recordId));
+      for (const id of ids) {
+        if (!exposedSet.has(id)) throw new Error("outside exposure");
+      }
+      // Same-scope guard on the reported records themselves.
+      for (const id of ids) {
+        let row: { scope: string } | undefined;
+        try {
+          row = db.prepare(`SELECT scope FROM records WHERE id = ?`).get(id) as
+            | { scope: string }
+            | undefined;
+        } catch {
+          throw new Error("read failed");
+        }
+        if (!row) throw new Error("outside exposure");
+        if (row.scope !== nScope) throw new Error("record scope");
+      }
+      const probe: ResponseEnvelope = ok({ feedback: { recallId, counted: ids.length } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      const use = db.prepare(
+        `INSERT OR IGNORE INTO usage(ts, recallId, recordId, scope, runId) VALUES (?, ?, ?, ?, ?)`,
+      );
+      for (const id of ids) {
+        const inserted = use.run(now, recallId, id, nScope, nRunId);
+        // Heat only on the first usage of a (recallId, recordId) exposure:
+        // a repeat under another idempotency key reuses the ledger row and
+        // must not double-heat the same recall exposure.
+        if (changedRows(inserted) === 1) {
+          db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(id, now);
+          db.prepare(`UPDATE note_heat SET usedCount = usedCount + 1, lastUsedAt = ? WHERE recordId = ?`).run(now, id);
+        }
+      }
+      const stored = budgeted(probe, config);
+      db.prepare(
+        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
+      ).run(idempotencyKey, "record.feedback", reqHash, JSON.stringify(stored), now);
+      auditInsert(db, {
+        ts: now,
+        op: "record.feedback",
+        targetId: recallId,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: ids.length,
+        runId: nRunId,
+        recallId,
+        reasonCode: null,
+      });
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "recall scope" || msg === "record scope") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "unknown recall" || msg === "outside exposure") return budgeted(fail("NOT_FOUND"), config);
+    if (/UNIQUE constraint failed: operations/.test(msg)) {
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
+      if (again && again.op === "record.feedback" && again.requestHash === reqHash) {
+        return replaySaved(again.responseJson, config);
+      }
+      return budgeted(fail("CONFLICT"), config);
+    }
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* record.correct (atomic revision + supersede)                        */
+/* ------------------------------------------------------------------ */
+
+export function correctRecord(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { recordId, body, kind, provenance, scope, links, sourceRefs, runId } = params;
+  if (typeof recordId !== "string" || recordId.length === 0 || recordId.length > 256 || hasControl(recordId)) {
+    return budgeted(bad(), config);
+  }
+  if (kind !== "correction") return budgeted(bad(), config);
+  if (typeof body !== "string") return budgeted(bad(), config);
+  if (countCp(body) > config.limits.bodyMaxCp) return budgeted(limitExceeded(), config);
+  const nBody = normalizeBody(body);
+  if (countCp(nBody) < 1) return budgeted(bad(), config);
+  if (countCp(nBody) > config.limits.bodyMaxCp) return budgeted(limitExceeded(), config);
+  const prov = parseProvenance(provenance);
+  if (!prov) return budgeted(bad(), config);
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  const nLinks = parseLinks(links, config.limits.linksMax);
+  if (nLinks === "bad") return budgeted(bad(), config);
+  if (nLinks === "over") return budgeted(limitExceeded(), config);
+  const nRefs = parseSourceRefs(sourceRefs, config.limits.sourceRefsMax);
+  if (nRefs === "bad") return budgeted(bad(), config);
+  if (nRefs === "over") return budgeted(limitExceeded(), config);
+  const nRunId = parseRunId(runId);
+  if (nRunId === "invalid") return budgeted(bad(), config);
+
+  const reqHash = requestHashFor("record.correct", {
+    body: body as string,
+    kind: "correction",
+    links: nLinks,
+    observedAt: prov.observedAt,
+    recordId,
+    runId: nRunId,
+    scope: nScope,
+    source: prov.source,
+    sourceRefs: nRefs,
+  });
+
+  let saved: StoredOp | null = null;
+  try {
+    saved = readOperation(db, idempotencyKey);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (saved) {
+    if (saved.op !== "record.correct") return budgeted(fail("CONFLICT"), config);
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    return replaySaved(saved.responseJson, config);
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+
+  const now = nowOverride ?? nowIso();
+  if (!Number.isFinite(Date.parse(now))) return budgeted(fail("STORE_UNAVAILABLE"), config);
+  const newId = genId("rec");
+  const rawBody = body as string;
+  let committed: ResponseEnvelope;
+  try {
+    committed = withTransaction(db, (): ResponseEnvelope => {
+      let target: { scope: string; status: string; revision: number } | undefined;
+      try {
+        target = db
+          .prepare(`SELECT scope, status, revision FROM records WHERE id = ?`)
+          .get(recordId) as { scope: string; status: string; revision: number } | undefined;
+      } catch {
+        throw new Error("read failed");
+      }
+      if (!target) throw new Error("missing");
+      if (target.scope !== nScope) throw new Error("scope mismatch");
+      if (target.status !== "active") throw new Error("not active");
+      for (const r of nRefs) {
+        const row = db.prepare(`SELECT scope FROM raw_events WHERE eventId = ?`).get(r) as
+          | { scope: string }
+          | undefined;
+        if (!row) throw new Error("source lost");
+        if (row.scope !== nScope) throw new Error("source scope");
+      }
+      const probe: ResponseEnvelope = ok({ record: { id: newId, supersedes: recordId } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      // Conditional flip is the arbiter: exactly one concurrent correction wins.
+      let moved: unknown;
+      try {
+        moved = db
+          .prepare(`UPDATE records SET status='superseded' WHERE id=? AND status='active' AND scope=?`)
+          .run(recordId, nScope);
+      } catch {
+        throw new Error("db over cap");
+      }
+      if (changedRows(moved) !== 1) throw new Error("not active");
+      db.prepare(
+        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
+         VALUES (?, ?, ?, ?, 'correction', ?, ?, ?, 'active', ?, ?, ?)`,
+      ).run(newId, rawBody, nBody, bodyHashFor(rawBody), prov.source, prov.observedAt, nScope, recordId, target.revision + 1, now);
+      for (const l of nLinks) {
+        db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(newId, l);
+      }
+      for (const r of nRefs) {
+        db.prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES (?, ?)`).run(newId, r);
+      }
+      db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(newId, now);
+      const stored = budgeted(probe, config);
+      db.prepare(
+        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
+      ).run(idempotencyKey, "record.correct", reqHash, JSON.stringify(stored), now);
+      auditInsert(db, {
+        ts: now,
+        op: "record.correct",
+        targetId: newId,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: null,
+        runId: nRunId,
+        recallId: null,
+        reasonCode: null,
+      });
+      // Canonical txn ends here: projection queue is post-commit only so the
+      // commit never depends on queue/index success.
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+    // Post-commit, best-effort: the new + superseded records plus resolved
+    // same-scope old/new outbound targets whose Backlinks may have changed
+    // (old targets lose the superseded linker, new targets gain the new one).
+    // Never changes the committed response.
+    postCommitEnqueueProjections(
+      db,
+      nScope,
+      [newId, recordId as string],
+      [...outboundRefsOf(db, recordId as string), ...nLinks],
+    );
+    // Derived indexes post-commit, best-effort: failure never rolls back canonical.
+    bestEffortIndexNote(db, newId, nBody);
+    return committed;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "missing" || msg === "source lost") {
+      // Distinguish missing target (NOT_FOUND) from missing source ref.
+      if (msg === "source lost") return budgeted(fail("NOT_FOUND"), config);
+      return budgeted(fail("NOT_FOUND"), config);
+    }
+    if (msg === "scope mismatch" || msg === "source scope") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "not active") return budgeted(fail("CONFLICT"), config);
+    if (/UNIQUE constraint failed: operations/.test(msg)) {
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
+      if (again && again.op === "record.correct" && again.requestHash === reqHash) {
+        return replaySaved(again.responseJson, config);
+      }
+      return budgeted(fail("CONFLICT"), config);
+    }
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* record.archive (terminal exclusion, row kept)                       */
+/* ------------------------------------------------------------------ */
+
+export function archiveRecord(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["id", "scope", "reasonCode"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { id, scope, reasonCode } = params;
+  if (typeof id !== "string" || id.length === 0 || id.length > 256) return budgeted(bad(), config);
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  if (typeof reasonCode !== "string" || !(ARCHIVE_REASONS as readonly string[]).includes(reasonCode)) {
+    return budgeted(bad(), config);
+  }
+
+  const reqHash = sha256HexUtf8(
+    canonicalStringify({ op: "record.archive", id, scope: nScope, reasonCode }),
+  );
+
+  let saved: StoredOp | null = null;
+  try {
+    saved = readOperation(db, idempotencyKey);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (saved) {
+    if (saved.op !== "record.archive") return budgeted(fail("CONFLICT"), config);
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    return replaySaved(saved.responseJson, config);
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+
+  const now = nowOverride ?? nowIso();
+  if (!Number.isFinite(Date.parse(now))) return budgeted(fail("STORE_UNAVAILABLE"), config);
+  let committed: ResponseEnvelope;
+  try {
+    committed = withTransaction(db, (): ResponseEnvelope => {
+      let target: { scope: string; status: string } | undefined;
+      try {
+        target = db.prepare(`SELECT scope, status FROM records WHERE id = ?`).get(id) as
+          | { scope: string; status: string }
+          | undefined;
+      } catch {
+        throw new Error("read failed");
+      }
+      if (!target) throw new Error("missing");
+      if (target.scope !== nScope) throw new Error("scope mismatch");
+      if (target.status !== "active") throw new Error("not active");
+      const probe: ResponseEnvelope = ok({ record: { id, status: "archived" } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      let moved: unknown;
+      try {
+        moved = db
+          .prepare(`UPDATE records SET status='archived' WHERE id=? AND status='active' AND scope=?`)
+          .run(id, nScope);
+      } catch {
+        throw new Error("db over cap");
+      }
+      if (changedRows(moved) !== 1) throw new Error("not active");
+      const stored = budgeted(probe, config);
+      db.prepare(
+        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
+      ).run(idempotencyKey, "record.archive", reqHash, JSON.stringify(stored), now);
+      auditInsert(db, {
+        ts: now,
+        op: "record.archive",
+        targetId: id as string,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: null,
+        runId: null,
+        recallId: null,
+        reasonCode: reasonCode as string,
+      });
+      // Canonical txn ends here: projection queue is post-commit only so the
+      // commit never depends on queue/index success.
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+    // Post-commit, best-effort: the archived record plus resolved same-scope
+    // outbound targets whose Backlinks lose the archived linker. Never changes
+    // the committed response.
+    postCommitEnqueueProjections(
+      db,
+      nScope,
+      [id as string],
+      outboundRefsOf(db, id as string),
+    );
+    return committed;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "missing") return budgeted(fail("NOT_FOUND"), config);
+    if (msg === "scope mismatch") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "not active") return budgeted(fail("CONFLICT"), config);
+    if (/UNIQUE constraint failed: operations/.test(msg)) {
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
+      if (again && again.op === "record.archive" && again.requestHash === reqHash) {
+        return replaySaved(again.responseJson, config);
+      }
+      return budgeted(fail("CONFLICT"), config);
+    }
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* Re-exported for tests/smoke: id format check. */
+export function qAll<T>(db: DatabaseSync, sql: string, args: Array<string | number>): T[] {
+  return db.prepare(sql).all(...(args as [])) as T[];
 }

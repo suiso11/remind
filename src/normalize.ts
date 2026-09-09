@@ -87,42 +87,6 @@ export function requestHashFor(op: string, normalizedParams: unknown): string {
   return sha256HexUtf8(canonicalStringify({ op, params: normalizedParams }));
 }
 
-/**
- * Approval token per plan 14.5: SHA256 over UTF-8 of JSON.stringify of the
- * fixed-position array (no delimiter tricks, no key sorting inside).
- * Tags must already be normalized sorted unique; supersedes/link null when absent.
- */
-export function approvalTokenFor(args: {
-  id: string;
-  bodyHash: string;
-  kind: string;
-  source: string;
-  observedAt: string;
-  scope: string;
-  supersedes: string | null;
-  tags: string[];
-  link: string | null;
-  createdAt: string;
-  expiresAt: string;
-}): string {
-  const arr = [
-    1,
-    args.id,
-    args.bodyHash,
-    args.kind,
-    args.source,
-    args.observedAt,
-    args.scope,
-    args.supersedes,
-    args.tags,
-    args.link,
-    args.createdAt,
-    args.expiresAt,
-  ];
-  const ser = JSON.stringify(arr);
-  return `sha256:${sha256HexUtf8(ser)}`;
-}
-
 export function safeEqual(a: string, b: string): boolean {
   const ba = Buffer.from(a, "utf8");
   const bb = Buffer.from(b, "utf8");
@@ -132,32 +96,6 @@ export function safeEqual(a: string, b: string): boolean {
   } catch {
     return false;
   }
-}
-
-/**
- * Escape for terminal review display: never let stored bytes drive the
- * terminal. ESC becomes \x1B text; other C0/C1 (except LF) and DEL become
- * \uXXXX; the string is otherwise preserved (LF newlines kept for readability).
- */
-export function escapeForTerminal(s: string): string {
-  let out = "";
-  for (const ch of s) {
-    const cp = ch.codePointAt(0) as number;
-    if (ch === "\n") {
-      out += "\n";
-      continue;
-    }
-    if (cp === 0x1b) {
-      out += "\\x1B";
-      continue;
-    }
-    if ((cp >= 0x00 && cp <= 0x1f) || (cp >= 0x7f && cp <= 0x9f)) {
-      out += `\\u${cp.toString(16).padStart(4, "0").toUpperCase()}`;
-      continue;
-    }
-    out += ch;
-  }
-  return out;
 }
 
 export function hasControl(s: string): boolean {

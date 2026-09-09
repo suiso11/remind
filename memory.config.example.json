@@ -1,11 +1,13 @@
 {
   "dbPath": "./memory.db",
+  "vaultPath": "./vault",
   "allowedScopes": ["personal/default"],
-  "candidateTtlSec": 259200,
   "limits": {
     "bodyMaxCp": 2000,
     "queryMaxCp": 500,
     "tagsMax": 5,
+    "linksMax": 8,
+    "sourceRefsMax": 8,
     "limitDefault": 10,
     "limitMax": 25,
     "snippetMaxCp": 200,

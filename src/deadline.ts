@@ -38,6 +38,7 @@ export function effectiveBusyMs(busyMs: number, remainingMs: number): number {
 export interface WorkerOpRequest {
   dbFile: string;
   config: AppConfig;
+  configPath: string;
   op: string;
   params: Record<string, unknown>;
   idempotencyKey?: string;
