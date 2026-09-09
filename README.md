@@ -1,187 +1,119 @@
-# remind-memory-cli (T4 correction + archive)
+# remind-memory-cli
 
-Local external-long-term-memory CLI foundation. Planning source: `plan.md`
-section 14 (MVP proposal). **T1** delivered the runnable foundation
-(boot, strict config, JSON envelopes, SQLite `scopes` init, protocol bound
-tests). **T2** adds candidates + human review/approve/reject
-(`candidate.create` / `candidate.get` over JSON; `review` / `approve` /
-`reject` on the human TTY path; approval-token binding; idempotent writes;
-metadata-only audit). **T3** adds deterministic `record.recall` atop
-approved records only (literal normalization, tag-ALL/link/time filters,
-fixed `createdAt DESC, id ASC` order, bounded prefix snippets, full-response
-budget, per-recall `recallId` with metadata-only `audit` + `exposures` rows
-in one fail-closed transaction). **T4** adds `record.correct-request`
-(correction-candidate creation over automated JSON) plus human-terminal
-`archive` and atomic correction approval (conditional supersede, exactly one
-race winner). `record.recall` matches `status=active` rows only, so
-superseded/archived records are excluded. This CLI never returns `ok:true`
-for unimplemented domain ops.
+ローカル専用の外部長期記憶 CLI（T1–T6 MVP）。SQLite に候補・レコード・監査証跡を保存し、自動処理は 1 行 JSON、承認などの重要操作は人間の端末でのみ行います。
 
-Companion integration is unresolved (plan.md U11); this repo changes nothing
-in Companion.
+## 前提条件
 
-## Pinned environment (actual, verified)
+- Node.js `24.12.0`、npm `11.6.2`
+- ランタイム依存なし（SQLite は Node 標準 `node:sqlite` を使用）
+- Windows PowerShell の例を中心に記載（パイプの 1 行 JSON は他シェルでも同様）
 
-- Node.js `24.12.0` (Supported LTS line), npm `11.6.2`
-- `engines: node >=24.12.0 <25`, `packageManager: npm@11.6.2`
-- TypeScript `5.9.3`, `@types/node` `24.10.1` (dev only)
-- **Zero runtime dependencies**: SQLite via the Node built-in `node:sqlite`
-  (`DatabaseSync`). Note: it still prints an `ExperimentalWarning` on this
-  Node version; the warning goes to stderr and never touches stdout JSON.
+## セットアップ / ビルド
 
-## Quick start
-
-```sh
+```powershell
 npm ci
-npm test        # build (tsc) + unit/smoke tests over dist/
-npm run smoke   # manual CLI envelope walkthrough in a temp dir
-cp memory.config.example.json memory.config.json  # local only, git-ignored
-echo '{"v":1,"op":"record.recall","params":{"query":"booking","scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
+npm run build
+Copy-Item memory.config.example.json memory.config.json
 ```
-Status (honest, verified): `npm test` builds with `tsc` and runs
-`node:test` over `dist/tests/` — **88 tests, 87 pass, 1 skipped** (config
-strictness, envelopes/bounds, CLI smoke, hardened stdin subprocess suite,
-T2 candidates/approval/idempotency/scope/TTY-guard suite, 4 T2 review
-regressions, plus 10 T3 recall regressions: approval-only/active-scope
-filtering with revoked scope, literal normalization (`%_` quotes, no
-wildcards), tag-ALL/link/time/order/ties/limits, Unicode codepoint
-truncation with exact byte accounting, empty-recall audit, query absence in
-audit/errors, recall-ID uniqueness with per-item exposures, forced audit
-failure rollback, budget-overflow with no exposures, CLI end-to-end over
-persistent seeded SQLite; plus 3 T3 fix regressions: 33000-row bounded-SQL
-scale recall with tag/link filter and exact order, unpaired-surrogate
-envelope/direct validation with astral preservation, CLI escaped-surrogate
-denial with no audit; plus 8 T4 correction/archive tests: atomic
-supersede with chain link, sequential competing-approval single winner with
-loser rollback, archive-vs-correction races both directions, cross-scope
-denial/invisibility, idempotent replay vs param-change conflict, no-orphan
-failure paths, recall exclusion of superseded/archived, JSON/non-TTY
-archive denial; plus 5 T4 race-tightening tests: real concurrent
-worker-thread approvals sharing one file DB behind a start barrier (one
-winner, loser CONFLICT, exact atomic records/candidate/audit/operations),
-concurrent approve-vs-archive mutual exclusion, direct
-`candidate.create(kind=correction)` parity with the new in-transaction
-target gate, failing-audit-trigger rollback for approve-correction and
-archive, and replay after DB reopen plus after target-archive/candidate-
-expiry; the single skip is the manual real-TTY
-interactive confirmation, exercised by hand only).
-`npm run smoke` walks a strict valid recall / unknown / human-op envelopes
-in a temp dir (recall returns `ok:true` with empty items on the fresh DB).
-T5 (retention docs, `docs/retention.md`) and T6 (fake adapter
-`src/fake-adapter.ts` + A1-A13 acceptance `tests/acceptance.test.ts`, 14/14
-pass via `npm run acceptance` including A8b strict-envelope fixtures; full-field
-A3 token binding plus stored bodyHash tamper guard; finite adapter bounds that
-degrade instead of clamp, strict single-line envelope, UTF-8 fatal decode,
-`killSignal:SIGKILL` forced deadline) are implemented and tested; the only
-skip/manual remainder is the real-TTY interactive confirmation.
-T3 fix notes (honest): `record.recall` uses parameterized SQL
-`WHERE scope/status/time AND instr(body, ?)>0 AND EXISTS(tag)… AND
-EXISTS(link)… ORDER BY createdAt DESC, id ASC LIMIT ?` (no `LIKE`, no
-wildcard, no unbounded `IN`; tag fetch only for the `<=limit` selected
-ids), with additive indexes `idx_records_scope_status_created_id`,
-`idx_record_tags_tag_record`, `idx_record_links_toname_from`. This bounds
-host variables and materialization, but the `instr` scan may still examine
-every row in the scope window — not hard constant latency. Denials
-(`BAD_REQUEST`/`FORBIDDEN_SCOPE`/`LIMIT_EXCEEDED`/`STORE_UNAVAILABLE`)
-write no `audit`/`exposures` rows; the exposure ledger is success-only
-(this clarification is not a new feature). Unpaired surrogates (including
-escaped `"\ud800"` halves) are `BAD_REQUEST` with no mutation at the
-protocol envelope and at direct create/recall validation; valid astral
-pairs still pass.
 
-## Interface
+- `memory.config.json` はローカル専用（git 管理対象外）。コミットしないでください。
+- `dbPath` は設定ファイルからの相対パスとして解決されます。
 
-- `memory-cli --config <path>` reads **one LF-framed** stdin JSON line,
-  writes **one** stdout JSON line (`{v, ok, code, message, data,
-  deduplicated}`), exit `0`. The first LF terminates the request: the CLI
-  answers without waiting for EOF, so a held-open pipe cannot hang it.
-  Bytes already buffered after the first LF with non-whitespace content
-  make it `BAD_REQUEST` (multiline); trailing whitespace-only bytes are
-  ignored. EOF without LF also terminates the line; leading empty lines
-  are skipped.
-- Bounded stdin: raw UTF-8 bytes are capped at `32768` **while streaming**
-  (before buffering/parsing), so overflow without a newline still returns
-  `LIMIT_EXCEEDED`. The `timeouts.cliMs` deadline aborts a never-ending
-  stdin with `TIMEOUT`, and the store op runs on a worker thread bounded by
-  the REMAINING `cliMs`: SQLite busy wait is clamped to
-  `min(busyMs, remaining)` and an independent parent timer terminates the
-  worker on expiry (`TIMEOUT`, unknown commit outcome, idempotent replay).
-  A same-thread `setTimeout` alone cannot interrupt synchronous SQLite; the
-  worker boundary is what makes the deadline effective. Line bytes are
-  decoded as UTF-8 `fatal:true`; invalid bytes return `BAD_REQUEST`.
-  Neither path waits indefinitely.
-- Startup failures (missing `--config`, invalid config, DB open failure,
-  empty/unreadable stdin) exit non-zero with **no stdout JSON** and a
-  **fixed** stderr line only (`error: bad arguments` /
-  `error: invalid config` / `error: store unavailable` / `error: bad
-  input`): argv, config contents, and exception messages are never echoed.
-  The `node:sqlite` `ExperimentalWarning` may also appear on stderr; it
-  never touches stdout JSON and never carries request bytes.
-- Config is file-only: unknown fields rejected; env vars / request JSON can
-  never override limits. Scopes seed `scopes(scope PK)` additively.
-- Response budget from `limits.responseMaxBytes` applies to **every**
-  stdout envelope path (`OK`/`BAD_REQUEST`/`FORBIDDEN`/`NOT_IMPLEMENTED`/
-  `LIMIT_EXCEEDED`/`TIMEOUT`/`STORE_UNAVAILABLE`): over-budget responses
-  become fail-closed `LIMIT_EXCEEDED`, never truncated.
-- Human-only ops over JSON return `FORBIDDEN`; unknown ops return
-  `BAD_REQUEST`; `candidate.create`/`candidate.get`/`record.recall`/
-  `record.correct-request` execute against the store (T2-T4).
-- Review discloses only for authorized scopes (startup config AND `scopes`
-  table); a scopes-table I/O failure (closed DB, missing/corrupt table) is
-  `STORE_UNAVAILABLE`, never `FORBIDDEN_SCOPE` (genuine denials — unknown
-  config scope or revoked row — stay `FORBIDDEN_SCOPE`); over-budget
-  create/approve/reject/correct-request/archive fail closed with no orphan
-  rows; a known committed `ok:true` is never replaced by `TIMEOUT` or a
-  close failure (a worker terminated by the deadline has UNKNOWN outcome:
-  `TIMEOUT` with idempotent replay via the same key + params).
-- Human `review`/`approve`/`reject`/`archive` require BOTH stdin and stdout
-  to be TTYs (a stdout redirect would otherwise capture the full candidate
-  body + approval token into a file/pipe) plus an interactive `yes`
-  confirmation for mutating ops; `archive` needs `--id` + `--scope` +
-  `--idempotency-key` + `--reason-code USER_ARCHIVED` (no approval token).
+## 設定（`memory.config.example.json`）
 
-## Layout
+- `dbPath`: SQLite ファイルの場所（例 `./memory.db`）
+- `allowedScopes`: 利用可能なスコープ（例 `["personal/default"]`）
+- `candidateTtlSec`: 承認の有効期限（例 259200 = 72 時間）。期限切れは削除ではなく承認不可（`EXPIRED`）になります
+- `limits`: 本文・クエリ・タグ・件数・応答サイズの上限
+- `timeouts`: `cliMs`（全体期限）、`busyMs`（SQLite 待機）
+- `dbMaxBytes`: DB サイズの上限（超過する書き込みはロールバックし `STORE_UNAVAILABLE`）
 
-- `src/config.ts` — strict startup config load/validate
-- `src/protocol.ts` — envelopes, fixed codes/messages, bounds
-- `src/db.ts` — SQLite open + `scopes` seed + T2 domain tables, plus
-  `applyEffectiveBusyTimeout` (P1 clamp `min(busyMs, remaining cliMs)`)
-- `src/deadline.ts` + `src/worker-op.ts` — P1 effective remaining deadline:
-  store op on a worker thread with its own connection, bounded busy wait,
-  independent parent timer with `worker.terminate()` (unknown commit
-  outcome documented; same-thread `setTimeout` cannot interrupt sync SQLite)
-- `src/normalize.ts` — T2 exact normalization (NFKC/trim/collapse/ASCII
-  fold), canonical times/hashes, approval-token binding, TTY escaping,
-  plus shared strict lone-surrogate well-formedness (`hasLoneSurrogate` /
-  `containsLoneSurrogateDeep`)
-- `src/store.ts` — T2 candidates + review/approve/reject + idempotency +
-  metadata-only audit, T3 `record.recall` (strict params incl.
-  lone-surrogate rejection, bounded parameterized SQL with `instr` literal
-  plus per-tag/link `EXISTS` plus SQL `LIMIT`, fixed order, bounded
-  snippets, full-budget gate, single-transaction audit/exposures), T4
-  `record.correct-request` (short-form correction candidate, advisory +
-  in-transaction target gate, idempotent; direct `candidate.create` with
-  `kind=correction` carries the same advisory + in-transaction gate) + correction approval (atomic
-  conditional supersede, single race winner) + human `archiveRecord`
-  (conditional active→archived flip, terminal, metadata-only audit with
-  `approvedAt=null`; `audit.ts` is the timestamp, kept to avoid conflating
-  archive with approval) plus a documented limitation: local single-user
-  error semantics keep adopted `NOT_FOUND` / `FORBIDDEN_SCOPE` /
-  `CONFLICT` on id lookups (which can disclose id existence); no policy
-  change without agreement. Prior T4 coverage was sequential simulation
-  only; the new race suite above is the first real shared-file-DB
-  concurrency verification (WAL, `BEGIN IMMEDIATE`, 8s busy wait).
-- `src/cli.ts` — CLI entry (`--config`, bounded LF-framed stdin, stdout line;
-  `candidate.create/get` routed to the store, human `review/approve/reject`
-  subcommands with TTY + `yes` confirmation)
-- `tests/` — `node:test` suites (config/protocol/cli smoke/hardening subprocess/T2/T3/T3-fix scale+surrogate/T4 correction-archive/acceptance A1-A13+A8b)
-- `memory.config.example.json` — fake scope (`personal/default`) only
+起動時設定はファイルのみです。不明な項目は起動失敗、環境変数やリクエスト JSON での上書きはできません。
 
-## Roadmap (plan.md 14.12)
+## 使い方：JSON 自動操作
 
-- [x] T1: this foundation
-- [x] T2: candidates + review/approve/reject
-- [x] T3: records + deterministic recall + exposure audit
-- [x] T4: correct-request/archive
-- [x] T5: retention documentation (no export/delete in MVP)
-- [x] T6: fake adapter + A1-A13 acceptance (14/14 incl. A8b strictness)
+基本形（標準入力に 1 行 JSON、標準出力に 1 行 JSON、終了コード `0`）：
+
+```powershell
+'{"v":1,"op":"record.recall","params":{"query":"booking","scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
+```
+
+自動処理で実行できる操作は 4 つのみです（`src/protocol.ts`、`src/cli.ts` で確認）：
+
+| 操作 | 用途 | 注意 |
+| --- | --- | --- |
+| `candidate.create` | 候補の登録 | `idempotencyKey` 必須 |
+| `candidate.get` | 候補メタデータの参照（本文なし） | `params: {id, scope}` |
+| `record.recall` | 承認済み・有効な記録の検索 | 承認済みのみ対象 |
+| `record.correct-request` | 訂正候補の登録 | `idempotencyKey` 必須 |
+
+例：
+
+```powershell
+# 候補の登録
+'{"v":1,"op":"candidate.create","idempotencyKey":"walk-001","params":{"body":"next wednesday booking check","kind":"user_fact","provenance":{"source":"session:s1:turn:3","observedAt":"2026-09-01T00:00:00.000Z"},"scope":"personal/default","tags":["schedule"],"ttlSec":259200,"runId":"run-001"}}' | node dist/src/cli.js --config ./memory.config.json
+
+# 候補メタデータの参照
+'{"v":1,"op":"candidate.get","params":{"id":"<candId>","scope":"personal/default"}}' | node dist/src/cli.js --config ./memory.config.json
+
+# 検索（承認済み active のみ、本文の断片を返す）
+'{"v":1,"op":"record.recall","params":{"query":"booking","scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
+
+# 訂正候補の登録（<recordId> は訂正対象の記録 ID）
+'{"v":1,"op":"record.correct-request","idempotencyKey":"corr-001","params":{"recordId":"<recordId>","body":"corrected text","provenance":{"source":"session:s1:turn:9","observedAt":"2026-09-02T00:00:00.000Z"},"scope":"personal/default","runId":"run-002"}}' | node dist/src/cli.js --config ./memory.config.json
+```
+
+- 書き込み操作は同じ `idempotencyKey` + 同じ内容なら再送可（`deduplicated:true`）。内容を変えた再送は `CONFLICT` です。
+- JSON 経由の `approve` / `reject` / `archive` は `FORBIDDEN` になります。未知の操作は `BAD_REQUEST` です。
+
+## 使い方：人間の端末操作（TTY 必須）
+
+`review` / `approve` / `reject` / `archive` は実際の端末でのみ実行できます。**標準入力と標準出力の両方が TTY** である必要があります（リダイレクトやパイプでは不可）。
+
+- `review` は表示のみで、確認入力は不要です。
+- `approve` / `reject` / `archive` は確認プロンプトに `yes` と手入力が必要です。`--confirm` のようなフラグは受け付けません。
+
+```powershell
+# 内容確認（本文・承認トークンを端末に表示）
+node dist/src/cli.js review --config ./memory.config.json --id <candId> --scope personal/default
+
+# 承認（<approvalToken> は review に表示されたもの）
+node dist/src/cli.js approve --config ./memory.config.json --id <candId> --scope personal/default --token <approvalToken> --idempotency-key h-001
+
+# 否認
+node dist/src/cli.js reject --config ./memory.config.json --id <candId> --scope personal/default --token <approvalToken> --idempotency-key h-002 --reason-code USER_REJECTED
+
+# アーカイブ（トークン不要、記録が検索対象外になる）
+node dist/src/cli.js archive --config ./memory.config.json --id <recordId> --scope personal/default --idempotency-key h-003 --reason-code USER_ARCHIVED
+```
+
+TTY でない `approve` / `reject` / `archive` は `FORBIDDEN`、TTY でない `review` はエラーを返し、本文やトークンは出しません。
+
+## テスト
+
+`package.json` のスクリプトと対応（`src/cli.ts`・`src/protocol.ts` に対する内容）：
+
+```powershell
+npm test         # build + 全テスト
+npm run smoke    # 一時ディレクトリでの CLI 動作確認
+npm run acceptance  # A1-A13 + A8b の受け入れテスト
+```
+
+- `npm test` の 1 件のスキップは、実際の端末での確認操作のみ手動のためです。
+- 詳しい受け入れ条件は `docs/acceptance-manifest.md`、保持の方針は `docs/retention.md` を参照してください。
+
+## データと安全な動作
+
+- 監査（`audit` / `exposures`）はメタデータのみで、本文・クエリ・断片は記録しません。
+- 期限切れ・アーカイブ・supersede はいずれも行を残します。削除する処理はありません。
+- 応答サイズ上限を超える応答は切り詰めず `LIMIT_EXCEEDED` で失敗します。
+- 標準入力はバイト数上限と期限で保護され、DB 操作は残り時間で打ち切られ `TIMEOUT` になります。タイムアウト後の確定状態は不明なものとして扱い、同じキーでの再送で確認します。
+- バックアップは CLI 停止中に SQLite ファイルをコピーしてください。稼働中のエクスポート機能はありません。
+
+## 現時点の制限（明確にないもの）
+
+- Companion 連携はありません。
+- エクスポート機能・削除（消去）API はありません。`archive` は検索対象外にするだけで、削除ではありません。
+- ベクトル検索・自動要約・バックグラウンド処理はありません。
+- 訂正の競合は 1 件のみが勝者となり、敗者は `CONFLICT` でロールバックします。
+- 同一 OS ユーザーが DB ファイルを直接読める前提のローカル単独利用です。ファイル権限は運用上の推奨であり、厳密な境界ではありません。
