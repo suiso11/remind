@@ -17,7 +17,7 @@ import { effectiveBusyMs, runStoreOpWithDeadline } from "../src/deadline.js";
 import { queryMemory, isCitationExposed, FAKE_FALLBACK_TEXT } from "../src/fake-adapter.js";
 import { drainProjection, projectOneRecord, projectionBackoffMs, rebuildVault } from "../src/projection.js";
 import { applyResponseBudget, checkRawSize, fail, ok, validateRequest } from "../src/protocol.js";
-import { archiveRecord, eventAppend, getRecord, listRecords, recallRecords, rememberRecord } from "../src/store.js";
+import { archiveRecord, correctRecord, eventAppend, getRecord, listRecords, recallRecords, rememberRecord } from "../src/store.js";
 
 function makeConfig(dir: string, dbName = "t.db"): { config: AppConfig; configPath: string } {
   const config: AppConfig = {
@@ -293,6 +293,66 @@ describe("Markdown projection: write, retry, rebuild", () => {
 });
 
 describe("projection consistency: backlinks and retry retention", () => {
+  it("re-enqueues remember, correction, and archive projections on idempotent replay", () => {
+    const ctx = setup("replay-queue");
+    try {
+      const target = seedRecord(ctx.db, ctx.config, "e-replay-target", "projection replay target", "replay-target");
+      drainProjection(ctx.db, ctx.config, ctx.configPath);
+      const ev = eventAppend(
+        ctx.db,
+        ctx.config,
+        {
+          eventId: "e-replay-op",
+          sessionId: "s1",
+          turnId: "t1",
+          body: "projection replay raw",
+          provenance: { source: "test", observedAt: OBS },
+          scope: "personal/default",
+        },
+        "replay-event",
+      );
+      assert.equal(ev.ok, true);
+      const rememberParams = {
+        body: "projection replay remembered",
+        kind: "user_fact",
+        provenance: { source: "test", observedAt: OBS },
+        scope: "personal/default",
+        links: [target],
+        sourceRefs: ["e-replay-op"],
+      };
+      const remembered = rememberRecord(ctx.db, ctx.config, rememberParams, "replay-remember");
+      const rememberedId = (remembered.data as { record: { id: string } }).record.id;
+      ctx.db.exec(`DELETE FROM projection_queue`);
+      assert.equal(rememberRecord(ctx.db, ctx.config, rememberParams, "replay-remember").deduplicated, true);
+      let queued = (ctx.db.prepare(`SELECT recordId FROM projection_queue ORDER BY recordId`).all() as Array<{ recordId: string }>).map((r) => r.recordId);
+      assert.deepEqual(queued, [rememberedId, target].sort());
+
+      const correctParams = {
+        recordId: rememberedId,
+        body: "projection replay corrected",
+        kind: "correction",
+        provenance: { source: "test", observedAt: OBS },
+        scope: "personal/default",
+        links: [target],
+        sourceRefs: ["e-replay-op"],
+      };
+      const corrected = correctRecord(ctx.db, ctx.config, correctParams, "replay-correct");
+      const correctedId = (corrected.data as { record: { id: string } }).record.id;
+      ctx.db.exec(`DELETE FROM projection_queue`);
+      assert.equal(correctRecord(ctx.db, ctx.config, correctParams, "replay-correct").deduplicated, true);
+      queued = (ctx.db.prepare(`SELECT recordId FROM projection_queue ORDER BY recordId`).all() as Array<{ recordId: string }>).map((r) => r.recordId);
+      assert.deepEqual(queued, [correctedId, rememberedId, target].sort());
+
+      const archiveParams = { id: correctedId, scope: "personal/default", reasonCode: "USER_ARCHIVED" };
+      assert.equal(archiveRecord(ctx.db, ctx.config, archiveParams, "replay-archive").ok, true);
+      ctx.db.exec(`DELETE FROM projection_queue`);
+      assert.equal(archiveRecord(ctx.db, ctx.config, archiveParams, "replay-archive").deduplicated, true);
+      queued = (ctx.db.prepare(`SELECT recordId FROM projection_queue ORDER BY recordId`).all() as Array<{ recordId: string }>).map((r) => r.recordId);
+      assert.deepEqual(queued, [correctedId, target].sort());
+    } finally {
+      ctx.cleanup();
+    }
+  });
   it("target Markdown backlink appears after linking and disappears after archive", () => {
     const ctx = setup("backlink");
     try {
@@ -400,6 +460,58 @@ describe("worker deadline contract", () => {
     assert.equal(effectiveBusyMs(2000, 300), 300);
     assert.equal(effectiveBusyMs(2000, 0), 0);
     assert.equal(effectiveBusyMs(2000, -5), 0);
+  });
+
+  it("returns a committed envelope before a deliberately slow projection drain", async () => {
+    const ctx = setup("post-before-drain");
+    try {
+      const ev = eventAppend(
+        ctx.db,
+        ctx.config,
+        {
+          eventId: "e-worker-slow",
+          sessionId: "s1",
+          turnId: "t1",
+          body: "worker projection source",
+          provenance: { source: "test", observedAt: OBS },
+          scope: "personal/default",
+        },
+        "worker-slow-event",
+      );
+      assert.equal(ev.ok, true);
+      ctx.db.exec(`CREATE TRIGGER slow_projection_delete BEFORE DELETE ON projection_queue BEGIN
+        SELECT sum(x) FROM (WITH RECURSIVE c(x) AS (
+          VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 5000000
+        ) SELECT x FROM c);
+      END`);
+      const outcome = await runStoreOpWithDeadline(
+        {
+          dbFile: ctx.config.dbPath,
+          config: ctx.config,
+          configPath: ctx.configPath,
+          op: "record.remember",
+          params: {
+            body: "worker committed before projection",
+            kind: "user_fact",
+            provenance: { source: "test", observedAt: OBS },
+            scope: "personal/default",
+            sourceRefs: ["e-worker-slow"],
+          },
+          idempotencyKey: "worker-slow-remember",
+          effectiveBusyMs: 500,
+        },
+        1000,
+      );
+      assert.equal(outcome.timedOut, false);
+      if (!outcome.timedOut) assert.equal(outcome.res.ok, true, JSON.stringify(outcome.res));
+    } finally {
+      try {
+        ctx.db.close();
+      } catch {
+        /* ignore */
+      }
+      await fs.promises.rm(ctx.dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
   });
 
   it("zero budget times out; broken worker fails closed, never hangs", async () => {

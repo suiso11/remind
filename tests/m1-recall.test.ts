@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
+import { bodyHashFor, normalizeBody } from "../src/normalize.js";
 import {
   archiveRecord,
   correctRecord,
@@ -134,6 +135,21 @@ function heatOf(db: DatabaseSync, id: string): number {
   return row?.usedCount ?? -1;
 }
 
+function insertRecord(
+  db: DatabaseSync,
+  id: string,
+  body: string,
+  createdAt: string,
+  links: string[] = [],
+): void {
+  const bodyNorm = normalizeBody(body);
+  db.prepare(
+    `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
+     VALUES (?, ?, ?, ?, 'user_fact', 'test', ?, 'personal/default', 'active', NULL, 1, ?)`,
+  ).run(id, body, bodyNorm, bodyHashFor(bodyNorm), OBS, createdAt);
+  for (const link of links) db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(id, link);
+}
+
 describe("links, backlinks, dangling refs, graph recall", () => {
   it("stores multiple links sorted and recalls graph neighbors", () => {
     const ctx = setup();
@@ -181,6 +197,43 @@ describe("links, backlinks, dangling refs, graph recall", () => {
       ctx.cleanup();
     }
   });
+
+  it("applies the recall time window to graph neighbors", () => {
+    const ctx = setup();
+    try {
+      const seed = remember(ctx.db, ctx.config, "window graph beacon", "graph-window-seed", {
+        now: "2026-07-01T00:00:00.000Z",
+      });
+      insertRecord(ctx.db, "rec_old_neighbor", "unrelated old neighbor", "2025-01-01T00:00:00.000Z", [seed]);
+      const ids = recallIds(ctx.db, ctx.config, "window graph beacon", {
+        since: "2026-01-01T00:00:00.000Z",
+      });
+      assert.ok(ids.includes(seed));
+      assert.equal(ids.includes("rec_old_neighbor"), false, JSON.stringify(ids));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("sorts same-distance graph neighbors before applying the expansion cap", () => {
+    const ctx = setup();
+    try {
+      const seed = remember(ctx.db, ctx.config, "graph cap beacon", "graph-cap-seed", {
+        now: "2026-01-01T00:00:00.000Z",
+      });
+      for (let i = 0; i < 45; i++) {
+        const id = `rec_g_${String(i).padStart(2, "0")}`;
+        const createdAt = new Date(Date.UTC(2026, 0, 2 + i)).toISOString();
+        insertRecord(ctx.db, id, "unrelated graph neighbor", createdAt, [seed]);
+      }
+      const ids = recallIds(ctx.db, ctx.config, "graph cap beacon", { limit: 25 });
+      const neighbors = ids.filter((id) => id !== seed);
+      const expected = Array.from({ length: 24 }, (_, i) => `rec_g_${String(44 - i).padStart(2, "0")}`);
+      assert.deepEqual(neighbors, expected);
+    } finally {
+      ctx.cleanup();
+    }
+  });
 });
 
 describe("raw lexical descent maps raw-only terms to records", () => {
@@ -223,6 +276,97 @@ describe("raw lexical descent maps raw-only terms to records", () => {
   });
 });
 
+describe("recall candidate determinism and fallback", () => {
+  it("orders equal-rank note and raw FTS candidates by createdAt DESC, id ASC", () => {
+    const ctx = setup();
+    try {
+      for (const id of ["rec_c", "rec_b", "rec_a"]) {
+        insertRecord(ctx.db, id, "unrelated note", "2026-04-01T00:00:00.000Z");
+        ctx.db.prepare(`INSERT INTO fts_notes(recordId, body) VALUES (?, 'tiephrase')`).run(id);
+      }
+      assert.deepEqual(recallIds(ctx.db, ctx.config, "tiephrase").slice(0, 3), ["rec_a", "rec_b", "rec_c"]);
+
+      for (const suffix of ["4", "3", "2", "1"]) {
+        const eventId = `event_${suffix}`;
+        ctx.db.prepare(
+          `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt)
+           VALUES (?, 's', 't', 'raw', 'raw', 'test', ?, 'personal/default', NULL, '2026-05-01T00:00:00.000Z')`,
+        ).run(eventId, OBS);
+        ctx.db.prepare(`INSERT INTO fts_raw(eventId, body) VALUES (?, 'rawtie')`).run(eventId);
+        const recordId = `rec_raw_${suffix}`;
+        insertRecord(ctx.db, recordId, "unrelated descent note", "2026-05-01T00:00:00.000Z");
+        ctx.db.prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES (?, ?)`).run(recordId, eventId);
+      }
+      const rawIds = recallIds(ctx.db, ctx.config, "rawtie");
+      assert.ok(rawIds.includes("rec_raw_1"), JSON.stringify(rawIds));
+      assert.equal(rawIds.includes("rec_raw_4"), false, JSON.stringify(rawIds));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("keeps raw-only and canonical-only candidates when the fusion pool exceeds 60", () => {
+    const ctx = setup();
+    try {
+      for (let i = 0; i < 60; i++) {
+        const id = `rec_lex_${String(i).padStart(2, "0")}`;
+        insertRecord(ctx.db, id, "unrelated lexical canonical body", "2026-03-01T00:00:00.000Z");
+        ctx.db.prepare(`INSERT INTO fts_notes(recordId, body) VALUES (?, 'pooltoken')`).run(id);
+      }
+      const rawEvent = eventAppend(
+        ctx.db,
+        ctx.config,
+        {
+          eventId: "event_pool_raw",
+          sessionId: "s",
+          turnId: "t",
+          body: "pooltoken raw source",
+          provenance: { source: "test", observedAt: OBS },
+          scope: "personal/default",
+        },
+        "pool-raw-event",
+      );
+      assert.equal(rawEvent.ok, true);
+      insertRecord(ctx.db, "rec_raw_only", "unrelated raw-backed note", "2026-03-02T00:00:00.000Z");
+      ctx.db.prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES ('rec_raw_only', 'event_pool_raw')`).run();
+      insertRecord(ctx.db, "rec_canon_only", "pooltoken canonical note", "2026-03-03T00:00:00.000Z");
+
+      const ids = recallIds(ctx.db, ctx.config, "pooltoken", { limit: 25 });
+      assert.ok(ids.includes("rec_raw_only"), JSON.stringify(ids));
+      assert.ok(ids.includes("rec_canon_only"), JSON.stringify(ids));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("falls back to canonical raw bodyNorm after both derived raw lookups miss", () => {
+    const ctx = setup();
+    try {
+      const eventId = "event_raw_fallback";
+      const ev = eventAppend(
+        ctx.db,
+        ctx.config,
+        {
+          eventId,
+          sessionId: "s",
+          turnId: "t",
+          body: "multiword fallback beacon",
+          provenance: { source: "test", observedAt: OBS },
+          scope: "personal/default",
+        },
+        "raw-fallback-event",
+      );
+      assert.equal(ev.ok, true);
+      const id = remember(ctx.db, ctx.config, "unrelated cited note", "raw-fallback-record", { refs: [eventId] });
+      ctx.db.prepare(`DELETE FROM fts_raw WHERE eventId=?`).run(eventId);
+      ctx.db.prepare(`DELETE FROM char_bigrams WHERE kind='raw' AND id=?`).run(eventId);
+      assert.ok(recallIds(ctx.db, ctx.config, "multiword fallback").includes(id));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
 describe("correction atomicity and idempotency", () => {
   function correct(
     db: DatabaseSync,
@@ -251,7 +395,8 @@ describe("correction atomicity and idempotency", () => {
     try {
       const orig = remember(ctx.db, ctx.config, "original meeting time noon sharp", "corr-a");
       raw(ctx.db, ctx.config, "corr-ev-corr-k1");
-      const done = correct(ctx.db, ctx.config, orig, "corrected meeting time one oclock sharp", "corr-k1");
+      const correctedBody = "  CORRECTED   meeting time one oclock sharp  ";
+      const done = correct(ctx.db, ctx.config, orig, correctedBody, "corr-k1");
       assert.equal(done.ok, true, JSON.stringify(done));
       const newId = (done.data as { record: { id: string } }).record.id;
       const oldView = getRecord(ctx.db, ctx.config, { id: orig, scope: "personal/default" });
@@ -260,7 +405,9 @@ describe("correction atomicity and idempotency", () => {
       const ids = ((listed.data as { items: Array<{ id: string }> }).items).map((i) => i.id);
       assert.ok(ids.includes(newId));
       assert.ok(!ids.includes(orig));
-      const replay = correct(ctx.db, ctx.config, orig, "corrected meeting time one oclock sharp", "corr-k1");
+      const hash = (ctx.db.prepare(`SELECT bodyHash FROM records WHERE id=?`).get(newId) as { bodyHash: string }).bodyHash;
+      assert.equal(hash, bodyHashFor(normalizeBody(correctedBody)));
+      const replay = correct(ctx.db, ctx.config, orig, correctedBody, "corr-k1");
       assert.equal(replay.ok, true);
       assert.equal(replay.deduplicated, true);
       // Second correction of the same (now superseded) target loses atomically.

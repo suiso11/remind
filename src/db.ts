@@ -111,14 +111,32 @@ export function initDb(
     // Persistent WAL mode only after the file is approved as M1-compatible,
     // so rejected legacy files are never mutated by startup.
     db.exec(`PRAGMA journal_mode = WAL;`);
-    db.exec(`CREATE TABLE IF NOT EXISTS scopes(scope TEXT PRIMARY KEY)`);
-    const ins = db.prepare(`INSERT OR IGNORE INTO scopes(scope) VALUES (?)`);
-    for (const s of config.allowedScopes) {
-      ins.run(s);
+    const initialize = (): void => {
+      db.exec(`CREATE TABLE IF NOT EXISTS scopes(scope TEXT PRIMARY KEY)`);
+      const ins = db.prepare(`INSERT OR IGNORE INTO scopes(scope) VALUES (?)`);
+      for (const s of config.allowedScopes) ins.run(s);
+      // M1 canonical + derived tables. Additive only; never drops rows.
+      ensureM1Schema(db);
+    };
+    if (uv === 0) {
+      // Fresh schema creation and its version stamp are one unit: an
+      // interrupted/failed DDL sequence remains a clean version-0 file.
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        initialize();
+        db.exec(`PRAGMA user_version = ${M1_USER_VERSION}`);
+        db.exec("COMMIT");
+      } catch (e) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          /* ignore */
+        }
+        throw e;
+      }
+    } else {
+      initialize();
     }
-    // M1 canonical + derived tables. Additive only; never drops rows.
-    ensureM1Schema(db);
-    db.exec(`PRAGMA user_version = ${M1_USER_VERSION}`);
   } catch (e) {
     try {
       db.close();

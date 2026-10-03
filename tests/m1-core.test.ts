@@ -10,10 +10,11 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { constants, DatabaseSync } from "node:sqlite";
 import { loadConfig, type AppConfig } from "../src/config.js";
 import { initDb, M1_USER_VERSION } from "../src/db.js";
-import { eventAppend, getRecord, listRecords, recallRecords, rememberRecord, hasLegacyApprovalSchema } from "../src/store.js";
+import { bodyHashFor, normalizeBody } from "../src/normalize.js";
+import { ensureM1Schema, eventAppend, getRecord, listRecords, recallRecords, rememberRecord, hasLegacyApprovalSchema } from "../src/store.js";
 import { validateRequest, WRITE_OPS, READ_OPS } from "../src/protocol.js";
 
 function baseConfig(dir: string, extraScopes: string[] = []): { config: AppConfig; configPath: string } {
@@ -169,6 +170,65 @@ describe("m1 schema: fresh v2 and legacy fail-fast", () => {
       assert.throws(() => initDb({ ...config, dbPath: f2 }, configPath), /legacy/i);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fresh DDL and user_version roll back together on schema failure", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "m1-atomic-schema-"));
+    try {
+      const { config, configPath } = baseConfig(dir);
+      const partial = new DatabaseSync(config.dbPath);
+      partial.exec(`CREATE TABLE scopes(scope TEXT PRIMARY KEY); CREATE VIEW records AS SELECT scope AS id FROM scopes`);
+      partial.close();
+      assert.throws(() => initDb(config, configPath), /db init failed/);
+      const reopen = new DatabaseSync(config.dbPath);
+      try {
+        assert.equal((reopen.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, 0);
+        assert.equal(
+          reopen.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='raw_events'`).get(),
+          undefined,
+        );
+      } finally {
+        reopen.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back usage dedup when unique-index creation fails, then retries once", () => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      db.exec(`CREATE TABLE usage(ts TEXT, recallId TEXT, recordId TEXT, scope TEXT, runId TEXT);
+        INSERT INTO usage VALUES ('1','r','x','s',NULL), ('2','r','x','s',NULL)`);
+      db.setAuthorizer((action, name) =>
+        action === constants.SQLITE_CREATE_INDEX && name === "idx_usage_recall_record"
+          ? constants.SQLITE_DENY
+          : constants.SQLITE_OK,
+      );
+      assert.throws(() => ensureM1Schema(db));
+      assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM usage`).get() as { n: number }).n, 2);
+      assert.equal(
+        db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_usage_recall_record'`).get(),
+        undefined,
+      );
+
+      db.setAuthorizer(null);
+      ensureM1Schema(db);
+      assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM usage`).get() as { n: number }).n, 1);
+      assert.ok(db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_usage_recall_record'`).get());
+
+      let usageAccesses = 0;
+      db.setAuthorizer((action, table) => {
+        if (table === "usage" && [constants.SQLITE_READ, constants.SQLITE_DELETE, constants.SQLITE_INSERT, constants.SQLITE_UPDATE].includes(action)) {
+          usageAccesses++;
+        }
+        return constants.SQLITE_OK;
+      });
+      ensureM1Schema(db);
+      assert.equal(usageAccesses, 0);
+    } finally {
+      db.close();
     }
   });
 
@@ -343,12 +403,17 @@ describe("record.remember immediate write + get/list", () => {
   it("remember is immediately recallable and get returns the full view", () => {
     const ctx = setup();
     try {
-      const { recordId } = rememberWithRef(ctx.db, ctx.config, "e-remember-1", "booking reference alpha bravo", "rem-1");
+      const body = "  ＢＯＯＫＩＮＧ\u3000 reference alpha bravo  ";
+      const bodyNorm = normalizeBody(body);
+      assert.equal(bodyNorm, "booking reference alpha bravo");
+      assert.notEqual(bodyNorm, body);
+      const { recordId } = rememberWithRef(ctx.db, ctx.config, "e-remember-1", body, "rem-1");
       const got = getRecord(ctx.db, ctx.config, { id: recordId, scope: "personal/default" });
       assert.equal(got.ok, true);
       const view = (got.data as { record: Record<string, unknown> }).record;
       assert.equal(view["status"], "active");
       assert.equal(view["kind"], "user_fact");
+      assert.equal(view["bodyHash"], bodyHashFor(bodyNorm));
       assert.deepEqual(view["sourceRefs"], ["e-remember-1"]);
       const rec = recallRecords(ctx.db, ctx.config, { query: "booking reference", scope: "personal/default", limit: 10 });
       assert.equal(rec.ok, true);

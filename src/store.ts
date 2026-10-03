@@ -110,12 +110,24 @@ export function ensureM1Schema(db: DatabaseSync): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_source_refs_event ON record_source_refs(eventId, recordId)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_bigrams_lookup ON char_bigrams(kind, bigram, id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_exposures_recall ON exposures(recallId, recordId)`);
-  try {
-    db.exec(`DELETE FROM usage WHERE rowid NOT IN (SELECT MIN(rowid) FROM usage GROUP BY recallId, recordId)`);
-  } catch {
-    /* best-effort dedupe before enforcing uniqueness */
+  const usageUniqueExists = db
+    .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='index' AND name='idx_usage_recall_record'`)
+    .get() as { found: number } | undefined;
+  if (!usageUniqueExists) {
+    // One-time migration for pre-index databases; normal startup never scans
+    // or rewrites the usage ledger. A savepoint works both standalone and
+    // inside fresh init's outer transaction.
+    db.exec(`SAVEPOINT ensure_m1_usage_unique`);
+    try {
+      db.exec(`DELETE FROM usage WHERE rowid NOT IN (SELECT MIN(rowid) FROM usage GROUP BY recallId, recordId)`);
+      db.exec(`CREATE UNIQUE INDEX idx_usage_recall_record ON usage(recallId, recordId)`);
+      db.exec(`RELEASE SAVEPOINT ensure_m1_usage_unique`);
+    } catch (e) {
+      try { db.exec(`ROLLBACK TO SAVEPOINT ensure_m1_usage_unique`); } catch { /* preserve the migration error */ }
+      try { db.exec(`RELEASE SAVEPOINT ensure_m1_usage_unique`); } catch { /* preserve the migration error */ }
+      throw e;
+    }
   }
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_recall_record ON usage(recallId, recordId)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_raw_scope_created ON raw_events(scope, createdAt, eventId)`);
   // Self-heal derived indexes when they are obviously out of sync with
   // canonical tables (empty or smaller than canonical). Best-effort only:
@@ -209,6 +221,16 @@ function replaySaved(savedJson: string, config: AppConfig): ResponseEnvelope {
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
   return budgeted({ ...parsed, deduplicated: true }, config);
+}
+
+function savedRecordId(savedJson: string): string | null {
+  try {
+    const parsed = JSON.parse(savedJson) as { data?: { record?: { id?: unknown } } };
+    const id = parsed.data?.record?.id;
+    return typeof id === "string" && ID_RE.test(id) ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 export function isScopeAuthorized(
@@ -582,7 +604,7 @@ function ftsNoteHits(
       sql += ` AND records.createdAt < ?`;
       args.push(until);
     }
-    sql += ` ORDER BY r ASC LIMIT ?`;
+    sql += ` ORDER BY r ASC, records.createdAt DESC, f.recordId ASC LIMIT ?`;
     args.push(cap);
     return db.prepare(sql).all(...args) as Array<{ id: string; rank: number }>;
   } catch {
@@ -660,7 +682,7 @@ function rawDescentHits(
           `SELECT f.eventId AS eventId FROM fts_raw f
            JOIN raw_events ON raw_events.eventId = f.eventId
            WHERE f.body MATCH ? AND raw_events.scope = ?
-           ORDER BY bm25(fts_raw) ASC LIMIT ?`,
+           ORDER BY bm25(fts_raw) ASC, raw_events.createdAt DESC, f.eventId ASC LIMIT ?`,
         )
         .all(match, scope, RAW_DESCENT_MAX) as Array<{ eventId: string }>;
       eventIds = rows.map((r) => r.eventId);
@@ -671,8 +693,8 @@ function rawDescentHits(
   if (eventIds.length === 0) {
     // Bigram fallback over raw bodies for CJK/short queries.
     const bigrams = bigramsOf(normalizedQuery);
-    try {
-      if (bigrams.length > 0) {
+    if (bigrams.length > 0) {
+      try {
         const placeholders = bigrams.map(() => "?").join(",");
         const rows = db
           .prepare(
@@ -683,15 +705,22 @@ function rawDescentHits(
           )
           .all(...[...bigrams, scope, RAW_DESCENT_MAX]) as Array<{ eventId: string }>;
         eventIds = rows.map((r) => r.eventId);
-      } else {
-        const rows = db
-          .prepare(
-            `SELECT eventId FROM raw_events WHERE scope = ? AND instr(bodyNorm, ?) > 0
-             ORDER BY createdAt DESC, eventId ASC LIMIT ?`,
-          )
-          .all(scope, normalizedQuery, RAW_DESCENT_MAX) as Array<{ eventId: string }>;
-        eventIds = rows.map((r) => r.eventId);
+      } catch {
+        eventIds = [];
       }
+    }
+  }
+  if (eventIds.length === 0) {
+    // Both derived event lookups missed: canonical raw text remains findable
+    // even for multi-code-point queries with stale/missing bigrams.
+    try {
+      const rows = db
+        .prepare(
+          `SELECT eventId FROM raw_events WHERE scope = ? AND instr(bodyNorm, ?) > 0
+           ORDER BY createdAt DESC, eventId ASC LIMIT ?`,
+        )
+        .all(scope, normalizedQuery, RAW_DESCENT_MAX) as Array<{ eventId: string }>;
+      eventIds = rows.map((r) => r.eventId);
     } catch {
       eventIds = [];
     }
@@ -1105,6 +1134,8 @@ export function rememberRecord(
     const denied = scopeGate(db, config, n.scope);
     if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    const id = savedRecordId(saved.responseJson);
+    if (id) postCommitEnqueueProjections(db, n.scope, [id], n.links);
     return replaySaved(saved.responseJson, config);
   }
   {
@@ -1135,7 +1166,7 @@ export function rememberRecord(
       db.prepare(
         `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1, ?)`,
-      ).run(id, n.body, n.bodyNorm, bodyHashFor(n.body), n.kind, n.source, n.observedAt, n.scope, now);
+      ).run(id, n.body, n.bodyNorm, bodyHashFor(n.bodyNorm), n.kind, n.source, n.observedAt, n.scope, now);
       for (const t of n.tags) {
         db.prepare(`INSERT INTO record_tags(recordId, tag) VALUES (?, ?)`).run(id, t);
       }
@@ -1187,6 +1218,8 @@ export function rememberRecord(
         return budgeted(fail("STORE_UNAVAILABLE"), config);
       }
       if (again && again.op === "record.remember" && again.requestHash === reqHash) {
+        const replayId = savedRecordId(again.responseJson);
+        if (replayId) postCommitEnqueueProjections(db, n.scope, [replayId], n.links);
         return replaySaved(again.responseJson, config);
       }
       return budgeted(fail("CONFLICT"), config);
@@ -1522,6 +1555,8 @@ function expandGraph(
   db: DatabaseSync,
   scope: string,
   frontier0: string[],
+  since: string | null,
+  until: string | null,
 ): Map<string, number> {
   const dist = new Map<string, number>();
   for (const id of frontier0) {
@@ -1529,43 +1564,46 @@ function expandGraph(
   }
   let frontier = [...frontier0];
   for (let d = 0; d < GRAPH_DEPTH_MAX && frontier.length > 0; d++) {
-    const next: string[] = [];
+    const candidates = new Set<string>();
     for (const id of frontier) {
-      if (dist.size >= GRAPH_EXPAND_MAX) break;
-      let outs: Array<{ toRef: string }>;
-      let backs: Array<{ fromId: string }>;
       try {
-        outs = db.prepare(`SELECT toRef FROM record_links WHERE fromId = ?`).all(id) as Array<{ toRef: string }>;
-        backs = db
+        const outs = db.prepare(`SELECT toRef FROM record_links WHERE fromId = ?`).all(id) as Array<{ toRef: string }>;
+        const backs = db
           .prepare(
             `SELECT l.fromId AS fromId FROM record_links l
              JOIN records r ON r.id = l.fromId
              WHERE l.toRef = ? AND r.scope = ? AND r.status = 'active'`,
           )
           .all(id, scope) as Array<{ fromId: string }>;
-      } catch {
-        continue;
-      }
-      const neighbors = [...outs.map((o) => o.toRef), ...backs.map((b) => b.fromId)];
-      for (const nb of neighbors) {
-        if (dist.has(nb) || dist.size >= GRAPH_EXPAND_MAX) continue;
-        // Resolve: only active same-scope records are followed (dangling skipped).
-        let okRow: { id: string } | undefined;
-        try {
-          okRow = db
-            .prepare(`SELECT id FROM records WHERE id = ? AND scope = ? AND status = 'active'`)
-            .get(nb, scope) as { id: string } | undefined;
-        } catch {
-          continue;
+        for (const nb of [...outs.map((o) => o.toRef), ...backs.map((b) => b.fromId)]) {
+          if (!dist.has(nb)) candidates.add(nb);
         }
-        if (!okRow) continue;
-        dist.set(nb, d + 1);
-        next.push(nb);
+      } catch {
+        /* skip this frontier member */
       }
     }
-    // Deterministic order within a distance level.
-    next.sort();
-    frontier = next;
+    const resolved: Array<{ id: string; createdAt: string }> = [];
+    for (const id of candidates) {
+      try {
+        const row = db
+          .prepare(`SELECT id, createdAt FROM records WHERE id = ? AND scope = ? AND status = 'active'`)
+          .get(id, scope) as { id: string; createdAt: string } | undefined;
+        if (!row) continue;
+        if (since !== null && row.createdAt < since) continue;
+        if (until !== null && row.createdAt >= until) continue;
+        resolved.push(row);
+      } catch {
+        /* dangling/unreadable refs are skipped */
+      }
+    }
+    resolved.sort((a, b) =>
+      a.createdAt !== b.createdAt
+        ? a.createdAt < b.createdAt ? 1 : -1
+        : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+    );
+    const next = resolved.slice(0, Math.max(0, GRAPH_EXPAND_MAX - dist.size));
+    for (const row of next) dist.set(row.id, d + 1);
+    frontier = next.map((row) => row.id);
   }
   return dist;
 }
@@ -1638,14 +1676,14 @@ export function recallRecords(
         const preScore = (id: string): number => {
           const lr = lexRank.has(id) ? 1 / (1 + (lexRank.get(id) as number)) : 0;
           const br = biRank.has(id) ? 0.5 / (1 + (biRank.get(id) as number)) : 0;
-          return lr + br + (seedIds.has(id) ? 0.25 : 0);
+          return lr + br + (rawSet.has(id) ? 2 : 0) + (canonSet.has(id) ? 1 : 0) + (seedIds.has(id) ? 0.25 : 0);
         };
         poolIds.sort((a, b) => preScore(b) - preScore(a) || (a < b ? -1 : a > b ? 1 : 0));
         poolIds = poolIds.slice(0, FUSION_CANDIDATE_MAX);
       }
       // 4) Bounded graph expansion from seeds + top lexical ids.
       const frontier0 = [...new Set<string>([...seedIds, ...poolIds.slice(0, 10)])].slice(0, 20);
-      const graphDist = expandGraph(db, p.scope, frontier0);
+      const graphDist = expandGraph(db, p.scope, frontier0, p.since, p.until);
 
       // Heat lookup for the bounded pool only.
       const heat = new Map<string, number>();
@@ -1977,6 +2015,15 @@ export function correctRecord(
     const denied = scopeGate(db, config, nScope);
     if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    const replayId = savedRecordId(saved.responseJson);
+    if (replayId) {
+      postCommitEnqueueProjections(
+        db,
+        nScope,
+        [replayId, recordId],
+        [...outboundRefsOf(db, recordId), ...nLinks],
+      );
+    }
     return replaySaved(saved.responseJson, config);
   }
   {
@@ -2024,7 +2071,7 @@ export function correctRecord(
       db.prepare(
         `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
          VALUES (?, ?, ?, ?, 'correction', ?, ?, ?, 'active', ?, ?, ?)`,
-      ).run(newId, rawBody, nBody, bodyHashFor(rawBody), prov.source, prov.observedAt, nScope, recordId, target.revision + 1, now);
+      ).run(newId, rawBody, nBody, bodyHashFor(nBody), prov.source, prov.observedAt, nScope, recordId, target.revision + 1, now);
       for (const l of nLinks) {
         db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(newId, l);
       }
@@ -2085,6 +2132,15 @@ export function correctRecord(
         return budgeted(fail("STORE_UNAVAILABLE"), config);
       }
       if (again && again.op === "record.correct" && again.requestHash === reqHash) {
+        const replayId = savedRecordId(again.responseJson);
+        if (replayId) {
+          postCommitEnqueueProjections(
+            db,
+            nScope,
+            [replayId, recordId],
+            [...outboundRefsOf(db, recordId), ...nLinks],
+          );
+        }
         return replaySaved(again.responseJson, config);
       }
       return budgeted(fail("CONFLICT"), config);
@@ -2132,6 +2188,7 @@ export function archiveRecord(
     const denied = scopeGate(db, config, nScope);
     if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    postCommitEnqueueProjections(db, nScope, [id], outboundRefsOf(db, id));
     return replaySaved(saved.responseJson, config);
   }
   {
@@ -2212,6 +2269,7 @@ export function archiveRecord(
         return budgeted(fail("STORE_UNAVAILABLE"), config);
       }
       if (again && again.op === "record.archive" && again.requestHash === reqHash) {
+        postCommitEnqueueProjections(db, nScope, [id], outboundRefsOf(db, id));
         return replaySaved(again.responseJson, config);
       }
       return budgeted(fail("CONFLICT"), config);

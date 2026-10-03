@@ -2,8 +2,8 @@
  * Worker entry for deadline enforcement (runs on the worker thread).
  * Opens its OWN SQLite connection (never shares the parent's handle),
  * applies the parent-computed effective busy timeout, runs exactly one
- * validated store op, drains the bounded projection queue (best-effort,
- * never hides committed memory), posts {res} back, and closes.
+ * validated store op, posts {res} back, drains the bounded projection queue
+ * (best-effort, never hides committed memory), and closes.
  */
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
@@ -85,14 +85,14 @@ function main(): void {
     db = new DatabaseSync(req.dbFile);
     db.exec(`PRAGMA busy_timeout = ${busy}`);
     const res = runOp(db, req);
-    // Post-commit projection (bounded, best-effort): a projection failure
-    // never replaces the committed envelope.
+    // Deliver the committed envelope before optional projection work so a
+    // slow drain cannot turn a known commit into a parent-side TIMEOUT.
+    post(res);
     try {
       drainProjection(db, req.config, req.configPath);
     } catch {
       /* queue retry next time */
     }
-    post(res);
   } catch {
     try {
       const cfg = (workerData as Req).config;
