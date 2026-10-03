@@ -5,6 +5,8 @@ export interface LimitsConfig {
   bodyMaxCp: number;
   queryMaxCp: number;
   tagsMax: number;
+  linksMax: number;
+  sourceRefsMax: number;
   limitDefault: number;
   limitMax: number;
   snippetMaxCp: number;
@@ -18,8 +20,8 @@ export interface TimeoutsConfig {
 
 export interface AppConfig {
   dbPath: string;
+  vaultPath: string;
   allowedScopes: string[];
-  candidateTtlSec: number;
   limits: LimitsConfig;
   timeouts: TimeoutsConfig;
   dbMaxBytes: number;
@@ -27,8 +29,8 @@ export interface AppConfig {
 
 const TOP_KEYS = [
   "dbPath",
+  "vaultPath",
   "allowedScopes",
-  "candidateTtlSec",
   "limits",
   "timeouts",
   "dbMaxBytes",
@@ -37,6 +39,8 @@ const LIMIT_KEYS = [
   "bodyMaxCp",
   "queryMaxCp",
   "tagsMax",
+  "linksMax",
+  "sourceRefsMax",
   "limitDefault",
   "limitMax",
   "snippetMaxCp",
@@ -58,8 +62,6 @@ export function countCp(s: string): number {
 }
 
 function hasControl(s: string): boolean {
-  // NUL, C0/C1 controls, DEL. Newlines are handled per-field by callers;
-  // config scope strings forbid all controls including newline.
   // eslint-disable-next-line no-control-regex
   return /[\u0000-\u001F\u007F-\u009F]/.test(s);
 }
@@ -84,10 +86,11 @@ function checkRange(
 }
 
 /**
- * Strict startup config loader. Only the config file supplies values;
- * env vars and request JSON can never override limits. Unknown fields
- * are rejected. Throws Error("...") on any problem; CLI turns that
- * into a non-zero startup failure with no stdout JSON.
+ * Strict startup config loader (M1). Only the config file supplies values;
+ * env vars and request JSON can never override limits. `vaultPath` (local
+ * Markdown projection target) is REQUIRED: missing/empty is a startup
+ * failure. Unknown fields are rejected. Throws Error("...") on any problem;
+ * CLI turns that into a non-zero startup failure with no stdout JSON.
  */
 export function loadConfig(configPath: string): AppConfig {
   let raw: string;
@@ -110,13 +113,17 @@ export function loadConfig(configPath: string): AppConfig {
       throw new Error(`unknown config field: ${k}`);
     }
   }
-  const { dbPath, allowedScopes, candidateTtlSec, limits, timeouts, dbMaxBytes } =
+  const { dbPath, vaultPath, allowedScopes, limits, timeouts, dbMaxBytes } =
     parsed;
 
   if (typeof dbPath !== "string" || dbPath.length === 0) {
     throw new Error("dbPath must be a non-empty string");
   }
   if (dbPath.includes("\u0000")) throw new Error("dbPath is invalid");
+  if (typeof vaultPath !== "string" || vaultPath.length === 0) {
+    throw new Error("vaultPath must be a non-empty string");
+  }
+  if (vaultPath.includes("\u0000")) throw new Error("vaultPath is invalid");
 
   if (!Array.isArray(allowedScopes) || allowedScopes.length === 0) {
     throw new Error("allowedScopes must be a non-empty array");
@@ -132,9 +139,6 @@ export function loadConfig(configPath: string): AppConfig {
     seen.add(s as string);
   }
 
-  let err = checkRange("candidateTtlSec", candidateTtlSec, 1, 31536000);
-  if (err) throw new Error(err);
-
   if (!isPlainObject(limits)) throw new Error("limits must be an object");
   for (const k of Object.keys(limits)) {
     if (!(LIMIT_KEYS as readonly string[]).includes(k)) {
@@ -146,6 +150,8 @@ export function loadConfig(configPath: string): AppConfig {
     ["bodyMaxCp", 1, 10000],
     ["queryMaxCp", 1, 2000],
     ["tagsMax", 0, 16],
+    ["linksMax", 0, 16],
+    ["sourceRefsMax", 0, 16],
     ["limitDefault", 1, 100],
     ["limitMax", 1, 100],
     ["snippetMaxCp", 1, 1000],
@@ -169,7 +175,7 @@ export function loadConfig(configPath: string): AppConfig {
     }
   }
   const to = timeouts as Record<string, unknown>;
-  err = checkRange("timeouts.cliMs", to["cliMs"], 100, 60000);
+  let err = checkRange("timeouts.cliMs", to["cliMs"], 100, 60000);
   if (err) throw new Error(err);
   err = checkRange("timeouts.busyMs", to["busyMs"], 100, 10000);
   if (err) throw new Error(err);
@@ -179,12 +185,14 @@ export function loadConfig(configPath: string): AppConfig {
 
   return {
     dbPath: dbPath as string,
+    vaultPath: vaultPath as string,
     allowedScopes: allowedScopes as string[],
-    candidateTtlSec: candidateTtlSec as number,
     limits: {
       bodyMaxCp: lim["bodyMaxCp"] as number,
       queryMaxCp: lim["queryMaxCp"] as number,
       tagsMax: lim["tagsMax"] as number,
+      linksMax: lim["linksMax"] as number,
+      sourceRefsMax: lim["sourceRefsMax"] as number,
       limitDefault: limitDefault,
       limitMax: limitMax,
       snippetMaxCp: lim["snippetMaxCp"] as number,
@@ -198,8 +206,21 @@ export function loadConfig(configPath: string): AppConfig {
   };
 }
 
+/** Resolve a config-relative path against the config file directory. */
+export function resolveConfigDirPath(configPath: string, p: string): string {
+  if (path.isAbsolute(p)) return p;
+  return path.resolve(path.dirname(path.resolve(configPath)), p);
+}
+
 /** Resolve dbPath relative to the config file directory. */
 export function resolveDbPath(configPath: string, dbPath: string): string {
-  if (path.isAbsolute(dbPath)) return dbPath;
-  return path.resolve(path.dirname(path.resolve(configPath)), dbPath);
+  return resolveConfigDirPath(configPath, dbPath);
+}
+
+/** Resolve vaultPath relative to the config file directory. */
+export function resolveVaultPath(
+  configPath: string,
+  vaultPath: string,
+): string {
+  return resolveConfigDirPath(configPath, vaultPath);
 }

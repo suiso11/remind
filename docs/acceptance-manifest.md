@@ -1,32 +1,21 @@
-# T6 acceptance manifest A1–A13 + A8b (automated vs manual)
+# M1 受け入れマニフェスト (7 件)
 
-Automated suite: `tests/acceptance.test.ts` (`npm run acceptance` =
-`npm run build && node --test dist/tests/acceptance.test.js`): 14 tests pass
-(A1–A13 + A8b). `npm test`: 88 tests, 87 pass, 1 skipped (real-TTY only).
-Fake adapter under test: `src/fake-adapter.ts` (spawns the compiled CLI,
-no shell, bounded I/O + timeout, fixed error map, current-recall citations
-only). Seeded fake data only; no real user data, no LLM, no network.
+対象: `tests/acceptance.test.ts` (`npm run acceptance`)。自動のみで手動 TTY 工程はない。旧 A1-A13 体系は廃止し、以下 A1-A7 を正とする。
 
-| ID | Plan expectation (§14.11) | Automated test | Existing-suite reference | Manual remainder |
-| --- | --- | --- | --- | --- |
-| A1 | Unapproved candidates never leak into recall | `A1 no leakage of unapproved candidates` | `tests/t3.test.ts` approval-only recall | none |
-| A2 | Approval → recall with fixed order, `recallId + snippet + truncated`; citations structural | `A2 approved recall via CLI+adapter` (+ `isCitationExposed` grant/out-of-exposure check) | `tests/t3.test.ts` recall shape/order | real-TTY `review` display + typed-`yes` `approve` (hand-run, §6 walkthrough) |
-| A3 | Token/immutability binding: every token-bound field tamper is `CONFLICT`, no record; stored body/bodyHash mismatch is `CONFLICT` (stale-hash guard, re-checked in-txn) | `A3 approval immutability binding` (full-field tampers + body/bodyHash SQL-tamper matrix) | `tests/t2.test.ts`, `t2-review-fixes` token binding | real-TTY token transcription (hand-run) |
-| A4 | `expiresAt` → `EXPIRED`, row retained | `A4 expiry` (row still selectable) | `tests/t2.test.ts` TTL/expiry | none |
-| A5 | Same key+params → `deduplicated:true`; changed params → `CONFLICT`; missing key → `BAD_REQUEST` | `A5 idempotency` (store + CLI envelope) | `tests/t2.test.ts` idempotency, `tests/t4.test.ts` replay/`CONFLICT` | none |
-| A6 | Deterministic repeat order; over-input `LIMIT_EXCEEDED` without truncation; bounded `snippet + truncated` | `A6 determinism and bounds` | `tests/t3.test.ts`, `t3-fix` scale/unicode | none |
-| A7 | Correction supersede + archive exclusion from recall | `A7 correction and archive exclusion` | `tests/t4.test.ts` supersede/archive/exclusion | real-TTY `archive` typed-`yes` (hand-run) |
-| A8 | No body/query in audit/exposures/errors; DB-down/startup-nonzero/timeout/malformed/over-budget → memoryless fixed-text fallback; no unaudited success | `A8 audit shrink-wrap and degraded fallback` (audit dump scan + adapter matrix: disabled/missing-config/corrupt-DB/garbage-stdout/over-budget) | `tests/t3.test.ts` audit-absence/rollback, `t4.test.ts` failing-audit rollback, `pr2-deadline-scope` timeout/scope | real timeout observation under load (operator note only) |
-| A8b | Strict adapter envelope/budget hardening (local fixtures only, no network): single-LF-line JSON, exact shape, finite bounds degrade, UTF-8 fatal, SIGKILL deadline | `A8b fake-adapter strictness` (malformed envelopes/budgets degrade memoryless) | `tests/hardening.test.ts` stdin subprocess suite | none |
-| A9 | JSON human ops `FORBIDDEN`; id-scope mismatch `FORBIDDEN_SCOPE`; actor/natural-language never authorizes | `A9 authorization and route separation` | `tests/t2.test.ts` TTY/`FORBIDDEN`, `protocol` envelope | real non-TTY refusal observation (hand-run: piped `approve` → `FORBIDDEN`) |
-| A10 | Competing correction approvals: one winner, loser `CONFLICT` + rollback | `A10 correction race` (sequential) + `tests/t4.test.ts` worker-thread race suite | `tests/t4.test.ts` race-tightening (real shared-DB concurrency) | none beyond the referenced race suite |
-| A11 | Pre-commit retry is fresh; committed replay survives restart/reopen and post-expiry (`deduplicated:true`) | `A11 idempotent rollback and restart` (close/reopen + post-expiry replay) | `tests/t2/t4` idempotent replay, `pr2` unknown-outcome replay | kill-during-commit observation (operator note only; never asserted) |
-| A12 | Cross-scope records never surface; `audit/exposures` scope/`runId`/`recallId` match | `A12 scope exposure isolation` | `tests/t3.test.ts` revoked-scope, `t4` cross-scope | none |
-| A13 | Each over-budget field `LIMIT_EXCEEDED`; emoji/combining input keeps codepoint/UTF-8 boundaries | `A13 overflow and unicode` | `tests/t3-fix.test.ts` surrogate/astral/scale | none |
+| ID | 内容 | 対応する計画受入 (plan.md §9) |
+| --- | --- | --- |
+| A1 | 新規 v2 ストアが残滓なく起動する (`user_version=2`、旧承認痕跡なし) | R12 (単一正本・再構築の前提) |
+| A2 | 旧承認スキーマ DB は起動失敗し、変更・削除・移行しない (退避して新 DB を指定) | R11 (縮退・安全な失敗)、R12 |
+| A3 | `event.append` -> 有効 `sourceRefs` 付き `record.remember` -> 直後の `record.recall/get/list` で内容が現れる。承認待ちなし | R1 (自律即時性)、R4 (raw 下降・snippet のみ)、R10 (有界・決定論)、R8 (source 検証・分離の一部) |
+| A4 | `record.feedback` で露出分のみ計数し、`record.correct` で旧版が `superseded` となり、`record.archive` 後に想起から除外される。行は保持 | R5 (訂正・並行時勝者 1 件)、R6 (アーカイブ除外・非削除)、R8 (露出検証・分離) |
+| A5 | CLI が M1 操作を提供し、旧世代操作 (`candidate.create`、`candidate.get`、`approve`、`review`、`record.correct-request` 等) を `BAD_REQUEST` で拒否する | R2 (承認残滓なし)、R7 (書込系の鍵検証の一部) |
+| A6 | 監査・露出台帳に本文を含まず、超過入力に `LIMIT_EXCEEDED` を返す | R8 (本文非保持の監査)、R10 (予算超過は切詰めなし) |
+| A7 | M2 ベクトル検索と M3 蒸留が存在しないこと (`record.vector-search`、`maintain.distill` 等は `BAD_REQUEST`) | R4 の縮退範囲 (語彙+グラフで動作)、R9・保守は M3 に延期 |
 
-Manual-only (never claimed as done by automation): real-TTY interactive
-confirmation for `review` / `approve` / `reject` / `archive` (actual
-terminal, human-typed `yes`; the suite's `approveCandidate` calls cover
-the domain transition only), plus operator observations (kill-during-commit
-replay, under-load timeout). The single `skip` in `npm test` remains that
-real-TTY confirmation.
+補足:
+
+- R3 (複数リンク・backlink) と R7 (冪等: 同一キー再送は `deduplicated:true`、改変は `CONFLICT`、欠落は `BAD_REQUEST`) は `tests/m1-core.test.ts`・`tests/m1-recall.test.ts`・`tests/m1-hardening.test.ts` と A3-A5 で確認する。
+- R9 (育成・`maintain.distill`) は M3 に延期。M1 の `record.feedback` は引用・採用の計数と露出検証の範囲のみ。
+- R10 の決定論は同一の正本・索引・heat 状態に対する同一順序を指す。書込み・再構築後は変わり得る。
+- R11 の呼出側縮退 (記憶なしの通常応答) と R12 の投影再構築は実装方針として保持し、自動試験の A1-A2・A6 と単体試験で確認する。
+- M2 ベクトル意味検索と M3 `maintain.distill` は未実装であり、受入として主張しない。

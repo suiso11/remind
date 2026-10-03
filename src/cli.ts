@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * memory-cli T1 foundation (hardened).
+ * memory-cli M1 (autonomous, no human gate).
  * Usage: memory-cli --config ./memory.config.json < request.jsonl
  *
  * Protocol: exactly ONE LF-framed stdin request. The first LF (0x0A)
@@ -8,37 +8,27 @@
  * held-open pipe cannot hang it. Bytes already buffered after the first LF
  * that contain non-whitespace make the request BAD_REQUEST (multiline);
  * trailing whitespace-only bytes are ignored. EOF without LF also
- * terminates the single line (backwards compatible). Leading empty lines
- * are skipped. An EOF with zero/non-whitespace-only bytes is "bad input"
- * (stderr, non-zero, no stdout JSON).
+ * terminates the single line. Leading empty lines are skipped. An EOF with
+ * zero/non-whitespace-only bytes is "bad input" (stderr, non-zero, no
+ * stdout JSON).
  *
- * Bounds: raw stdin bytes are capped at 32768 (RAW_MAX_BYTES) *while
- * streaming*, before buffering/parsing. Exceeding bytes => LIMIT_EXCEEDED
- * envelope even with no newline. The overall cliMs deadline from startup
- * config aborts a never-ending stdin => TIMEOUT envelope. The store op then
- * runs on a worker thread bounded by the REMAINING cliMs: the SQLite busy
+ * Bounds: raw stdin bytes are capped at 32768 (RAW_MAX_BYTES) while
+ * streaming, before buffering/parsing. The overall cliMs deadline from
+ * startup config aborts a never-ending stdin => TIMEOUT envelope. The store
+ * op runs on a worker thread bounded by the REMAINING cliMs: the SQLite busy
  * wait is clamped to min(busyMs, remaining) and an independent parent timer
  * answers TIMEOUT on expiry (unknown commit outcome; idempotent replay via
  * the same key + params) followed by whole-process exit. worker.terminate()
- * is best-effort only and is NOT relied upon to unwind worker finally blocks
- * or promptly interrupt native SQLite; the reliable bound is the parent's
- * timely TIMEOUT plus OS process exit (which closes handles; SQLite recovery
- * decides the commit outcome). A same-thread setTimeout
- * alone cannot interrupt synchronous SQLite; the worker boundary plus the
- * parent timer plus process exit is what makes the deadline effective. Line bytes are
- * decoded as UTF-8 with fatal:true; invalid bytes => BAD_REQUEST envelope.
+ * is best-effort only; the reliable bound is the parent's timely TIMEOUT
+ * plus OS process exit (SQLite recovery decides the commit outcome).
  *
- * Final automated JSON uses fs.writeSync(1, line) before intentional exit so
- * the bounded response is not truncated by an async stdout write.
+ * Autonomous ops (all direct-commit, no approval/TTY):
+ *   event.append, record.remember, record.get, record.list,
+ *   record.recall, record.feedback, record.correct, record.archive
  *
- * Errors: startup/config/db/input-path stderr carries FIXED codes only and
- * never echoes argv, config contents, or exception messages. All stdout
- * JSON envelopes pass the responseMaxBytes budget (fail-closed
- * LIMIT_EXCEEDED, never truncated).
- *
- * Human ops (review/approve/reject/archive) require BOTH stdin and stdout
- * to be TTYs plus an interactive `yes` confirmation; JSON `archive` is
- * FORBIDDEN (human path only) and JSON correct-request routes to the store.
+ * Startup: missing vaultPath, unknown config fields, legacy approval-schema
+ * DBs, and unreadable DBs fail with a FIXED stderr line + non-zero exit and
+ * never emit stdout JSON. A legacy DB is never mutated or deleted.
  */
 import { loadConfig } from "./config.js";
 import {
@@ -49,19 +39,18 @@ import {
   validateRequest,
   type ResponseEnvelope,
 } from "./protocol.js";
-import { applyEffectiveBusyTimeout, initDb } from "./db.js";
+import { initDb, isLegacyDbError } from "./db.js";
 import { effectiveBusyMs, runStoreOpWithDeadline } from "./deadline.js";
-import { escapeForTerminal } from "./normalize.js";
 import * as fs from "node:fs";
 import {
-  approveCandidate,
   archiveRecord,
-  correctRequest,
-  createCandidate,
-  getCandidateForReview,
-  getCandidateMeta,
+  correctRecord,
+  eventAppend,
+  feedbackRecords,
+  getRecord,
+  listRecords,
   recallRecords,
-  rejectCandidate,
+  rememberRecord,
 } from "./store.js";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
@@ -70,14 +59,10 @@ import type { AppConfig } from "./config.js";
 const STDERR_ARGS = "error: bad arguments\n";
 const STDERR_CONFIG = "error: invalid config\n";
 const STDERR_DB = "error: store unavailable\n";
+const STDERR_LEGACY =
+  "error: legacy store: back up existing data and configure a new DB file\n";
 const STDERR_INPUT = "error: bad input\n";
 
-/**
- * Reliable final JSON emit for the automated path: fs.writeSync(1, ...) the
- * bounded envelope before the intentional process.exit(). process.stdout.write
- * is async and may truncate when followed by exit(); the sync write keeps the
- * bounded response intact. Never throws (best effort on broken pipes).
- */
 function emitJsonLine(res: ResponseEnvelope): void {
   try {
     fs.writeSync(1, JSON.stringify(res) + "\n");
@@ -104,7 +89,6 @@ function parseArgs(argv: string[]): { configPath: string } {
       process.stderr.write(usage() + "\n");
       process.exit(0);
     } else {
-      // Fixed error: never echo the offending argument value.
       throw new Error("bad arguments");
     }
   }
@@ -131,11 +115,6 @@ function stripTrailingCr(b: Buffer): Buffer {
   return b;
 }
 
-/**
- * Bounded async stdin reader: resolves on the first LF without waiting for
- * EOF, enforces the raw byte cap incrementally, and enforces the deadline
- * even when the pipe is held open with no EOF. Skips leading empty lines.
- */
 export function readFirstLine(
   maxBytes: number,
   timeoutMs: number,
@@ -152,7 +131,6 @@ export function readFirstLine(
       cleanup();
       resolve({ kind: "timeout" });
     }, Math.max(0, timeoutMs));
-    // Ensure the timer alone never keeps the loop alive.
     try {
       (timer as unknown as { unref?: () => void }).unref?.();
     } catch {
@@ -193,7 +171,6 @@ export function readFirstLine(
       resolve(r);
     }
 
-    /** Try to extract the first non-empty line from buffered bytes. */
     function tryExtract(eof: boolean): boolean {
       const buf = buffered();
       const lf = buf.indexOf(0x0a);
@@ -263,7 +240,6 @@ export function readFirstLine(
     }
 
     function onErr(): void {
-      // Stream read failure: fixed input error, no echo.
       finish({ kind: "empty" });
     }
 
@@ -289,64 +265,46 @@ export function decodeLineFatal(rawBytes: Buffer): string | null {
   }
 }
 
-export function handleRawInput(
-  line: string,
-  responseMaxBytes: number,
-): ResponseEnvelope {
-  if (line === "__MULTILINE__") {
-    return applyResponseBudget(fail("BAD_REQUEST"), responseMaxBytes);
-  }
-  const over = checkRawSize(line);
-  if (over) return applyResponseBudget(over, responseMaxBytes);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return applyResponseBudget(fail("BAD_REQUEST"), responseMaxBytes);
-  }
-  const v = validateRequest(parsed);
-  if (!v.ok) return applyResponseBudget(v.res, responseMaxBytes);
-  // Sync pre-check only; the DB-bound routing lives in main() (deadline
-  // worker) and handleValidatedRequest(). Unknown/human ops are refused
-  // here without touching the store.
-  return applyResponseBudget(fail("NOT_IMPLEMENTED"), responseMaxBytes);
-}
-
-/** Route a validated JSON request against an open DB (T2-T4 domain ops). */
+/** Route a validated JSON request against an open DB (M1 domain ops). */
 export function handleValidatedRequest(
   db: DatabaseSync,
   config: AppConfig,
+  configPath: string,
   op: string,
   params: Record<string, unknown>,
   idempotencyKey?: string,
 ): ResponseEnvelope {
-  if (op === "candidate.create") {
-    // Envelope guarantees the key; double-check fail-closed.
-    if (typeof idempotencyKey !== "string") return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
-    return createCandidate(db, config, params, idempotencyKey);
+  const needKey = (v: string | undefined): v is string => typeof v === "string";
+  switch (op) {
+    case "event.append":
+      if (!needKey(idempotencyKey)) return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+      return eventAppend(db, config, params, idempotencyKey);
+    case "record.remember":
+      if (!needKey(idempotencyKey)) return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+      return rememberRecord(db, config, params, idempotencyKey);
+    case "record.get":
+      return getRecord(db, config, params);
+    case "record.list":
+      return listRecords(db, config, params);
+    case "record.recall":
+      return recallRecords(db, config, params);
+    case "record.feedback":
+      if (!needKey(idempotencyKey)) return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+      return feedbackRecords(db, config, params, idempotencyKey);
+    case "record.correct":
+      if (!needKey(idempotencyKey)) return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+      return correctRecord(db, config, params, idempotencyKey);
+    case "record.archive":
+      if (!needKey(idempotencyKey)) return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+      return archiveRecord(db, config, params, idempotencyKey);
+    default:
+      return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
   }
-  if (op === "candidate.get") {
-    return getCandidateMeta(db, config, params);
-  }
-  if (op === "record.recall") {
-    return recallRecords(db, config, params);
-  }
-  if (op === "record.correct-request") {
-    // Envelope guarantees the key; double-check fail-closed. The deadline
-    // worker path (main below) routes here too; this direct call keeps the
-    // domain wired for tests and non-worker use.
-    if (typeof idempotencyKey !== "string") return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
-    return correctRequest(db, config, params, idempotencyKey);
-  }
-  // Human-only archive over JSON stays FORBIDDEN (validateRequest already
-  // rejects it); unknown ops are BAD_REQUEST. Neither is reachable here.
-  return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
 }
 
-/** Post-commit policy: a known committed success (ok:true) is never replaced
- * by TIMEOUT or a DB-close failure. Unknown-outcome cases (process killed
- * before stdout, timeout before commit) keep idempotent replay via the
- * caller's same key + params. Close errors never leak raw text. */
+/** Post-commit policy: a known committed success is never replaced by
+ * TIMEOUT or a DB-close failure. Unknown-outcome cases keep idempotent
+ * replay via the caller's same key + params. */
 export function preserveCommittedResult(
   res: ResponseEnvelope,
   timedOut: boolean,
@@ -359,271 +317,21 @@ export function preserveCommittedResult(
   return res;
 }
 
-/**
- * Terminal-disclosure gate for human ops. BOTH stdin and stdout must be
- * TTYs: stdin alone is not enough, because `review ... > review.log` keeps
- * stdin a TTY while the full candidate body + approval token land in a
- * file/pipe. Explicit booleans keep this unit-testable (stdin true /
- * stdout false must refuse); production passes the real isTTY flags.
- */
-export function isHumanTty(stdinTty: boolean | undefined, stdoutTty: boolean | undefined): boolean {
-  return stdinTty === true && stdoutTty === true;
-}
-
-const HUMAN_SUBCOMMANDS = new Set(["review", "approve", "reject", "archive"]);
-
-function parseHumanArgs(argv: string[]): { sub: string; opts: Record<string, string> } | null {
-  if (argv.length === 0 || !HUMAN_SUBCOMMANDS.has(argv[0] as string)) return null;
-  const sub = argv[0] as string;
-  const opts: Record<string, string> = {};
-  for (let i = 1; i < argv.length; i++) {
-    const a = argv[i];
-    if ((a === "--config" || a === "--id" || a === "--scope" || a === "--token" || a === "--idempotency-key" || a === "--reason-code") && i + 1 < argv.length) {
-      opts[a] = argv[++i] as string;
-    } else {
-      // Unknown flags (including --confirm / --yes) are rejected as
-      // BAD_REQUEST JSON by the caller; never silently accepted.
-      return { sub, opts: { ...opts, __bad: a } };
-    }
-  }
-  return { sub, opts };
-}
-
-function readConfirmLine(timeoutMs: number): Promise<string | null> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let buf = "";
-    const stdin = process.stdin;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(null);
-    }, Math.max(0, timeoutMs));
-    try {
-      (timer as unknown as { unref?: () => void }).unref?.();
-    } catch {
-      /* ignore */
-    }
-    function cleanup(): void {
-      clearTimeout(timer);
-      try {
-        stdin.removeAllListeners("data");
-        stdin.removeAllListeners("end");
-        stdin.removeAllListeners("error");
-      } catch {
-        /* ignore */
-      }
-      try {
-        stdin.pause();
-      } catch {
-        /* ignore */
-      }
-    }
-    function done(v: string | null): void {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(v);
-    }
-    stdin.setEncoding("utf8");
-    stdin.on("data", (d: string) => {
-      buf += d;
-      const lf = buf.indexOf("\n");
-      if (lf >= 0) done(buf.slice(0, lf));
-    });
-    stdin.on("end", () => done(buf));
-    stdin.on("error", () => done(null));
-    try {
-      stdin.resume();
-    } catch {
-      done(null);
-    }
-  });
-}
-
-async function runHuman(
-  sub: string,
-  opts: Record<string, string>,
-  config: AppConfig,
-  db: DatabaseSync,
-  started: number,
-): Promise<void> {
-  const remaining = (): number => config.timeouts.cliMs - (Date.now() - started);
-  const outJson = (res: ResponseEnvelope): void => {
-    const capped = applyResponseBudget(res, config.limits.responseMaxBytes);
-    emitJsonLine(capped);
-  };
-  if (opts["__bad"]) {
-    outJson(fail("BAD_REQUEST"));
-    process.exit(0);
-    return;
-  }
-  const id = opts["--id"];
-  const scope = opts["--scope"];
-  if (!id || !scope) {
-    outJson(fail("BAD_REQUEST"));
-    process.exit(0);
-    return;
-  }
-  // TTY is mandatory on BOTH streams for every human op: no piped
-  // approval, and no file/pipe capture of the review body + approval token
-  // (a stdout redirect keeps stdin a TTY, so stdin alone cannot gate
-  // disclosure). Non-TTY approve/reject/archive get a machine-readable
-  // FORBIDDEN; review gets a fixed stderr + non-zero. No body/token on any
-  // refusal. Archive (T4) additionally requires an interactive `yes` below,
-  // exactly like approve/reject; `--confirm`-style flags were already
-  // rejected above.
-  const stdinTty = !!process.stdin.isTTY;
-  const stdoutTty = !!process.stdout.isTTY;
-  if (!isHumanTty(stdinTty, stdoutTty)) {
-    if (sub === "review") {
-      process.stderr.write("error: human operation requires tty\n");
-      process.exit(2);
-      return;
-    }
-    outJson(fail("FORBIDDEN"));
-    process.exit(0);
-    return;
-  }
-  if (sub === "review") {
-    const r = getCandidateForReview(db, config, id, scope);
-    if (!r.ok) {
-      // Metadata-only failure on stdout would risk confusion with the review
-      // text; use the fixed JSON envelope so callers can branch safely.
-      // (No body is emitted on failure paths.)
-      if (r.code === "FORBIDDEN_SCOPE") outJson(fail("FORBIDDEN_SCOPE"));
-      else if (r.code === "NOT_FOUND") outJson(fail("NOT_FOUND"));
-      else if (r.code === "STORE_UNAVAILABLE") outJson(fail("STORE_UNAVAILABLE"));
-      else outJson(fail("BAD_REQUEST"));
-      process.exit(0);
-      return;
-    }
-    // Explicit TTY review: complete immutable body (escaped) + metadata +
-    // canonical digest. Display only; approval happens via approve + yes.
-    const lines = [
-      `id: ${escapeForTerminal(r.row.id)}`,
-      `status: ${escapeForTerminal(r.row.status)}`,
-      `kind: ${escapeForTerminal(r.row.kind)}`,
-      `scope: ${escapeForTerminal(r.row.scope)}`,
-      `source: ${escapeForTerminal(r.row.source)}`,
-      `observedAt: ${escapeForTerminal(r.row.observedAt)}`,
-      `createdAt: ${escapeForTerminal(r.row.createdAt)}`,
-      `expiresAt: ${escapeForTerminal(r.row.expiresAt)}`,
-      `bodyHash: ${escapeForTerminal(r.row.bodyHash)}`,
-      `supersedes: ${escapeForTerminal(r.row.supersedes ?? "null")}`,
-      `tags: ${escapeForTerminal(JSON.stringify(r.tags))}`,
-      `link: ${escapeForTerminal(r.link ?? "null")}`,
-      `approvalToken: ${r.token}`,
-      `--- body ---`,
-      escapeForTerminal(r.row.body),
-      `--- end ---`,
-    ];
-    process.stdout.write(lines.join("\n") + "\n");
-    process.exit(0);
-    return;
-  }
-  const token = opts["--token"];
-  const key = opts["--idempotency-key"];
-  if (sub === "archive") {
-    // Archive binds no approval token (there is no candidate to display);
-    // it needs the record id + scope (checked above) + caller key +
-    // fixed reason code. JSON `archive` stays FORBIDDEN by the envelope.
-    const reason = opts["--reason-code"];
-    if (!key || !reason) {
-      outJson(fail("BAD_REQUEST"));
-      process.exit(0);
-      return;
-    }
-  } else if (!token || !key) {
-    outJson(fail("BAD_REQUEST"));
-    process.exit(0);
-    return;
-  }
-  // Interactive confirmation from the real TTY; --confirm-style flags were
-  // already rejected above and natural-language text is never accepted.
-  try {
-    process.stderr.write("confirm: type yes to continue\n");
-  } catch {
-    /* ignore */
-  }
-  const answer = await readConfirmLine(remaining());
-  if (answer === null || answer.trim() !== "yes") {
-    outJson(fail("BAD_REQUEST"));
-    process.exit(0);
-    return;
-  }
-  if (Date.now() - started > config.timeouts.cliMs) {
-    outJson(fail("TIMEOUT"));
-    process.exit(0);
-    return;
-  }
-  if (sub === "approve") {
-    outJson(approveCandidate(db, config, { id, scope, token: token as string, idempotencyKey: key as string }));
-    process.exit(0);
-    return;
-  }
-  if (sub === "archive") {
-    outJson(archiveRecord(db, config, { id, scope, idempotencyKey: key as string, reasonCode: opts["--reason-code"] as string }));
-    process.exit(0);
-    return;
-  }
-  // reject
-  const reason = opts["--reason-code"];
-  if (!reason) {
-    outJson(fail("BAD_REQUEST"));
-    process.exit(0);
-    return;
-  }
-  outJson(rejectCandidate(db, config, { id, scope, token: token as string, idempotencyKey: key as string, reasonCode: reason }));
-  process.exit(0);
-}
+const STORE_OPS = new Set([
+  "event.append",
+  "record.remember",
+  "record.get",
+  "record.list",
+  "record.recall",
+  "record.feedback",
+  "record.correct",
+  "record.archive",
+]);
 
 async function main(): Promise<void> {
   const started = Date.now();
   const rawArgv = process.argv.slice(2);
-  // Human terminal path branches before any stdin read.
-  const human = parseHumanArgs(rawArgv);
   let configPath: string;
-  if (human) {
-    const cp = human.opts["--config"];
-    if (!cp) {
-      // Missing --config on the human path is a startup failure (no stdout).
-      process.stderr.write(STDERR_ARGS);
-      process.exit(2);
-      return;
-    }
-    configPath = cp;
-    let hConfig;
-    try {
-      hConfig = loadConfig(configPath);
-    } catch {
-      process.stderr.write(STDERR_CONFIG);
-      process.exit(2);
-      return;
-    }
-    let hDb: DatabaseSync | null = null;
-    try {
-      const hEff = effectiveBusyMs(hConfig.timeouts.busyMs, hConfig.timeouts.cliMs);
-      hDb = initDb(hConfig, configPath, hEff).db as unknown as DatabaseSync;
-      // Bound interactive lock waits by the overall deadline too.
-      applyEffectiveBusyTimeout(hDb, hConfig.timeouts.busyMs, hConfig.timeouts.cliMs);
-    } catch {
-      process.stderr.write(STDERR_DB);
-      process.exit(3);
-      return;
-    }
-    try {
-      await runHuman(human.sub, human.opts, hConfig, hDb, started);
-    } finally {
-      try {
-        hDb.close();
-      } catch {
-        /* ignore */
-      }
-    }
-    return;
-  }
   try {
     configPath = parseArgs(rawArgv).configPath;
   } catch {
@@ -642,19 +350,18 @@ async function main(): Promise<void> {
   const elapsed = (): number => Date.now() - started;
   const remaining = (): number => config.timeouts.cliMs - elapsed();
   let db: { close(): void } | null = null;
-  let rawDb: DatabaseSync | null = null;
   let dbFile = "";
   try {
     const startupEff = effectiveBusyMs(config.timeouts.busyMs, remaining());
     const opened = initDb(config, configPath, startupEff);
     db = opened.db;
-    rawDb = opened.db as unknown as DatabaseSync;
     dbFile = opened.dbFile;
   } catch (e) {
-    // P1: initDb DDL also contends on the write lock. With the clamped
-    // busy wait it fails fast; lock contention answers a bounded envelope
-    // (never a late OK, never an unbounded 5000ms block), while genuine
-    // startup failures keep the fixed stderr + non-zero exit contract.
+    if (isLegacyDbError(e)) {
+      process.stderr.write(STDERR_LEGACY);
+      process.exit(3);
+      return;
+    }
     const msg = e instanceof Error ? e.message : String(e);
     if (/busy|locked|timeout/i.test(msg)) {
       const timedOut = Date.now() - started > config.timeouts.cliMs;
@@ -679,23 +386,16 @@ async function main(): Promise<void> {
     }
   };
 
-  // Bounded stdin read with the real remaining deadline.
   const stdinRes = await readFirstLine(RAW_MAX_BYTES, remaining());
   if (stdinRes.kind === "timeout" || elapsed() > config.timeouts.cliMs) {
-    const res = applyResponseBudget(
-      fail("TIMEOUT"),
-      config.limits.responseMaxBytes,
-    );
+    const res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
     closeDb();
     emitJsonLine(res);
     process.exit(0);
     return;
   }
   if (stdinRes.kind === "overflow") {
-    const res = applyResponseBudget(
-      fail("LIMIT_EXCEEDED"),
-      config.limits.responseMaxBytes,
-    );
+    const res = applyResponseBudget(fail("LIMIT_EXCEEDED"), config.limits.responseMaxBytes);
     closeDb();
     emitJsonLine(res);
     process.exit(0);
@@ -710,19 +410,11 @@ async function main(): Promise<void> {
 
   let res: ResponseEnvelope = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
   if (stdinRes.trailingNonEmpty) {
-    // Sensible multiline handling: more than one non-empty LF-framed line
-    // already buffered is a business error, without waiting for EOF.
-    res = applyResponseBudget(
-      fail("BAD_REQUEST"),
-      config.limits.responseMaxBytes,
-    );
+    res = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
   } else {
     const line = decodeLineFatal(stdinRes.rawBytes);
     if (line === null) {
-      res = applyResponseBudget(
-        fail("BAD_REQUEST"),
-        config.limits.responseMaxBytes,
-      );
+      res = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
     } else if (line.trim().length === 0) {
       process.stderr.write(STDERR_INPUT);
       closeDb();
@@ -744,34 +436,20 @@ async function main(): Promise<void> {
           const v = validateRequest(parsed);
           if (!v.ok) {
             res = applyResponseBudget(v.res, config.limits.responseMaxBytes);
-          } else if (rawDb && (v.req.op === "candidate.create" || v.req.op === "candidate.get" || v.req.op === "record.recall" || v.req.op === "record.correct-request")) {
-            // P1: effective remaining deadline. The parent's remaining cliMs
-            // bounds BOTH the SQLite busy wait (effectiveBusyMs clamp, so a
-            // busyMs > cliMs config cannot block past the deadline) AND the
-            // whole op via a worker thread with an independent parent timer
-            // followed by whole-process exit. worker.terminate() is
-            // best-effort only (no reliable finally unwind / native-SQLite
-            // interruption promised); a same-thread setTimeout could not
-            // interrupt synchronous SQLite. A timed-out op has UNKNOWN commit
-            // outcome (OS exit closes handles; SQLite recovery decides):
-            // answer TIMEOUT and let the caller replay with the same
-            // idempotency key + params. Worker construction/error/exit
-            // without a message answers STORE_UNAVAILABLE immediately.
+          } else if (STORE_OPS.has(v.req.op)) {
             const opRemaining = remaining();
             if (opRemaining <= 0) {
               res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
             } else {
-              // Release the parent handle so the worker is the only
-              // connection; then run bounded.
               closeDb();
               db = null;
-              rawDb = null;
               const eff = effectiveBusyMs(config.timeouts.busyMs, opRemaining);
               try {
                 const outcome = await runStoreOpWithDeadline(
                   {
                     dbFile,
                     config,
+                    configPath,
                     op: v.req.op,
                     params: v.req.params,
                     idempotencyKey: v.req.idempotencyKey,
@@ -789,9 +467,6 @@ async function main(): Promise<void> {
               }
             }
           } else {
-            // Human-only ops (archive/approve/reject) never reach here:
-            // validateRequest already answers FORBIDDEN. Anything else is
-            // an unknown op (BAD_REQUEST), never a silent success.
             res = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
           }
         }
@@ -804,8 +479,6 @@ async function main(): Promise<void> {
   try {
     db?.close();
   } catch {
-    // Fixed code only; never leaks the raw close error, and never
-    // replaces a known committed success below.
     closeFailed = true;
   }
   res = preserveCommittedResult(res, timedOut, closeFailed, config.limits.responseMaxBytes);
@@ -813,12 +486,12 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-// Entry guard: importing this module from tests must not run main().
-// Only the real CLI entry (argv[1] is cli.js) executes.
 function isCliEntry(): boolean {
   try {
-    return (process.argv[1] ?? "").replace(/\\/g, "/").endsWith("src/cli.js") ||
-      (process.argv[1] ?? "").replace(/\\/g, "/").endsWith("dist/src/cli.js");
+    return (
+      (process.argv[1] ?? "").replace(/\\/g, "/").endsWith("src/cli.js") ||
+      (process.argv[1] ?? "").replace(/\\/g, "/").endsWith("dist/src/cli.js")
+    );
   } catch {
     return false;
   }
