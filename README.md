@@ -83,7 +83,7 @@ npm run smoke    # 一時 DB での event.append -> remember -> recall 確認
 npm run acceptance  # M1 受け入れ 7 件
 ```
 
-書き込み永続化失敗時の巻き戻しは `tests/m1-rollback.test.ts` で確認する (audit/operations の INSERT 拒否で 5 操作とも `STORE_UNAVAILABLE`・正本不変・再送で 1 件のみ確定)。 投影キューの耐久回復は `tests/r07-projection-recovery.test.ts` (3 件: close+reopen 永続・rename 失敗時の最終 Markdown 保持・削除/破損からの完全再構築)、実子プロセス CLI の境界・リプレイは `tests/r08-cli-boundary-replay.test.ts` (7 件: 先行 LF/EOF・多行・保持 TIMEOUT・不正 UTF-8・32768 境界・SQLite ロック時の同キー再送単一確定) で確認する。全 73 件が Linux ローカルで成功、smoke も一時 DB/実 CLI で成功。
+書き込み永続化失敗時の巻き戻しは `tests/m1-rollback.test.ts` で確認する (audit/operations の INSERT 拒否で 5 操作とも `STORE_UNAVAILABLE`・正本不変・再送で 1 件のみ確定)。 投影キューの耐久回復は `tests/r07-projection-recovery.test.ts` (3 件: close+reopen 永続 + 独立 future 行不変/分離回復・同一宛先 regular 最終 Markdown への実 rename 段階 primitive fault 保持/再 drain 復元・recall+feedback populated な 8 列 exposures/usage/heat を含む完全再構築 + exposure 有効/二重 heat なし)、実子プロセス CLI の境界・リプレイは `tests/r08-cli-boundary-replay.test.ts` (7 件: 先行 LF/EOF・多行・保持 TIMEOUT・不正 UTF-8・32768 境界・SQLite ロック時の同キー再送単一確定) で確認する。全 73 件が Linux ローカルで成功、smoke も一時 DB/実 CLI で成功。
 
 受け入れ条件は `docs/acceptance-manifest.md`、保持方針は `docs/retention.md` を参照。
 

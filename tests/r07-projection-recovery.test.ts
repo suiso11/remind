@@ -8,12 +8,19 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
-import { eventAppend, rememberRecord, correctRecord } from "../src/store.js";
+import {
+  archiveRecord,
+  eventAppend,
+  feedbackRecords,
+  recallRecords,
+  rememberRecord,
+} from "../src/store.js";
 import {
   drainProjection,
   projectOneRecord,
@@ -102,6 +109,12 @@ function queueRows(db: DatabaseSync): string[] {
   ).map((r) => r.recordId);
 }
 
+function queueMeta(db: DatabaseSync, id: string): { attempts: number; nextAt: string } | undefined {
+  return db
+    .prepare("SELECT attempts, nextAt FROM projection_queue WHERE recordId = ?")
+    .get(id) as { attempts: number; nextAt: string } | undefined;
+}
+
 function forceDue(db: DatabaseSync, id: string): void {
   db.prepare("UPDATE projection_queue SET nextAt=? WHERE recordId=?").run(PAST, id);
 }
@@ -112,8 +125,15 @@ function expectedMarkdown(db: DatabaseSync, id: string): string {
   return renderMarkdown(rec, readBacklinks(db, id, rec.scope));
 }
 
-describe("R07 queue persists across close+reopen; links/backlinks only on success", () => {
-  it("failed queue survives reopen and drains with restored links/backlinks", () => {
+function heatOf(db: DatabaseSync, id: string): number {
+  const row = db.prepare("SELECT usedCount FROM note_heat WHERE recordId = ?").get(id) as
+    | { usedCount: number }
+    | undefined;
+  return row?.usedCount ?? 0;
+}
+
+describe("R07 queue persists across close+reopen; future retry row untouched then recovers", () => {
+  it("failed queue survives reopen; one future row stays intact while other drains, then recovers", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r07-persist-"));
     let db: DatabaseSync | null = null;
     try {
@@ -128,7 +148,7 @@ describe("R07 queue persists across close+reopen; links/backlinks only on succes
       });
       assert.deepEqual(queueRows(db), [a, b].sort());
       // Fail the drain against a real non-directory vault target: nothing is
-      // written, rows survive, canonical memory stays intact.
+      // written, rows survive with backoff, canonical memory stays intact.
       const blocker = path.join(dir, "blocker-file");
       fs.writeFileSync(blocker, "not a dir", "utf8");
       const broken = { ...config, vaultPath: blocker };
@@ -144,12 +164,25 @@ describe("R07 queue persists across close+reopen; links/backlinks only on succes
       ({ db } = initDb(config, configPath));
       if (db === null) throw new Error("db init failed");
       assert.deepEqual(queueRows(db), [a, b].sort());
-      for (const id of [a, b]) forceDue(db, id);
+      // Keep b as an independent future retry row; only a is due.
+      forceDue(db, a);
+      const bMetaBefore = queueMeta(db, b);
+      assert.ok(bMetaBefore, "future retry row missing");
+      assert.ok((bMetaBefore as { nextAt: string }).nextAt > new Date().toISOString());
+      const partial = drainProjection(db, config, configPath);
+      assert.equal(partial.failed, 0, JSON.stringify(partial));
+      assert.equal(partial.projected, 1, JSON.stringify(partial));
+      // Future row metadata is byte-identical, no markdown was written for it.
+      assert.deepEqual(queueMeta(db, b), bMetaBefore);
+      assert.deepEqual(queueRows(db), [b]);
+      assert.ok(!fs.existsSync(path.join(config.vaultPath, b + ".md")));
+      assert.equal(fs.readFileSync(path.join(config.vaultPath, a + ".md"), "utf8"), expectedMarkdown(db, a));
+      // Now make the future row due separately: eventual recovery, no sleeps.
+      forceDue(db, b);
       const done = drainProjection(db, config, configPath);
       assert.equal(done.failed, 0, JSON.stringify(done));
-      assert.ok(done.projected >= 2, JSON.stringify(done));
+      assert.ok(done.projected >= 1, JSON.stringify(done));
       assert.deepEqual(queueRows(db), []);
-      // Links/backlinks are restored only by this successful dequeue.
       const fileA = path.join(config.vaultPath, a + ".md");
       const fileB = path.join(config.vaultPath, b + ".md");
       assert.ok(fs.existsSync(fileA) && fs.existsSync(fileB));
@@ -169,10 +202,14 @@ describe("R07 queue persists across close+reopen; links/backlinks only on succes
   });
 });
 
-describe("R07 rename failure preserves final markdown without partial overwrite", () => {
-  it("real rename-stage failure keeps sentinel, then re-drain restores", () => {
+describe("R07 rename-stage fault preserves SAME regular final markdown", () => {
+  it("primitive fs.renameSync fault at exact dest keeps old bytes, retry renders canonical", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r07-rename-"));
     let db: DatabaseSync | null = null;
+    // Patch the live underlying node:fs export (not the frozen import-star
+    // view): projection.js reads the same live binding via its getter.
+    const rawFs = createRequire(__filename)("node:fs") as typeof fs;
+    const origRename = rawFs.renameSync;
     try {
       const { config, configPath } = makeConfig(dir);
       ({ db } = initDb(config, configPath));
@@ -180,53 +217,59 @@ describe("R07 rename failure preserves final markdown without partial overwrite"
       const id = seedRecord(db, config, "r07 rename guard memo", "rename-1");
       assert.equal(drainProjection(db, config, configPath).failed, 0);
       const finalPath = path.join(config.vaultPath, id + ".md");
-      const v1 = fs.readFileSync(finalPath, "utf8");
-      assert.ok(v1.includes("r07 rename guard memo"));
-      // Queue a corrected revision, then sabotage its final path as a
-      // non-empty directory: temp+rename hits a real rename-stage failure.
-      seedRaw(db, config, "r07-rename-raw-2");
-      const corr = correctRecord(
+      assert.ok(fs.statSync(finalPath).isFile(), "prior final must be a regular file");
+      const oldBytes = fs.readFileSync(finalPath, "utf8");
+      assert.ok(oldBytes.includes("r07 rename guard memo"));
+      // Real status change on the SAME destination: archiving re-enqueues id.
+      const arc = archiveRecord(
         db,
         config,
-        {
-          recordId: id,
-          body: "r07 rename guard memo revised",
-          kind: "correction",
-          provenance: { source: "session:s1:turn:9", observedAt: OBS },
-          scope: SCOPE,
-          sourceRefs: ["r07-rename-raw-2"],
-        },
-        "r07-rename-corr-1",
+        { id, scope: SCOPE, reasonCode: "USER_ARCHIVED" },
+        "r07-rename-arc-1",
       );
-      assert.equal(corr.ok, true, JSON.stringify(corr));
-      const newId = (corr.data as { record: { id: string } }).record.id;
-      const newFinal = path.join(config.vaultPath, newId + ".md");
-      fs.mkdirSync(newFinal, { recursive: true });
-      const sentinel = path.join(newFinal, "sentinel.txt");
-      fs.writeFileSync(sentinel, "prior-final-guard", "utf8");
+      assert.equal(arc.ok, true, JSON.stringify(arc));
+      assert.ok(queueRows(db).includes(id));
+      const tmpPath = path.join(config.vaultPath, `.${id}.${process.pid}.tmp`);
+      try {
+        fs.rmSync(tmpPath, { force: true });
+      } catch {
+        /* ignore */
+      }
+      // Scoped primitive fault: tmp write proceeds, only the exact-dest
+      // rename throws. Platform-independent (no dir-vs-file OS semantics).
+      rawFs.renameSync = ((tmp: fs.PathLike, dest: fs.PathLike): void => {
+        if (String(dest) === finalPath) {
+          assert.ok(fs.existsSync(tmp as string), "tmp must exist before rename-stage fault");
+          throw new Error("injected rename-stage fault at exact dest");
+        }
+        (origRename as (a: fs.PathLike, b: fs.PathLike) => void)(tmp, dest);
+      }) as typeof rawFs.renameSync;
       const out = drainProjection(db, config, configPath);
       assert.ok(out.failed >= 1, JSON.stringify(out));
-      // No partial overwrite: directory + sentinel survive, queue retained,
-      // and the prior revision file is intact.
-      assert.ok(fs.statSync(newFinal).isDirectory());
-      assert.equal(fs.readFileSync(sentinel, "utf8"), "prior-final-guard");
-      assert.ok(queueRows(db).includes(newId));
-      // The prior revision re-rendered atomically to its canonical
-      // superseded state: a complete render, never a partial overwrite.
-      assert.equal(fs.readFileSync(finalPath, "utf8"), expectedMarkdown(db, id));
-      // Remove sabotage, clear stale tmp files, force due, re-drain.
-      fs.rmSync(newFinal, { recursive: true, force: true });
-      for (const f of fs.readdirSync(config.vaultPath)) {
-        if (f.endsWith(".tmp")) fs.rmSync(path.join(config.vaultPath, f), { force: true });
-      }
-      forceDue(db, newId);
+      assert.ok(queueRows(db).includes(id));
+      // SAME regular file preserved byte-for-byte; no partial overwrite.
+      assert.ok(fs.statSync(finalPath).isFile());
+      assert.equal(fs.readFileSync(finalPath, "utf8"), oldBytes);
+      assert.ok(fs.existsSync(tmpPath), "tmp write must have happened before fault");
+      rawFs.renameSync = origRename;
+      // Force the retained row due and retry with the real primitive.
+      forceDue(db, id);
       const done = drainProjection(db, config, configPath);
       assert.equal(done.failed, 0, JSON.stringify(done));
-      assert.ok(!queueRows(db).includes(newId));
-      assert.equal(fs.readFileSync(newFinal, "utf8"), expectedMarkdown(db, newId));
-      assert.ok(fs.readFileSync(newFinal, "utf8").includes("r07 rename guard memo revised"));
+      assert.deepEqual(queueRows(db), []);
+      // New canonical render (archived status) replaced the preserved bytes.
+      assert.ok(fs.statSync(finalPath).isFile());
+      assert.equal(fs.readFileSync(finalPath, "utf8"), expectedMarkdown(db, id));
+      assert.ok(fs.readFileSync(finalPath, "utf8").includes("r07 rename guard memo"));
+      assert.ok(fs.readFileSync(finalPath, "utf8").includes("archived"));
+      assert.notEqual(fs.readFileSync(finalPath, "utf8"), oldBytes);
       projectOneRecord(db, config.vaultPath, "rec_does_not_exist_r07");
     } finally {
+      try {
+        rawFs.renameSync = origRename;
+      } catch {
+        /* ignore */
+      }
       try {
         db?.close();
       } catch {
@@ -237,8 +280,8 @@ describe("R07 rename failure preserves final markdown without partial overwrite"
   });
 });
 
-describe("R07 rebuild restores full canonical content; canonical rows invariant", () => {
-  it("deleted/corrupted vault rebuilds exactly; full row contents unchanged", () => {
+describe("R07 rebuild restores full canonical content with populated ledgers invariant", () => {
+  it("recall+feedback ledgers survive derived delete/corrupt+rebuild; exposure stays valid without double heat", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r07-rebuild-"));
     let db: DatabaseSync | null = null;
     try {
@@ -268,6 +311,17 @@ describe("R07 rebuild restores full canonical content; canonical rows invariant"
       assert.equal(cRes.ok, true, JSON.stringify(cRes));
       const c = (cRes.data as { record: { id: string } }).record.id;
       assert.equal(drainProjection(db, config, configPath).failed, 0);
+      // Populate exposures/usage/heat with real recall+feedback BEFORE the snapshot.
+      const rec = recallRecords(db, config, { query: "r07 rebuild", scope: SCOPE, limit: 10 });
+      assert.equal(rec.ok, true, JSON.stringify(rec));
+      const recallId = (rec.data as { recallId: string }).recallId;
+      const exposed = ((rec.data as { items: Array<{ id: string }> }).items ?? []).map((i) => i.id);
+      assert.ok(exposed.includes(a) && exposed.includes(b), "recall must expose a+b: " + JSON.stringify(exposed));
+      const fb = feedbackRecords(db, config, { recallId, recordIds: [a, b], scope: SCOPE }, "r07-rebuild-fb-1");
+      assert.equal(fb.ok, true, JSON.stringify(fb));
+      assert.equal((fb.data as { feedback: { counted: number } }).feedback.counted, 2);
+      assert.equal(heatOf(db, a), 1);
+      assert.equal(heatOf(db, b), 1);
       const theDb = db as DatabaseSync;
       const dumpCanonical = (): Record<string, unknown> => {
         const dump = (sql: string): unknown[] => theDb.prepare(sql).all() as unknown[];
@@ -279,12 +333,15 @@ describe("R07 rebuild restores full canonical content; canonical rows invariant"
           record_source_refs: dump("SELECT recordId, eventId FROM record_source_refs ORDER BY recordId ASC, eventId ASC"),
           operations: dump("SELECT idempotencyKey, op, requestHash, responseJson, createdAt FROM operations ORDER BY idempotencyKey ASC"),
           audit: dump("SELECT ts, op, targetId, code, scope, bytes, limitN, runId, recallId, reasonCode FROM audit ORDER BY rowid ASC"),
-          usage: dump("SELECT ts, recallId, recordId, scope, runId FROM usage ORDER BY rowid ASC"),
+          exposures: dump("SELECT ts, recallId, runId, scope, recordId, snippetBytes, truncated, limitN FROM exposures ORDER BY recallId ASC, recordId ASC"),
+          usage: dump("SELECT ts, recallId, recordId, scope, runId FROM usage ORDER BY recallId ASC, recordId ASC"),
           note_heat: dump("SELECT recordId, usedCount, lastUsedAt FROM note_heat ORDER BY recordId ASC"),
           scopes: dump("SELECT scope FROM scopes ORDER BY scope ASC"),
         };
       };
       const before = dumpCanonical();
+      assert.ok((before["exposures"] as unknown[]).length >= 2, "exposures must be populated");
+      assert.ok((before["usage"] as unknown[]).length === 2, "usage must have 2 rows");
       const expected = new Map<string, string>([
         [a, expectedMarkdown(theDb, a)],
         [b, expectedMarkdown(theDb, b)],
@@ -296,7 +353,8 @@ describe("R07 rebuild restores full canonical content; canonical rows invariant"
       fs.rmSync(path.join(config.vaultPath, c + ".md"));
       const n = rebuildVault(theDb, config, configPath);
       assert.ok(n >= 3, "rebuild count " + n);
-      // Full canonical row contents (not counts) are invariant. Derived
+      // Full canonical row contents (not counts) are invariant, including the
+      // populated 8-column exposures, usage, and heat. Derived
       // projection_queue/fts/char-bigram state is excluded from comparison.
       assert.deepEqual(dumpCanonical(), before);
       for (const [rid, md] of expected) {
@@ -304,6 +362,15 @@ describe("R07 rebuild restores full canonical content; canonical rows invariant"
       }
       assert.ok(fs.readFileSync(path.join(config.vaultPath, b + ".md"), "utf8").includes("[[" + a + "]]"));
       assert.ok(fs.readFileSync(path.join(config.vaultPath, a + ".md"), "utf8").includes("[[" + b + "]]"));
+      // Existing exposure is still valid but does not double-heat the same recall.
+      const heatA = heatOf(theDb, a);
+      const heatB = heatOf(theDb, b);
+      const usageN = (theDb.prepare("SELECT COUNT(*) AS n FROM usage").get() as { n: number }).n;
+      const fb2 = feedbackRecords(theDb, config, { recallId, recordIds: [a, b], scope: SCOPE }, "r07-rebuild-fb-2");
+      assert.equal(fb2.ok, true, JSON.stringify(fb2));
+      assert.equal(heatOf(theDb, a), heatA);
+      assert.equal(heatOf(theDb, b), heatB);
+      assert.equal((theDb.prepare("SELECT COUNT(*) AS n FROM usage").get() as { n: number }).n, usageN);
     } finally {
       try {
         db?.close();
