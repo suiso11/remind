@@ -12,7 +12,7 @@
   },
   "packageManager": "npm@11.6.2",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && chmod +x dist/src/cli.js",
     "test": "npm run clean && npm run build && node --test dist/tests/*.test.js",
     "smoke": "npm run build && node dist/scripts/smoke.js",
     "acceptance": "npm run clean && npm run build && node --test dist/tests/acceptance.test.js",
