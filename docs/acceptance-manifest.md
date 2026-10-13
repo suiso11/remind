@@ -19,3 +19,4 @@
 - R10 の決定論は同一の正本・索引・heat 状態に対する同一順序を指す。書込み・再構築後は変わり得る。
 - R11 の呼出側縮退 (記憶なしの通常応答) と R12 の投影再構築は実装方針として保持し、自動試験の A1-A2・A6 と単体試験で確認する。
 - M2 ベクトル意味検索と M3 `maintain.distill` は未実装であり、受入として主張しない。
+- 書込み永続化失敗時の巻戻しは `tests/m1-rollback.test.ts` で確認する。audit/operations の INSERT 拒否で 5 操作 (`event.append`・`remember`・`feedback`・`correct`・`archive`) とも `STORE_UNAVAILABLE`・正本/heat/usage/links/sourceRefs/status 不変・operations/成功 audit 残留なし、解除後の再送で 1 件のみ確定する。DB・vault は temp 配下のみで終了時に除去する。A4 の逐次 lifecycle coverage と区別し、R05 全項目や M2/M3 の完了を主張しない。

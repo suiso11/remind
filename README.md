@@ -83,6 +83,8 @@ npm run smoke    # 一時 DB での event.append -> remember -> recall 確認
 npm run acceptance  # M1 受け入れ 7 件
 ```
 
+書き込み永続化失敗時の巻き戻しは `tests/m1-rollback.test.ts` で確認する (audit/operations の INSERT 拒否で 5 操作とも `STORE_UNAVAILABLE`・正本不変・再送で 1 件のみ確定)。
+
 受け入れ条件は `docs/acceptance-manifest.md`、保持方針は `docs/retention.md` を参照。
 
 ## 未実装の明示
