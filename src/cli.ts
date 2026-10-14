@@ -486,15 +486,4 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-function isCliEntry(): boolean {
-  try {
-    return (
-      (process.argv[1] ?? "").replace(/\\/g, "/").endsWith("src/cli.js") ||
-      (process.argv[1] ?? "").replace(/\\/g, "/").endsWith("dist/src/cli.js")
-    );
-  } catch {
-    return false;
-  }
-}
-
-if (isCliEntry()) void main();
+if (require.main === module) void main();

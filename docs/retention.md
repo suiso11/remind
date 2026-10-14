@@ -5,7 +5,7 @@
 - `raw_events` は不変の追記のみ。更新・削除はない。
 - `records` は `active / superseded / archived` の行をすべて保持する。`record.correct` は新 revision 追記 + 旧版 `superseded`、`record.archive` は検索除外フラグであり、いずれも物理削除ではない。
 - 削除 (消去) API とエクスポート API はない。SQLite ファイルの削除や `VACUUM` を消去保証として主張しない。保持期間・削除可否の方針決定は将来課題とする。
-- 台帳 (`operations / audit / exposures / usage / note_heat`) は運用に必要な範囲で保持する。`exposures` は上限 1000 件で古い行から刈り込む。監査の失敗は操作全体を巻き戻す (監査なしの成功を作らない)。
+- 台帳 (`operations / audit / exposures / usage / note_heat`) は運用に必要な範囲で保持する。`exposures` は上限 1000 件で古い行から刈り込む。刈り込み失敗は `record.recall` 全体を `STORE_UNAVAILABLE` で巻き戻し、上限超過の成功を作らない (新規露出+監査の原子性)。監査の失敗は操作全体を巻き戻す (監査なしの成功を作らない)。
 
 ## 容量上限
 
