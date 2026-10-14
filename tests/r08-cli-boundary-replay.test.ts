@@ -24,6 +24,26 @@
  *   boundary. It asserts the real worker BEGIN marker (positive worker
  *   threadId), the bounded parent TIMEOUT + process exit with the lock held,
  *   and exactly one canonical effect after same-key retry + dedup replay.
+ *
+ * Discriminating deadline proof: parent-measured spawn-to-response mixes in
+ * unbounded node bootstrap + parent poll scheduling, so its cliMs + 4000
+ * bound alone could mask a hardcoded 5000 default under a 2500 config. The
+ * real proof is the child observer's clock: the preload records Date.now()
+ * once at load (actual CLI start, ahead of initDb/ready/request) and stamps
+ * the real stdout write + process.exit pass-through (natives returned
+ * unchanged). Response/start and exit/start on that clock must land within
+ * cliMs + 1000: same-process timer-to-write scheduling jitter is tens of
+ * ms, so 1000 is generous, yet 2500 + 1000 = 3500 << 5000 rejects an ignored
+ * configured budget. The startup budget is measured from actual CLI start,
+ * never reset at ready/request. The 15s watchdog survives only as failure
+ * cleanup, never as proof.
+ *
+ * Fault vs recovery budgets (contract, not a timeout raise): the fault phase
+ * keeps the STRICT 2500/10000 injection profile; recovery replays the SAME
+ * DB file/scope/EXACT key+params under the existing STANDARD profile
+ * (makeConfig defaults 5000/2000 = shipped example). Config is not the
+ * idempotency hash (key+params are); a caller retries unknown-outcome
+ * TIMEOUTs under the normal budget. Production policy is untouched.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -41,6 +61,8 @@ const OBS = "2026-09-01T00:00:00.000Z";
 const SCOPE = "personal/default";
 /** Explicit bounded CI startup/scheduling allowance for deadline asserts. */
 const ALLOW_MS = 4000;
+/** Tight child-clock allowance: same-process scheduling only (see header). */
+const CHILD_ALLOW_MS = 1000;
 /** Long watchdog used ONLY for failure cleanup waits, never as proof. */
 const WATCHDOG_MS = 15000;
 
@@ -592,6 +614,9 @@ describe("R08 genuine SQLite lock fails closed; same-key retry effects exactly o
       seedDb = null;
       const readyFile = path.join(dir, "r08-child-ready");
       const workerFile = path.join(dir, "r08-worker-begin");
+      const childStartFile = path.join(dir, "r08-child-start");
+      const childResponseFile = path.join(dir, "r08-child-response");
+      const childExitFile = path.join(dir, "r08-child-exit");
       const t0 = Date.now();
       const child = scope.spawn(
         process.execPath,
@@ -649,6 +674,30 @@ describe("R08 genuine SQLite lock fails closed; same-key retry effects exactly o
       assert.equal(nonEmptyLines(stdout).length, 1);
       assert.ok(exitElapsed <= cliMs + ALLOW_MS, `exit took ${exitElapsed}ms, beyond ${cliMs}ms + ${ALLOW_MS}ms allowance`);
       assert.ok(exitElapsed >= cliMs - 250, `exit took ${exitElapsed}ms, before the ${cliMs}ms deadline could fire`);
+      // Discriminating proof on the CHILD clock (actual CLI start through
+      // real stdout write + process exit, no parent scheduling mixed in).
+      const rSeen = await waitFor(() => fs.existsSync(childResponseFile), WATCHDOG_MS);
+      assert.equal(rSeen, true, "child observer never stamped the real stdout response");
+      const xSeen = await waitFor(() => fs.existsSync(childExitFile), WATCHDOG_MS);
+      assert.equal(xSeen, true, "child observer never stamped process exit");
+      const childStart = Number(fs.readFileSync(childStartFile, "utf8").trim());
+      const childResponse = Number(fs.readFileSync(childResponseFile, "utf8").trim());
+      const childExitText = fs.readFileSync(childExitFile, "utf8").trim();
+      const childExit = Number(childExitText.split(/\s/)[0]);
+      assert.ok(Number.isFinite(childStart) && childStart > 0, "bad child start stamp " + JSON.stringify(String(childStart)));
+      assert.ok(Number.isFinite(childResponse) && childResponse >= childStart, "bad child response stamp");
+      assert.ok(Number.isFinite(childExit) && childExit >= childResponse, "bad child exit stamp " + JSON.stringify(childExitText));
+      const childResponseElapsed = childResponse - childStart;
+      const childExitElapsed = childExit - childStart;
+      assert.ok(
+        childResponseElapsed <= cliMs + CHILD_ALLOW_MS,
+        `child TIMEOUT took ${childResponseElapsed}ms, beyond ${cliMs}ms + ${CHILD_ALLOW_MS}ms (rejects hardcoded 5000)`,
+      );
+      assert.ok(
+        childExitElapsed <= cliMs + CHILD_ALLOW_MS,
+        `child exit took ${childExitElapsed}ms, beyond ${cliMs}ms + ${CHILD_ALLOW_MS}ms (rejects hardcoded 5000)`,
+      );
+      assert.ok(childExitElapsed >= cliMs - 250, `child exit took ${childExitElapsed}ms, before the ${cliMs}ms deadline could fire`);
       // Release the lock only after the CLI has fully exited (reaped).
       try {
         locker.exec("ROLLBACK");
@@ -657,15 +706,22 @@ describe("R08 genuine SQLite lock fails closed; same-key retry effects exactly o
       }
       locker.close();
       locker = null;
+      // Recovery runs the SAME DB/scope/EXACT key+params under the STANDARD
+      // profile (makeConfig defaults 5000/2000 = shipped example), NOT the
+      // 2500/10000 fault-injection budget: the fault config's 2500ms window
+      // is consumed by cold-start bootstrap + WAL recovery on Windows once
+      // contention is gone, which is a test-budget artifact, not a store
+      // bug. Same-key retry under the normal budget is the caller contract.
+      const { configPath: recoveryConfigPath } = makeConfig(dir, "workertimeout.db");
       // Same key + params retry resolves the single canonical effect; the
       // TIMEOUT attempt's outcome stays unknown and is never inferred.
-      const first = syncRun(configPath, line + "\n");
+      const first = syncRun(recoveryConfigPath, line + "\n");
       assert.equal(first.status, 0, "stderr=" + first.stderr.slice(0, 300));
       const firstBody = parseSingleJson(first.stdout);
       assert.equal(firstBody["ok"], true, JSON.stringify(firstBody));
       assert.equal(firstBody["code"], "OK");
       const firstId = ((firstBody["data"] as { record: { id: string } }).record as { id: string }).id;
-      const replay = syncRun(configPath, line + "\n");
+      const replay = syncRun(recoveryConfigPath, line + "\n");
       assert.equal(replay.status, 0);
       const replayBody = parseSingleJson(replay.stdout);
       assert.equal(replayBody["ok"], true, JSON.stringify(replayBody));

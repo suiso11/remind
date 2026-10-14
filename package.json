@@ -12,11 +12,12 @@
   },
   "packageManager": "npm@11.6.2",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"if (process.platform !== 'win32') require('node:fs').chmodSync('dist/src/cli.js', 0o755)\"",
     "test": "npm run clean && npm run build && node --test dist/tests/*.test.js",
     "smoke": "npm run build && node dist/scripts/smoke.js",
     "acceptance": "npm run clean && npm run build && node --test dist/tests/acceptance.test.js",
     "cli": "node dist/src/cli.js",
+    "evaluate:baseline": "npm run build && node dist/scripts/evaluate-baseline.js",
     "clean": "node -e \"require('fs').rm('dist',{recursive:true,force:true},()=>{})\""
   },
   "dependencies": {},
