@@ -21,7 +21,7 @@
 - `raw_events` は不変の追記のみ。更新・削除はない。
 - `records` は `active / superseded / archived / retired` の行をすべて保持する。`record.correct` は新 revision 追記 + 旧版 `superseded`、`record.archive` は検索除外フラグ、`record.retire / reactivate` は可逆の通常想起除外・復帰であり、いずれも物理削除ではない。
 - 削除 (消去) API とエクスポート API はない。SQLite ファイルの削除や `VACUUM` を消去保証として主張しない。保持期間・削除可否の方針決定は将来課題とする。
-- 台帳 (`operations / audit / exposures / usage / note_heat`) は運用に必要な範囲で保持する。`exposures` は上限 1000 件で古い行から刈り込む。監査の失敗は操作全体を巻き戻す (監査なしの成功を作らない)。
+- 台帳 (`operations / audit / exposures / usage / note_heat`) は運用に必要な範囲で保持する。`exposures` は上限 1000 件で古い行から刈り込む。刈り込み失敗は `record.recall` 全体を `STORE_UNAVAILABLE` で巻き戻し、上限超過の成功を作らない (新規露出+監査の原子性)。監査の失敗は操作全体を巻き戻す (監査なしの成功を作らない)。
 - `note_heat.usedCount` は `record.feedback` の検証通過分のみ加算する累積値であり、mere recall・露出のみでは加算しない。
 
 ## 可逆引退・蒸留・統合（M3 で実装済み）

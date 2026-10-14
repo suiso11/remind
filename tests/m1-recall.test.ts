@@ -134,6 +134,18 @@ function recallIds(db: DatabaseSync, config: AppConfig, query: string, extra: Re
   return ((res.data as { items: Array<{ id: string }> }).items).map((i) => i.id);
 }
 
+function get(db: DatabaseSync, config: AppConfig, id: string): Record<string, unknown> {
+  const res = getRecord(db, config, { id, scope: "personal/default" });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  return (res.data as { record: Record<string, unknown> }).record;
+}
+
+function list(db: DatabaseSync, config: AppConfig): string[] {
+  const res = listRecords(db, config, { scope: "personal/default", limit: 25 });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  return ((res.data as { items: Array<{ id: string }> }).items).map((i) => i.id);
+}
+
 function heatOf(db: DatabaseSync, id: string): number {
   const row = db.prepare(`SELECT usedCount FROM note_heat WHERE recordId=?`).get(id) as
     | { usedCount: number }
@@ -863,6 +875,561 @@ describe("canonical bodyNorm fallback without derived indexes", () => {
       assert.equal(heatOf(ctx.db, id), 1);
     } finally {
       ctx.cleanup();
+    }
+  });
+});
+
+describe("shared-file concurrent correction race", () => {
+  interface RaceReady { ready: boolean; threadId: number; dbFile: string; status: string | null }
+  interface RaceResult {
+    res: { ok: boolean; code: string; data?: unknown; deduplicated?: boolean };
+    begin: number; commit: number; rollback: number; isTransaction: unknown; threadId: number;
+  }
+  type RaceSettled<T> = { ok: true; value: T } | { ok: false; error: unknown };
+  // ONE shared actual worker lifecycle, parameterized by config/params/key/
+  // barrier. Both the genuine same-DB race and the real bad-DB failure test
+  // use this helper: settled outcomes bind immediately, sync spawn failure
+  // rejects both outcomes, success resolves only after an actual code-0 exit
+  // with ready+result observed, and every physical exit is recorded so temp
+  // fixtures are removed only after workers actually exited.
+  function launchRaceContender(opts: {
+    workerPath: string;
+    config: AppConfig;
+    params: Record<string, unknown>;
+    key: string;
+    barrier: SharedArrayBuffer;
+    workers: Worker[];
+    settledSink: Array<Promise<unknown>>;
+    exits: number[];
+  }): {
+    readyP: Promise<RaceReady>;
+    doneP: Promise<RaceResult>;
+    readySettled: Promise<RaceSettled<RaceReady>>;
+    doneSettled: Promise<RaceSettled<RaceResult>>;
+  } {
+    let readyResolve!: (v: RaceReady) => void;
+    let readyReject!: (e: unknown) => void;
+    let doneResolve!: (v: RaceResult) => void;
+    let doneReject!: (e: unknown) => void;
+    const readyP = new Promise<RaceReady>((resolve, reject) => {
+      readyResolve = resolve;
+      readyReject = reject;
+    });
+    const doneP = new Promise<RaceResult>((resolve, reject) => {
+      doneResolve = resolve;
+      doneReject = reject;
+    });
+    // Attach settled-outcome handlers IMMEDIATELY (before spawn) so both
+    // readiness and completion always have a rejection handler even when
+    // the later awaits never attach (ready failure / pre-start assert
+    // failure). Outcomes preserve the real error for propagation.
+    const readySettled: Promise<RaceSettled<RaceReady>> = readyP.then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    const doneSettled: Promise<RaceSettled<RaceResult>> = doneP.then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    opts.settledSink.push(readySettled, doneSettled);
+    let ready: RaceReady | null = null;
+    let result: RaceResult | null = null;
+    let worker: Worker;
+    try {
+      worker = new Worker(opts.workerPath, {
+        workerData: { config: opts.config, params: opts.params, idempotencyKey: opts.key, barrier: opts.barrier },
+      });
+    } catch (err) {
+      readyReject(err);
+      doneReject(err);
+      throw err;
+    }
+    opts.workers.push(worker);
+    worker.once("error", readyReject);
+    worker.once("exit", (code) => {
+      opts.exits.push(code);
+      // The result resolves only AFTER a successful worker exit.
+      if (code === 0 && ready && result) doneResolve(result);
+      else {
+        const err = new Error(`race worker exited code=${code} ready=${ready !== null} result=${result !== null}`);
+        try {
+          readyReject(err);
+        } catch {
+          /* ignore */
+        }
+        doneReject(err);
+      }
+    });
+    worker.on("message", (msg: unknown) => {
+      const m = msg as { ready?: boolean } & RaceReady & RaceResult & { res?: RaceResult["res"] };
+      try {
+        if (m && typeof m === "object" && "res" in m && m.res && typeof m.res === "object") {
+          result = m as unknown as RaceResult;
+        } else if (m && typeof m === "object" && (m as { ready?: unknown }).ready === true) {
+          ready = m as unknown as RaceReady;
+          readyResolve(ready);
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+    return { readyP, doneP, readySettled, doneSettled };
+  }
+  it("exactly one of two simultaneous same-file corrections wins; the loser leaves zero residue", async () => {
+    // Genuine same-file concurrency: two worker threads each open their OWN
+    // DatabaseSync on the same temp file and call the REAL correctRecord with
+    // distinct keys, own raw source events, and distinct replacement
+    // body/link/runId. A shared rendezvous holds both contenders at native
+    // BEGIN until both have arrived, so the conditional status flip arbitrates
+    // exactly one winner. This is the concurrent counterpart of the existing
+    // sequential replay tests (which are preserved untouched); it never
+    // duplicates them and never uses echo/tautology assertions.
+    const ctx = setup();
+    const workers: Worker[] = [];
+    const allSettled: Array<Promise<unknown>> = [];
+    const exits: number[] = [];
+    const barrier = new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT);
+    const barr = new Int32Array(barrier);
+    const failAfterMs = 60000;
+    function failTimeout<T>(p: Promise<T>, what: string): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`correction race: ${what} timed out`)), failAfterMs);
+        try {
+          (timer as unknown as { unref?: () => void }).unref?.();
+        } catch {
+          /* ignore */
+        }
+        p.then(
+          (v) => {
+            clearTimeout(timer);
+            resolve(v);
+          },
+          (e) => {
+            clearTimeout(timer);
+            reject(e);
+          },
+        );
+      });
+    }
+    const watchdog = setTimeout(() => {
+      try {
+        Atomics.store(barr, 0, 1);
+        Atomics.store(barr, 1, 2);
+        Atomics.notify(barr, 0);
+      } catch {
+        /* ignore */
+      }
+      for (const w of workers) {
+        try {
+          void w.terminate();
+        } catch {
+          /* ignore */
+        }
+      }
+    }, failAfterMs);
+    try {
+      // Setup: left/right link records and the original active record.
+      const left = remember(ctx.db, ctx.config, "race left anchor harbor memo", "race-left");
+      const right = remember(ctx.db, ctx.config, "race right anchor harbor memo", "race-right");
+      const origBody = "race original canyon memo noon sharp";
+      const orig = remember(ctx.db, ctx.config, origBody, "race-orig");
+      raw(ctx.db, ctx.config, "race-src-a");
+      raw(ctx.db, ctx.config, "race-src-b");
+      const paramsA: Record<string, unknown> = {
+        recordId: orig,
+        body: "race canyon verdict alpha orchard",
+        kind: "correction",
+        provenance: { source: "session:s1:turn:9", observedAt: OBS },
+        scope: "personal/default",
+        links: [left],
+        sourceRefs: ["race-src-a"],
+        runId: "race-run-a",
+      };
+      const paramsB: Record<string, unknown> = {
+        recordId: orig,
+        body: "race canyon verdict beta orchard",
+        kind: "correction",
+        provenance: { source: "session:s1:turn:9", observedAt: OBS },
+        scope: "personal/default",
+        links: [right],
+        sourceRefs: ["race-src-b"],
+        runId: "race-run-b",
+      };
+      const workerPath = path.join(__dirname, "fixtures", "correction-race-worker.js");
+      function launch(params: Record<string, unknown>, key: string): ReturnType<typeof launchRaceContender> {
+        return launchRaceContender({
+          workerPath,
+          config: ctx.config,
+          params,
+          key,
+          barrier,
+          workers,
+          settledSink: allSettled,
+          exits,
+        });
+      }
+      const a = launch(paramsA, "race-key-a");
+      let b: ReturnType<typeof launch> | undefined;
+      try {
+        b = launch(paramsB, "race-key-b");
+      } catch (err) {
+        // Synchronous second-spawn failure: consume the first worker's
+        // settlements so its promises never reject unhandled, then propagate
+        // the real spawn error. Cleanup in finally still terminates/joins.
+        await Promise.allSettled(allSettled);
+        throw err;
+      }
+      assert.ok(b, "second contender must launch");
+      const [readyA, readyB] = await Promise.all([
+        failTimeout(a.readyP, "contender A ready"),
+        failTimeout(b.readyP, "contender B ready"),
+      ]);
+      // Both contenders run on real distinct worker threads against the same
+      // actual database file (junction-safe: resolve BOTH reported paths),
+      // with the target still active and no BEGIN executed yet.
+      for (const r of [readyA, readyB]) {
+        assert.equal(r.ready, true);
+        assert.ok(Number.isInteger(r.threadId) && r.threadId > 0, `positive threadId: ${JSON.stringify(r)}`);
+        assert.equal(r.status, "active");
+        assert.equal(fs.realpathSync(r.dbFile), fs.realpathSync(ctx.config.dbPath));
+      }
+      assert.notEqual(readyA.threadId, readyB.threadId, "contenders must run on distinct threads");
+      assert.equal(Atomics.load(barr, 1), 0, "BEGIN executed before the start release");
+      // Release the start gate: both real BEGINs rendezvous, then arbitrate.
+      Atomics.store(barr, 0, 1);
+      Atomics.notify(barr, 0);
+      const [doneA, doneB] = await Promise.all([
+        failTimeout(a.doneP, "contender A result"),
+        failTimeout(b.doneP, "contender B result"),
+      ]);
+      // Two real BEGINs arrived; exactly one OK and one CONFLICT.
+      assert.equal(Atomics.load(barr, 1), 2, "expected exactly 2 real BEGIN arrivals");
+      const oks = [doneA.res.ok, doneB.res.ok];
+      assert.deepEqual([...oks].sort(), [false, true]);
+      const winnerIdx = doneA.res.ok ? 0 : 1;
+      const married = [
+        { done: doneA, params: paramsA, key: "race-key-a", word: "alpha" },
+        { done: doneB, params: paramsB, key: "race-key-b", word: "beta" },
+      ];
+      const winner = married[winnerIdx] as (typeof married)[number];
+      const loser = married[1 - winnerIdx] as (typeof married)[number];
+      assert.equal(loser.done.res.ok, false);
+      assert.equal(loser.done.res.code, "CONFLICT", JSON.stringify(loser.done.res));
+      // Native transaction counters: winner begin1/commit1/rollback0, loser
+      // begin1/commit0/rollback1, both connections closed cleanly.
+      assert.deepEqual(
+        [winner.done.begin, winner.done.commit, winner.done.rollback],
+        [1, 1, 0],
+        JSON.stringify(winner.done),
+      );
+      assert.deepEqual(
+        [loser.done.begin, loser.done.commit, loser.done.rollback],
+        [1, 0, 1],
+        JSON.stringify(loser.done),
+      );
+      assert.equal(winner.done.isTransaction, false);
+      assert.equal(loser.done.isTransaction, false);
+      const winnerBody = winner.params["body"] as string;
+      const winnerLink = (winner.params["links"] as string[])[0] as string;
+      const winnerRef = (winner.params["sourceRefs"] as string[])[0] as string;
+      const winnerRun = winner.params["runId"] as string;
+      const loserBody = loser.params["body"] as string;
+      const loserRef = (loser.params["sourceRefs"] as string[])[0] as string;
+      const loserLink = (loser.params["links"] as string[])[0] as string;
+      const loserRun = loser.params["runId"] as string;
+      const loserWord = loser.word;
+      const newId = (winner.done.res.data as { record: { id: string } }).record.id;
+      // Winning canonical shape: old superseded with unchanged body;
+      // replacement active, revision 2, exact winning body/sourceRef/link.
+      const oldRow = ctx.db.prepare(`SELECT body, status, revision FROM records WHERE id = ?`).get(orig) as
+        | { body: string; status: string; revision: number }
+        | undefined;
+      assert.ok(oldRow);
+      assert.equal(oldRow?.status, "superseded");
+      assert.equal(oldRow?.body, origBody);
+      const newRow = ctx.db.prepare(
+        `SELECT body, kind, status, supersedes, revision FROM records WHERE id = ?`,
+      ).get(newId) as
+        | { body: string; kind: string; status: string; supersedes: string | null; revision: number }
+        | undefined;
+      assert.ok(newRow);
+      assert.equal(newRow?.status, "active");
+      assert.equal(newRow?.kind, "correction");
+      assert.equal(newRow?.supersedes, orig);
+      assert.equal(newRow?.revision, 2);
+      assert.equal(newRow?.body, winnerBody);
+      // Consumer-visible: active list is only left/right/new, get works, and
+      // recall includes the replacement but never the superseded revision.
+      assert.deepEqual(new Set(list(ctx.db, ctx.config)), new Set([left, right, newId]));
+      assert.equal(get(ctx.db, ctx.config, newId)["id"], newId);
+      const hits = recallIds(ctx.db, ctx.config, "race canyon verdict");
+      assert.ok(hits.includes(newId), JSON.stringify(hits));
+      assert.ok(!hits.includes(orig), JSON.stringify(hits));
+      // Exact cardinalities: 4 records, 4 source refs, 4 heat rows, 1 link,
+      // and a single correction revision.
+      const count = (sql: string): number =>
+        (ctx.db.prepare(sql).get() as { n: number }).n;
+      assert.equal(count(`SELECT COUNT(*) AS n FROM records`), 4);
+      assert.equal(count(`SELECT COUNT(*) AS n FROM record_source_refs`), 4);
+      assert.equal(count(`SELECT COUNT(*) AS n FROM note_heat`), 4);
+      assert.equal(count(`SELECT COUNT(*) AS n FROM record_links`), 1);
+      assert.equal(count(`SELECT COUNT(*) AS n FROM records WHERE kind = 'correction'`), 1);
+      assert.deepEqual(
+        (ctx.db.prepare(`SELECT fromId, toRef FROM record_links`).all() as Array<{ fromId: string; toRef: string }>).map(
+          (r) => [r.fromId, r.toRef],
+        ),
+        [[newId, winnerLink]],
+      );
+      assert.deepEqual(
+        (ctx.db.prepare(`SELECT recordId FROM record_source_refs WHERE eventId = ?`).all(winnerRef) as Array<{ recordId: string }>).map((r) => r.recordId),
+        [newId],
+      );
+      // ZERO loser residue: no canonical body/ref/link/operation/success audit.
+      assert.equal(
+        (ctx.db.prepare(`SELECT COUNT(*) AS n FROM records WHERE body = ?`).get(loserBody) as { n: number }).n,
+        0,
+      );
+      assert.equal(
+        (ctx.db.prepare(`SELECT COUNT(*) AS n FROM record_source_refs WHERE eventId = ?`).get(loserRef) as { n: number }).n,
+        0,
+      );
+      assert.equal(
+        (ctx.db.prepare(`SELECT COUNT(*) AS n FROM record_links WHERE toRef = ?`).get(loserLink) as { n: number }).n,
+        0,
+      );
+      assert.equal(
+        (ctx.db.prepare(`SELECT COUNT(*) AS n FROM operations WHERE idempotencyKey = ?`).get(loser.key) as { n: number }).n,
+        0,
+      );
+      assert.equal(
+        (ctx.db.prepare(`SELECT COUNT(*) AS n FROM audit WHERE runId = ?`).get(loserRun) as { n: number }).n,
+        0,
+      );
+      assert.equal(
+        (ctx.db.prepare(`SELECT COUNT(*) AS n FROM fts_notes WHERE body LIKE ?`).get(`%${loserWord}%`) as { n: number }).n,
+        0,
+      );
+      // ZERO orphans across derived ledgers: every heat/queue/fts/bigram/ref
+      // row belongs to a surviving canonical record.
+      const known = new Set([left, right, orig, newId]);
+      for (const r of ctx.db.prepare(`SELECT recordId FROM note_heat`).all() as Array<{ recordId: string }>) {
+        assert.ok(known.has(r.recordId), `orphan heat ${r.recordId}`);
+      }
+      const queued = (ctx.db.prepare(`SELECT recordId FROM projection_queue`).all() as Array<{ recordId: string }>).map((r) => r.recordId);
+      assert.deepEqual(new Set(queued), new Set([left, right, orig, newId]));
+      for (const r of ctx.db.prepare(`SELECT recordId FROM fts_notes`).all() as Array<{ recordId: string }>) {
+        assert.ok(known.has(r.recordId), `orphan fts ${r.recordId}`);
+      }
+      assert.equal(count(`SELECT COUNT(*) AS n FROM fts_notes`), 4);
+      for (const r of ctx.db.prepare(`SELECT DISTINCT id FROM char_bigrams WHERE kind = 'note'`).all() as Array<{ id: string }>) {
+        assert.ok(known.has(r.id), `orphan bigram ${r.id}`);
+      }
+      for (const r of ctx.db.prepare(`SELECT recordId FROM record_source_refs`).all() as Array<{ recordId: string }>) {
+        assert.ok(known.has(r.recordId), `orphan ref ${r.recordId}`);
+      }
+      // Only the winning correction operation stores the actual response, and
+      // only the winning runId owns the OK audit row.
+      const opRows = ctx.db.prepare(`SELECT idempotencyKey, op, responseJson FROM operations WHERE op = 'record.correct'`).all() as Array<{
+        idempotencyKey: string; op: string; responseJson: string;
+      }>;
+      assert.equal(opRows.length, 1);
+      assert.equal(opRows[0]?.idempotencyKey, winner.key);
+      assert.deepEqual(JSON.parse(opRows[0]?.responseJson as string), winner.done.res);
+      const auditRows = (ctx.db.prepare(`SELECT code, runId FROM audit WHERE op = 'record.correct'`).all() as Array<{
+        code: string; runId: string | null;
+      }>).map((r) => [r.code, r.runId]);
+      assert.equal(auditRows.length, 1);
+      assert.deepEqual(auditRows, [["OK", winnerRun]]);
+      // Same-key winner replay against the REAL store: deduplicated with the
+      // same canonical ID and no new canonical/operation rows.
+      const replay = correctRecord(ctx.db, ctx.config, winner.params, winner.key);
+      assert.equal(replay.ok, true, JSON.stringify(replay));
+      assert.equal(replay.deduplicated, true, JSON.stringify(replay));
+      assert.equal((replay.data as { record: { id: string } }).record.id, newId);
+      assert.equal(count(`SELECT COUNT(*) AS n FROM records`), 4);
+      // Both genuine contenders physically exited 0 before inspect/cleanup:
+      // each success resolved only after its actual exit event.
+      assert.deepEqual(exits, [0, 0], JSON.stringify(exits));
+    } finally {
+      clearTimeout(watchdog);
+      try {
+        Atomics.store(barr, 0, 1);
+        Atomics.store(barr, 1, 2);
+        Atomics.notify(barr, 0);
+      } catch {
+        /* ignore */
+      }
+      // Consume every settlement (ready + completion of both contenders)
+      // before joining, so a readiness/assert failure never leaves a worker
+      // error/exit/termination rejection unawaited.
+      try {
+        await Promise.allSettled(allSettled);
+      } catch {
+        /* ignore */
+      }
+      for (const w of workers) {
+        try {
+          await w.terminate();
+        } catch {
+          /* ignore */
+        }
+      }
+      ctx.cleanup();
+    }
+  });
+
+  it("worker lifecycle failure before ready settles every outcome with no leaks", async () => {
+    // Native failure-edge counterpart using the SAME launch lifecycle: both
+    // contenders open a REAL DatabaseSync on an invalid temp DB path, so the
+    // actual SQLite open fails BEFORE ready. The primary error is awaited via
+    // settled outcomes (not a bare throw), every completion is consumed, both
+    // workers actually exit, and fixtures are removed.
+    const ctx = setup();
+    const workers: Worker[] = [];
+    const exits: number[] = [];
+    const failSettled: Array<Promise<unknown>> = [];
+    const barrier = new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT);
+    const barr = new Int32Array(barrier);
+    const failAfterMs = 60000;
+    function failTimeout<T>(p: Promise<T>, what: string): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`correction race failure-edge: ${what} timed out`)), failAfterMs);
+        try {
+          (timer as unknown as { unref?: () => void }).unref?.();
+        } catch {
+          /* ignore */
+        }
+        p.then(
+          (v) => {
+            clearTimeout(timer);
+            resolve(v);
+          },
+          (e) => {
+            clearTimeout(timer);
+            reject(e);
+          },
+        );
+      });
+    }
+    const watchdog = setTimeout(() => {
+      try {
+        Atomics.store(barr, 0, 1);
+        Atomics.store(barr, 1, 2);
+        Atomics.notify(barr, 0);
+      } catch {
+        /* ignore */
+      }
+      for (const w of workers) {
+        try {
+          void w.terminate();
+        } catch {
+          /* ignore */
+        }
+      }
+    }, failAfterMs);
+    try {
+      (watchdog as unknown as { unref?: () => void }).unref?.();
+    } catch {
+      /* ignore */
+    }
+    const workerPath = path.join(__dirname, "fixtures", "correction-race-worker.js");
+    // Invalid temp DB path: parent directory does not exist, so the worker's
+    // real DatabaseSync open throws natively before any ready post. The
+    // recordId is a valid non-empty string so the failure is the native
+    // SQLite open, never the fixture's params validation.
+    const badConfig: AppConfig = { ...ctx.config, dbPath: path.join(ctx.dir, "missing-parent", "t.db") };
+    const badParams: Record<string, unknown> = { recordId: "missing-target" };
+    function launchBad(idempotencyKey: string): ReturnType<typeof launchRaceContender> {
+      return launchRaceContender({
+        workerPath,
+        config: badConfig,
+        params: badParams,
+        key: idempotencyKey,
+        barrier,
+        workers,
+        settledSink: failSettled,
+        exits,
+      });
+    }
+    let fa: ReturnType<typeof launchBad>;
+    let fb: ReturnType<typeof launchBad> | undefined;
+    try {
+      try {
+        fa = launchBad("race-fail-a");
+      } catch (err) {
+        await Promise.allSettled(failSettled);
+        throw err;
+      }
+      try {
+        fb = launchBad("race-fail-b");
+      } catch (err) {
+        await Promise.allSettled(failSettled);
+        throw err;
+      }
+      assert.ok(fb, "second failing contender must launch");
+      // Primary errors awaited as settled outcomes (never a bare throw):
+      // readiness must fail for BOTH contenders before any result.
+      const [ra, rb] = await Promise.all([
+        failTimeout(fa.readySettled, "failing contender A readiness settles"),
+        failTimeout(fb.readySettled, "failing contender B readiness settles"),
+      ]);
+      assert.equal(ra.ok, false, "contender A readiness must settle as failure");
+      assert.equal(rb.ok, false, "contender B readiness must settle as failure");
+      assert.ok(ra.ok === false && ra.error instanceof Error, JSON.stringify(ra));
+      assert.ok(rb.ok === false && rb.error instanceof Error, JSON.stringify(rb));
+      // Preserved actual native SQLite open identity (observed at runtime:
+      // worker 'error' event carries code ERR_SQLITE_ERROR, errcode 14,
+      // "unable to open database file"). This rejects a fixture validation
+      // error or any generic exit wording as the readiness cause.
+      for (const r of [ra, rb]) {
+        assert.ok(r.ok === false, JSON.stringify(r));
+        const err = (r as { ok: false; error: unknown }).error as Error & { code?: unknown; errcode?: unknown };
+        assert.equal((err as { code?: unknown }).code, "ERR_SQLITE_ERROR", String(err?.message));
+        assert.equal((err as { errcode?: unknown }).errcode, 14, String(err?.message));
+        assert.ok(/unable to open database file/.test(err.message), JSON.stringify(err.message));
+        assert.ok(!/params\.recordId must be/.test(err.message), JSON.stringify(err.message));
+      }
+      // Completions consumed: both settle as failures, proving no completion
+      // rejection is left unawaited. The meaningful failure proof is the
+      // native readiness cause above plus the physical nonzero exits below.
+      const [da, db] = await Promise.all([
+        failTimeout(fa.doneSettled, "failing contender A completion settles"),
+        failTimeout(fb.doneSettled, "failing contender B completion settles"),
+      ]);
+      assert.equal(da.ok, false, "contender A completion must settle as failure");
+      assert.equal(db.ok, false, "contender B completion must settle as failure");
+      assert.ok(da.ok === false && da.error instanceof Error, JSON.stringify(da));
+      assert.ok(db.ok === false && db.error instanceof Error, JSON.stringify(db));
+      // Both workers actually exited nonzero (native open failed) before any
+      // fixture removal: physical exit proof, not message wording.
+      assert.equal(exits.length, 2, `both failing workers must exit: ${JSON.stringify(exits)}`);
+      for (const code of exits) assert.notEqual(code, 0);
+      // No correction ran against the real DB file: zero race operations.
+      const n = (ctx.db.prepare(`SELECT COUNT(*) AS n FROM operations WHERE op = 'record.correct'`).get() as { n: number }).n;
+      assert.equal(n, 0);
+    } finally {
+      clearTimeout(watchdog);
+      try {
+        Atomics.store(barr, 0, 1);
+        Atomics.store(barr, 1, 2);
+        Atomics.notify(barr, 0);
+      } catch {
+        /* ignore */
+      }
+      try {
+        await Promise.allSettled(failSettled);
+      } catch {
+        /* ignore */
+      }
+      for (const w of workers) {
+        try {
+          await w.terminate();
+        } catch {
+          /* ignore */
+        }
+      }
+      ctx.cleanup();
+      assert.equal(fs.existsSync(ctx.dir), false, "failure-edge fixtures must be removed");
     }
   });
 });
