@@ -699,6 +699,7 @@ describe("shared-file concurrent correction race", () => {
     // duplicates them and never uses echo/tautology assertions.
     const ctx = setup();
     const workers: Worker[] = [];
+    const allSettled: Array<Promise<unknown>> = [];
     const barrier = new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT);
     const barr = new Int32Array(barrier);
     const failAfterMs = 60000;
@@ -775,6 +776,8 @@ describe("shared-file concurrent correction race", () => {
       function launch(params: Record<string, unknown>, key: string): {
         readyP: Promise<ReadyMsg>;
         doneP: Promise<ResultMsg>;
+        readySettled: Promise<{ ok: true; value: ReadyMsg } | { ok: false; error: unknown }>;
+        doneSettled: Promise<{ ok: true; value: ResultMsg } | { ok: false; error: unknown }>;
       } {
         let readyResolve!: (v: ReadyMsg) => void;
         let readyReject!: (e: unknown) => void;
@@ -788,11 +791,31 @@ describe("shared-file concurrent correction race", () => {
           doneResolve = resolve;
           doneReject = reject;
         });
+        // Attach settled-outcome handlers IMMEDIATELY (before spawn) so both
+        // readiness and completion always have a rejection handler even when
+        // the later awaits never attach (ready failure / pre-start assert
+        // failure). Outcomes preserve the real error for propagation.
+        const readySettled: Promise<{ ok: true; value: ReadyMsg } | { ok: false; error: unknown }> = readyP.then(
+          (value) => ({ ok: true as const, value }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        const doneSettled: Promise<{ ok: true; value: ResultMsg } | { ok: false; error: unknown }> = doneP.then(
+          (value) => ({ ok: true as const, value }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        allSettled.push(readySettled, doneSettled);
         let ready: ReadyMsg | null = null;
         let result: ResultMsg | null = null;
-        const worker = new Worker(workerPath, {
-          workerData: { config: ctx.config, params, idempotencyKey: key, barrier },
-        });
+        let worker: Worker;
+        try {
+          worker = new Worker(workerPath, {
+            workerData: { config: ctx.config, params, idempotencyKey: key, barrier },
+          });
+        } catch (err) {
+          readyReject(err);
+          doneReject(err);
+          throw err;
+        }
         workers.push(worker);
         worker.once("error", readyReject);
         worker.once("exit", (code) => {
@@ -821,10 +844,20 @@ describe("shared-file concurrent correction race", () => {
             /* ignore */
           }
         });
-        return { readyP, doneP };
+        return { readyP, doneP, readySettled, doneSettled };
       }
       const a = launch(paramsA, "race-key-a");
-      const b = launch(paramsB, "race-key-b");
+      let b: ReturnType<typeof launch> | undefined;
+      try {
+        b = launch(paramsB, "race-key-b");
+      } catch (err) {
+        // Synchronous second-spawn failure: consume the first worker's
+        // settlements so its promises never reject unhandled, then propagate
+        // the real spawn error. Cleanup in finally still terminates/joins.
+        await Promise.allSettled(allSettled);
+        throw err;
+      }
+      assert.ok(b, "second contender must launch");
       const [readyA, readyB] = await Promise.all([
         failTimeout(a.readyP, "contender A ready"),
         failTimeout(b.readyP, "contender B ready"),
@@ -994,6 +1027,14 @@ describe("shared-file concurrent correction race", () => {
       } catch {
         /* ignore */
       }
+      // Consume every settlement (ready + completion of both contenders)
+      // before joining, so a readiness/assert failure never leaves a worker
+      // error/exit/termination rejection unawaited.
+      try {
+        await Promise.allSettled(allSettled);
+      } catch {
+        /* ignore */
+      }
       for (const w of workers) {
         try {
           await w.terminate();
@@ -1002,6 +1043,219 @@ describe("shared-file concurrent correction race", () => {
         }
       }
       ctx.cleanup();
+    }
+  });
+
+  it("worker lifecycle failure before ready settles every outcome with no leaks", async () => {
+    // Native failure-edge counterpart using the SAME launch lifecycle: both
+    // contenders open a REAL DatabaseSync on an invalid temp DB path, so the
+    // actual SQLite open fails BEFORE ready. The primary error is awaited via
+    // settled outcomes (not a bare throw), every completion is consumed, both
+    // workers actually exit, and fixtures are removed.
+    const ctx = setup();
+    const workers: Worker[] = [];
+    const exits: number[] = [];
+    const failSettled: Array<Promise<unknown>> = [];
+    const barrier = new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT);
+    const barr = new Int32Array(barrier);
+    const failAfterMs = 60000;
+    function failTimeout<T>(p: Promise<T>, what: string): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`correction race failure-edge: ${what} timed out`)), failAfterMs);
+        try {
+          (timer as unknown as { unref?: () => void }).unref?.();
+        } catch {
+          /* ignore */
+        }
+        p.then(
+          (v) => {
+            clearTimeout(timer);
+            resolve(v);
+          },
+          (e) => {
+            clearTimeout(timer);
+            reject(e);
+          },
+        );
+      });
+    }
+    const watchdog = setTimeout(() => {
+      try {
+        Atomics.store(barr, 0, 1);
+        Atomics.store(barr, 1, 2);
+        Atomics.notify(barr, 0);
+      } catch {
+        /* ignore */
+      }
+      for (const w of workers) {
+        try {
+          void w.terminate();
+        } catch {
+          /* ignore */
+        }
+      }
+    }, failAfterMs);
+    try {
+      (watchdog as unknown as { unref?: () => void }).unref?.();
+    } catch {
+      /* ignore */
+    }
+    const workerPath = path.join(__dirname, "fixtures", "correction-race-worker.js");
+    interface ReadyMsg { ready: boolean; threadId: number; dbFile: string; status: string | null }
+    interface ResultMsg {
+      res: { ok: boolean; code: string; data?: unknown; deduplicated?: boolean };
+      begin: number; commit: number; rollback: number; isTransaction: unknown; threadId: number;
+    }
+    // Invalid temp DB path: parent directory does not exist, so the worker's
+    // real DatabaseSync open throws natively before any ready post.
+    const badConfig: AppConfig = { ...ctx.config, dbPath: path.join(ctx.dir, "missing-parent", "t.db") };
+    function launchBad(idempotencyKey: string): {
+      readyP: Promise<ReadyMsg>;
+      doneP: Promise<ResultMsg>;
+      readySettled: Promise<{ ok: true; value: ReadyMsg } | { ok: false; error: unknown }>;
+      doneSettled: Promise<{ ok: true; value: ResultMsg } | { ok: false; error: unknown }>;
+    } {
+      let readyResolve!: (v: ReadyMsg) => void;
+      let readyReject!: (e: unknown) => void;
+      let doneResolve!: (v: ResultMsg) => void;
+      let doneReject!: (e: unknown) => void;
+      const readyP = new Promise<ReadyMsg>((resolve, reject) => {
+        readyResolve = resolve;
+        readyReject = reject;
+      });
+      const doneP = new Promise<ResultMsg>((resolve, reject) => {
+        doneResolve = resolve;
+        doneReject = reject;
+      });
+      const readySettled: Promise<{ ok: true; value: ReadyMsg } | { ok: false; error: unknown }> = readyP.then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      const doneSettled: Promise<{ ok: true; value: ResultMsg } | { ok: false; error: unknown }> = doneP.then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      failSettled.push(readySettled, doneSettled);
+      let ready: ReadyMsg | null = null;
+      let result: ResultMsg | null = null;
+      let worker: Worker;
+      try {
+        worker = new Worker(workerPath, {
+          workerData: {
+            config: badConfig,
+            params: { recordId: "missing-target" },
+            idempotencyKey,
+            barrier,
+          },
+        });
+      } catch (err) {
+        readyReject(err);
+        doneReject(err);
+        throw err;
+      }
+      workers.push(worker);
+      worker.once("exit", (code) => {
+        exits.push(code);
+      });
+      worker.once("error", readyReject);
+      worker.once("exit", (code) => {
+        if (code === 0 && ready && result) doneResolve(result);
+        else {
+          const err = new Error(`race worker exited code=${code} ready=${ready !== null} result=${result !== null}`);
+          try {
+            readyReject(err);
+          } catch {
+            /* ignore */
+          }
+          doneReject(err);
+        }
+      });
+      worker.on("message", (msg: unknown) => {
+        const m = msg as { ready?: boolean } & ReadyMsg & ResultMsg & { res?: ResultMsg["res"] };
+        try {
+          if (m && typeof m === "object" && "res" in m && m.res && typeof m.res === "object") {
+            result = m as unknown as ResultMsg;
+          } else if (m && typeof m === "object" && (m as { ready?: unknown }).ready === true) {
+            ready = m as unknown as ReadyMsg;
+            readyResolve(ready);
+          }
+        } catch {
+          /* ignore */
+        }
+      });
+      return { readyP, doneP, readySettled, doneSettled };
+    }
+    let fa: ReturnType<typeof launchBad>;
+    let fb: ReturnType<typeof launchBad> | undefined;
+    try {
+      try {
+        fa = launchBad("race-fail-a");
+      } catch (err) {
+        await Promise.allSettled(failSettled);
+        throw err;
+      }
+      try {
+        fb = launchBad("race-fail-b");
+      } catch (err) {
+        await Promise.allSettled(failSettled);
+        throw err;
+      }
+      assert.ok(fb, "second failing contender must launch");
+      // Primary errors awaited as settled outcomes (never a bare throw):
+      // readiness must fail for BOTH contenders before any result.
+      const [ra, rb] = await Promise.all([
+        failTimeout(fa.readySettled, "failing contender A readiness settles"),
+        failTimeout(fb.readySettled, "failing contender B readiness settles"),
+      ]);
+      assert.equal(ra.ok, false, "contender A readiness must settle as failure");
+      assert.equal(rb.ok, false, "contender B readiness must settle as failure");
+      assert.ok(ra.ok === false && ra.error instanceof Error, JSON.stringify(ra));
+      assert.ok(rb.ok === false && rb.error instanceof Error, JSON.stringify(rb));
+      // Completions consumed: both settle as failures with the real exit
+      // error, proving no completion rejection is left unawaited.
+      const [da, db] = await Promise.all([
+        failTimeout(fa.doneSettled, "failing contender A completion settles"),
+        failTimeout(fb.doneSettled, "failing contender B completion settles"),
+      ]);
+      assert.equal(da.ok, false, "contender A completion must settle as failure");
+      assert.equal(db.ok, false, "contender B completion must settle as failure");
+      assert.ok(
+        da.ok === false && da.error instanceof Error && /exited code=/.test((da.error as Error).message),
+        JSON.stringify(da.ok === false ? String((da.error as Error)?.message) : da),
+      );
+      assert.ok(
+        db.ok === false && db.error instanceof Error && /exited code=/.test((db.error as Error).message),
+        JSON.stringify(db.ok === false ? String((db.error as Error)?.message) : db),
+      );
+      // Both workers actually exited (nonzero: native open failed).
+      assert.equal(exits.length, 2, `both failing workers must exit: ${JSON.stringify(exits)}`);
+      for (const code of exits) assert.notEqual(code, 0);
+      // No correction ran against the real DB file: zero race operations.
+      const n = (ctx.db.prepare(`SELECT COUNT(*) AS n FROM operations WHERE op = 'record.correct'`).get() as { n: number }).n;
+      assert.equal(n, 0);
+    } finally {
+      clearTimeout(watchdog);
+      try {
+        Atomics.store(barr, 0, 1);
+        Atomics.store(barr, 1, 2);
+        Atomics.notify(barr, 0);
+      } catch {
+        /* ignore */
+      }
+      try {
+        await Promise.allSettled(failSettled);
+      } catch {
+        /* ignore */
+      }
+      for (const w of workers) {
+        try {
+          await w.terminate();
+        } catch {
+          /* ignore */
+        }
+      }
+      ctx.cleanup();
+      assert.equal(fs.existsSync(ctx.dir), false, "failure-edge fixtures must be removed");
     }
   });
 });
