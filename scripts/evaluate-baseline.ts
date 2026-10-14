@@ -428,9 +428,16 @@ function main(): void {
         if (!getOld.envelopeValid || oldView?.status !== "superseded") setupFailure = `old status check failed: ${JSON.stringify(oldView)}`;
         else if (!getNew.envelopeValid || newView?.status !== "active" || newView?.supersedes !== oldId) setupFailure = `new status/supersedes check failed: ${JSON.stringify(newView)}`;
         else if (!getRet.envelopeValid || retView?.status !== "archived") setupFailure = `retired status check failed: ${JSON.stringify(retView)}`;
-        else if (!getLens.envelopeValid || !Array.isArray(lensView?.links) || (lensView as { links: string[] }).links.length !== 2) setupFailure = `lens links check failed: ${JSON.stringify(lensView)}`;
-        else if (!getLens.envelopeValid || !Array.isArray(lensView?.sourceRefs) || (lensView as { sourceRefs: string[] }).sourceRefs.length !== 1) setupFailure = "lens sourceRefs check failed";
-        else if (!listP.envelopeValid) setupFailure = "list P failed";
+        else if (!getLens.envelopeValid || !Array.isArray(lensView?.links) || !Array.isArray(lensView?.sourceRefs)) setupFailure = `lens links/refs check failed: ${JSON.stringify(lensView)}`;
+        else {
+          const beaconId = aliasToId.get("beacon") as string;
+          const chartId = aliasToId.get("chart") as string;
+          const gotLinks = [...((lensView as { links: string[] }).links)].sort();
+          const expLinks = [beaconId, chartId].sort();
+          const gotRefs = (lensView as { sourceRefs: string[] }).sourceRefs;
+          if (JSON.stringify(gotLinks) !== JSON.stringify(expLinks)) setupFailure = `lens links identity check failed: got ${JSON.stringify(gotLinks)} exp ${JSON.stringify(expLinks)}`;
+          else if (JSON.stringify(gotRefs) !== JSON.stringify(["b1-lens"])) setupFailure = `lens sourceRefs identity check failed: got ${JSON.stringify(gotRefs)}`;
+          else if (!listP.envelopeValid) setupFailure = "list P failed";
         else {
           const items = ((listP.envelope as { data?: { items?: Array<{ id?: unknown }> } }).data?.items ?? []) as Array<{ id: string }>;
           verifiedListP = items.map((i) => i.id);
@@ -445,6 +452,7 @@ function main(): void {
             setupFailure = `foreign P scope check failed: ${JSON.stringify(getForeignP.envelope)}`;
           } else if (!getForeignW.envelopeValid || (getForeignW.envelope as { ok?: unknown })["ok"] !== true) {
             setupFailure = "foreign W read failed";
+          }
           }
         }
       } catch {
@@ -680,7 +688,12 @@ function main(): void {
         if (fb.envelopeValid && (fb.envelope as { ok?: unknown })["ok"] === true) {
           feedback = { status: "reported", recallId: eligible.recallId, recordIds: relevant, queryId: eligible.queryId, round: eligible.round, code: "OK", latencyMs: fb.elapsedMs };
         } else {
+          // Non-normal runtime failure: invoked feedback MUST succeed. Keep the
+          // 36 quality rows untouched; signal via invariants + nonzero exit.
+          // Intended low quality or no eligible exposure stays "unavailable", never an error.
           feedback = { status: "failed", recallId: eligible.recallId, recordIds: relevant, code: (fb.envelope as { code?: unknown } | null)?.code ?? fb.invalidReason ?? "INVALID", latencyMs: fb.elapsedMs };
+          invariantFailures.push(`feedback: invoked feedback failed code=${String((fb.envelope as { code?: unknown } | null)?.code ?? fb.invalidReason ?? "INVALID")}`);
+          exitCode = 1;
         }
       } else {
         feedback = { status: "unavailable", reason: "no eligible exposed relevant result without quality threshold" };
@@ -734,6 +747,25 @@ function main(): void {
       try {
         fs.rmSync(corruptDir, { recursive: true, force: true });
       } catch { /* ignore */ }
+    }
+
+    // Deliberate corrupt-probe contract: direct CLI must stay a degraded
+    // startup failure (exit 3, empty stdout) and the adapter must stay
+    // degraded STORE_UNAVAILABLE with EMPTY citations. An unexpected
+    // nondegraded/cited/successful probe is an explicit probe-contract
+    // failure (nonzero) WITHOUT touching normal quality/degradation counts.
+    let probeContract: Record<string, unknown> = { status: "ok" };
+    {
+      const d = corruptDirect as { status?: unknown; stdoutBytes?: unknown; stdoutEmpty?: unknown };
+      const a = corruptAdapter as { degraded?: unknown; code?: unknown; citations?: unknown };
+      const directOk = d.status === 3 && d.stdoutBytes === 0 && d.stdoutEmpty === true;
+      const adapterOk = a.degraded === true && a.code === "STORE_UNAVAILABLE" && Array.isArray(a.citations) && (a.citations as unknown[]).length === 0;
+      if (!directOk || !adapterOk) {
+        const reason = `probe contract failed: directOk=${String(directOk)} adapterOk=${String(adapterOk)}`;
+        probeContract = { status: "failure", reason };
+        invariantFailures.push(reason);
+        exitCode = 1;
+      }
     }
 
     const posAgg = aggregatePositive(positiveEntries);
@@ -794,6 +826,7 @@ function main(): void {
         excludedFromDegradation: true,
         direct: corruptDirect,
         adapter: corruptAdapter,
+        contract: probeContract,
       },
       setup: setupFailure === null ? { status: "ok" } : { status: "failure", reason: setupFailure, quality: "UNAVAILABLE" },
       quality: setupFailure === null ? "available" : "UNAVAILABLE",
