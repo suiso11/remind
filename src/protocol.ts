@@ -74,9 +74,12 @@ export const WRITE_OPS = new Set([
   "record.feedback",
   "record.correct",
   "record.archive",
+  "record.retire",
+  "record.reactivate",
+  "maintain.distill",
 ]);
 /** Read ops: no idempotency key. */
-export const READ_OPS = new Set(["record.get", "record.list", "record.recall"]);
+export const READ_OPS = new Set(["record.get", "record.list", "record.recall", "record.search"]);
 
 export interface ValidRequest {
   v: 1;

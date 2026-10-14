@@ -12,14 +12,23 @@
   },
   "packageManager": "npm@11.6.2",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/src/cli.js',0o755)\"",
     "test": "npm run clean && npm run build && node --test dist/tests/*.test.js",
     "smoke": "npm run build && node dist/scripts/smoke.js",
     "acceptance": "npm run clean && npm run build && node --test dist/tests/acceptance.test.js",
     "cli": "node dist/src/cli.js",
-    "clean": "node -e \"require('fs').rm('dist',{recursive:true,force:true},()=>{})\""
+    "clean": "node -e \"require('fs').rm('dist',{recursive:true,force:true},()=>{})\"",
+    "provision:model": "npm run build && node dist/scripts/provision-model.js",
+    "provision:llm": "npm run build && node dist/scripts/provision-llm.js",
+    "rebuild:vectors": "npm run build && node dist/scripts/rebuild-vectors.js",
+    "rebuild:graph": "npm run build && node dist/scripts/rebuild-graph.js",
+    "smoke:m3": "npm run build && node dist/scripts/smoke-m3.js",
+    "eval:m2": "npm run build && node dist/scripts/eval-m2.js",
+    "smoke:semantic": "npm run build && node dist/scripts/smoke-semantic.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@huggingface/transformers": "4.3.1"
+  },
   "devDependencies": {
     "@types/node": "24.10.1",
     "typescript": "5.9.3"

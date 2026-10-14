@@ -18,6 +18,44 @@ export interface TimeoutsConfig {
   busyMs: number;
 }
 
+export interface VectorsConfig {
+  modelDir: string;
+  topK: number;
+  timeoutMs: number;
+  enabled: boolean;
+}
+
+/**
+ * M3 cultivation bounds (U5 implementation choices, startup-only).
+ * All optional: absent preserves existing behavior (queue still functions
+ * with defaults; no model is required by this slice).
+ */
+export interface CultivationConfig {
+  /** Max pending+leased review rows (default 500). Enqueue beyond drops, never fails the canonical write. */
+  queueMax: number;
+  /** Max actions per applyCultivationBatch call (default 20). */
+  batchMax: number;
+  /** Single-flight lease TTL in ms (default 120000). Expired leases are reclaimable (crash support). */
+  leaseTtlMs: number;
+  /** Max retries per queued review before it is marked failed (default 5). */
+  reviewMaxAttempts: number;
+}
+
+export interface LlmConfig {
+  modelDir: string;
+  timeoutMs: number;
+  enabled: boolean;
+  /** Max new tokens per generation (default 48). */
+  maxNewTokens: number;
+  /** Max prompt characters per inference (default 2000). */
+  maxPromptChars: number;
+}
+
+export interface MaintenanceConfig {
+  /** Whole-operation deadline for maintain.distill in ms (default 120000). */
+  timeoutMs: number;
+}
+
 export interface AppConfig {
   dbPath: string;
   vaultPath: string;
@@ -25,6 +63,14 @@ export interface AppConfig {
   limits: LimitsConfig;
   timeouts: TimeoutsConfig;
   dbMaxBytes: number;
+  /** M2 semantic vectors (optional; absent preserves M1 behavior with offline fallback). */
+  vectors?: VectorsConfig;
+  /** M3 cultivation queue/lease bounds (optional; absent uses defaults, no model required). */
+  cultivation?: CultivationConfig;
+  /** M3 local LLM runtime (optional; absent/disabled keeps distill degraded + fast). */
+  llm?: LlmConfig;
+  /** M3 maintenance deadline (optional; absent uses the default long budget). */
+  maintenance?: MaintenanceConfig;
 }
 
 const TOP_KEYS = [
@@ -34,6 +80,10 @@ const TOP_KEYS = [
   "limits",
   "timeouts",
   "dbMaxBytes",
+  "vectors",
+  "cultivation",
+  "llm",
+  "maintenance",
 ] as const;
 const LIMIT_KEYS = [
   "bodyMaxCp",
@@ -183,6 +233,112 @@ export function loadConfig(configPath: string): AppConfig {
   err = checkRange("dbMaxBytes", dbMaxBytes, 1048576, 1073741824);
   if (err) throw new Error(err);
 
+  let vectors: VectorsConfig | undefined;
+  if ("vectors" in parsed && (parsed as Record<string, unknown>)["vectors"] !== undefined) {
+    const v = (parsed as Record<string, unknown>)["vectors"];
+    if (!isPlainObject(v)) throw new Error("vectors must be an object");
+    for (const k of Object.keys(v)) {
+      if (!["modelDir", "topK", "timeoutMs", "enabled"].includes(k)) {
+        throw new Error(`unknown vectors field: ${k}`);
+      }
+    }
+    const modelDir = v["modelDir"] ?? "./models/paraphrase-multilingual-MiniLM-L12-v2";
+    if (typeof modelDir !== "string" || modelDir.length === 0 || modelDir.includes("\u0000")) {
+      throw new Error("vectors.modelDir must be a non-empty string");
+    }
+    const topK = v["topK"] ?? 20;
+    const eTop = checkRange("vectors.topK", topK, 1, 60);
+    if (eTop) throw new Error(eTop);
+    const timeoutMs = v["timeoutMs"] ?? 15000;
+    const eTo = checkRange("vectors.timeoutMs", timeoutMs, 500, 60000);
+    if (eTo) throw new Error(eTo);
+    const enabled = v["enabled"] ?? true;
+    if (typeof enabled !== "boolean") throw new Error("vectors.enabled must be a boolean");
+    vectors = {
+      modelDir: modelDir as string,
+      topK: topK as number,
+      timeoutMs: timeoutMs as number,
+      enabled: enabled as boolean,
+    };
+  }
+
+  let cultivation: CultivationConfig | undefined;
+  if ("cultivation" in parsed && (parsed as Record<string, unknown>)["cultivation"] !== undefined) {
+    const c = (parsed as Record<string, unknown>)["cultivation"];
+    if (!isPlainObject(c)) throw new Error("cultivation must be an object");
+    for (const k of Object.keys(c)) {
+      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts"].includes(k)) {
+        throw new Error(`unknown cultivation field: ${k}`);
+      }
+    }
+    const queueMax = c["queueMax"] ?? CULTIVATION_DEFAULT_QUEUE_MAX;
+    const eQ = checkRange("cultivation.queueMax", queueMax, 1, 10000);
+    if (eQ) throw new Error(eQ);
+    const batchMax = c["batchMax"] ?? CULTIVATION_DEFAULT_BATCH_MAX;
+    const eB = checkRange("cultivation.batchMax", batchMax, 1, 50);
+    if (eB) throw new Error(eB);
+    const leaseTtlMs = c["leaseTtlMs"] ?? CULTIVATION_DEFAULT_LEASE_TTL_MS;
+    const eL = checkRange("cultivation.leaseTtlMs", leaseTtlMs, 5000, 600000);
+    if (eL) throw new Error(eL);
+    const reviewMaxAttempts = c["reviewMaxAttempts"] ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS;
+    const eR = checkRange("cultivation.reviewMaxAttempts", reviewMaxAttempts, 1, 10);
+    if (eR) throw new Error(eR);
+    cultivation = {
+      queueMax: queueMax as number,
+      batchMax: batchMax as number,
+      leaseTtlMs: leaseTtlMs as number,
+      reviewMaxAttempts: reviewMaxAttempts as number,
+    };
+  }
+
+  let llm: LlmConfig | undefined;
+  if ("llm" in parsed && (parsed as Record<string, unknown>)["llm"] !== undefined) {
+    const l = (parsed as Record<string, unknown>)["llm"];
+    if (!isPlainObject(l)) throw new Error("llm must be an object");
+    for (const k of Object.keys(l)) {
+      if (!["modelDir", "timeoutMs", "enabled", "maxNewTokens", "maxPromptChars"].includes(k)) {
+        throw new Error(`unknown llm field: ${k}`);
+      }
+    }
+    const modelDir = l["modelDir"] ?? LLM_DEFAULT_MODEL_DIR;
+    if (typeof modelDir !== "string" || modelDir.length === 0 || modelDir.includes("\u0000")) {
+      throw new Error("llm.modelDir must be a non-empty string");
+    }
+    const timeoutMs = l["timeoutMs"] ?? LLM_DEFAULT_TIMEOUT_MS;
+    const eT = checkRange("llm.timeoutMs", timeoutMs, 500, 300000);
+    if (eT) throw new Error(eT);
+    const enabled = l["enabled"] ?? true;
+    if (typeof enabled !== "boolean") throw new Error("llm.enabled must be a boolean");
+    const maxNewTokens = l["maxNewTokens"] ?? LLM_DEFAULT_MAX_NEW_TOKENS;
+    const eN = checkRange("llm.maxNewTokens", maxNewTokens, 1, 256);
+    if (eN) throw new Error(eN);
+    const maxPromptChars = l["maxPromptChars"] ?? LLM_DEFAULT_MAX_PROMPT_CHARS;
+    const eP = checkRange("llm.maxPromptChars", maxPromptChars, 500, 8000);
+    if (eP) throw new Error(eP);
+    llm = {
+      modelDir: modelDir as string,
+      timeoutMs: timeoutMs as number,
+      enabled: enabled as boolean,
+      maxNewTokens: maxNewTokens as number,
+      maxPromptChars: maxPromptChars as number,
+    };
+  }
+
+  let maintenance: MaintenanceConfig | undefined;
+  if ("maintenance" in parsed && (parsed as Record<string, unknown>)["maintenance"] !== undefined) {
+    const m = (parsed as Record<string, unknown>)["maintenance"];
+    if (!isPlainObject(m)) throw new Error("maintenance must be an object");
+    for (const k of Object.keys(m)) {
+      if (!["timeoutMs"].includes(k)) {
+        throw new Error(`unknown maintenance field: ${k}`);
+      }
+    }
+    const timeoutMs = m["timeoutMs"] ?? MAINTENANCE_DEFAULT_TIMEOUT_MS;
+    const eT = checkRange("maintenance.timeoutMs", timeoutMs, 5000, 600000);
+    if (eT) throw new Error(eT);
+    maintenance = { timeoutMs: timeoutMs as number };
+  }
+
   return {
     dbPath: dbPath as string,
     vaultPath: vaultPath as string,
@@ -203,6 +359,48 @@ export function loadConfig(configPath: string): AppConfig {
       busyMs: to["busyMs"] as number,
     },
     dbMaxBytes: dbMaxBytes as number,
+    ...(vectors ? { vectors } : {}),
+    ...(cultivation ? { cultivation } : {}),
+    ...(llm ? { llm } : {}),
+    ...(maintenance ? { maintenance } : {}),
+  };
+}
+
+/** M3 local-LLM + maintenance defaults (startup-only; documented in docs/retention.md). */
+export const LLM_DEFAULT_MODEL_DIR = "./models/qwen25-15b-instruct";
+export const LLM_DEFAULT_TIMEOUT_MS = 60000;
+export const LLM_DEFAULT_MAX_NEW_TOKENS = 48;
+export const LLM_DEFAULT_MAX_PROMPT_CHARS = 2000;
+export const MAINTENANCE_DEFAULT_TIMEOUT_MS = 120000;
+
+export function llmBounds(config: AppConfig): Required<LlmConfig> {
+  return {
+    modelDir: config.llm?.modelDir ?? LLM_DEFAULT_MODEL_DIR,
+    timeoutMs: config.llm?.timeoutMs ?? LLM_DEFAULT_TIMEOUT_MS,
+    enabled: config.llm?.enabled ?? false,
+    maxNewTokens: config.llm?.maxNewTokens ?? LLM_DEFAULT_MAX_NEW_TOKENS,
+    maxPromptChars: config.llm?.maxPromptChars ?? LLM_DEFAULT_MAX_PROMPT_CHARS,
+  };
+}
+
+export function maintenanceTimeoutMs(config: AppConfig): number {
+  const t = config.maintenance?.timeoutMs ?? MAINTENANCE_DEFAULT_TIMEOUT_MS;
+  return Number.isInteger(t) && t >= 5000 && t <= 600000 ? t : MAINTENANCE_DEFAULT_TIMEOUT_MS;
+}
+
+/** M3 cultivation defaults (U5 implementation choices; documented in docs/retention.md). */
+export const CULTIVATION_DEFAULT_QUEUE_MAX = 500;
+export const CULTIVATION_DEFAULT_BATCH_MAX = 20;
+export const CULTIVATION_DEFAULT_LEASE_TTL_MS = 120000;
+export const CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS = 5;
+
+export function cultivationBounds(config: AppConfig): Required<CultivationConfig> {
+  return {
+    queueMax: config.cultivation?.queueMax ?? CULTIVATION_DEFAULT_QUEUE_MAX,
+    batchMax: config.cultivation?.batchMax ?? CULTIVATION_DEFAULT_BATCH_MAX,
+    leaseTtlMs: config.cultivation?.leaseTtlMs ?? CULTIVATION_DEFAULT_LEASE_TTL_MS,
+    reviewMaxAttempts:
+      config.cultivation?.reviewMaxAttempts ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS,
   };
 }
 
