@@ -318,15 +318,25 @@ describe("R06 strict global exposure cap with atomic prune", () => {
       assert.equal(heatOf(ctx.db, heatProbe), heatBefore);
       // Transaction is closed: a new write transaction starts cleanly.
       ctx.db.exec("BEGIN IMMEDIATE; ROLLBACK;");
-      // Retry after clearing the fault commits with the cap intact and no heat.
-      const heatBeforeRetry = heatOf(ctx.db, heatProbe);
+      // Retry after clearing the fault commits with the cap intact and no heat:
+      // the retry returns SCOPE_A rows, so compare the COMPLETE note_heat
+      // table (ids, counters, and timestamps) before vs after the retry.
+      const heatSnapBefore = dumpRows(ctx.db, `SELECT recordId, usedCount, lastUsedAt FROM note_heat ORDER BY recordId ASC`);
       const retry = recallRecords(ctx.db, ctx.config, { query: "capbeacon shared memo orchard", scope: SCOPE_A, limit: 5 }, FIXED_TS);
       assert.equal(retry.ok, true, JSON.stringify(retry));
       assert.equal(exposureCount(ctx.db), 1000);
-      assert.equal(heatOf(ctx.db, heatProbe), heatBeforeRetry);
+      assert.deepEqual(
+        dumpRows(ctx.db, `SELECT recordId, usedCount, lastUsedAt FROM note_heat ORDER BY recordId ASC`),
+        heatSnapBefore,
+      );
       const items = (retry.data as { items: Array<{ id: string }> }).items;
       assert.equal(items.length, 5);
-      for (const it of items) assert.equal(heatOf(ctx.db, it.id), heatOf(ctx.db, it.id));
+      for (const it of items) {
+        assert.ok(
+          (heatSnapBefore as Array<{ recordId: string }>).some((r) => r.recordId === it.id),
+          `retry item missing from pre-retry heat snapshot: ${it.id}`,
+        );
+      }
     } finally { ctx.cleanup(); }
   });
 });
