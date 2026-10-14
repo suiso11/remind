@@ -3,9 +3,9 @@
  * manifest must execute as a real consumer program (not an in-process import).
  *
  * The test resolves the binary target FROM the manifest bin map, builds an
- * owned POSIX symlink plus an owned Windows .cmd launcher that both honor
- * that same target (no hardcoded dist string asserts, no help-wording
- * asserts, no mock echo), then drives real store behavior through the
+ * owned platform-appropriate launcher honoring that same target (POSIX
+ * symlink on POSIX, .cmd launcher on Windows; no hardcoded dist string
+ * asserts, no help-wording asserts, no mock echo), then drives real store behavior through the
  * platform launcher: event.append persists, remember/get returns the same
  * body, same-key replay deduplicates to exactly one canonical effect.
  */
@@ -58,9 +58,14 @@ function makeConfig(dir: string): { configPath: string; dbPath: string } {
   return { configPath, dbPath };
 }
 
-function buildLaunchers(dir: string, target: string): { posix: string; win: string } {
+function buildLauncher(dir: string, target: string): string {
   const binDir = path.join(dir, "owned-bin");
   fs.mkdirSync(binDir, { recursive: true });
+  if (process.platform === "win32") {
+    const win = path.join(binDir, "memory-cli.cmd");
+    fs.writeFileSync(win, `@echo off\r\n"${process.execPath}" "${target}" %*\r\n`, "utf8");
+    return win;
+  }
   const posix = path.join(binDir, "memory-cli");
   try {
     fs.unlinkSync(posix);
@@ -68,9 +73,7 @@ function buildLaunchers(dir: string, target: string): { posix: string; win: stri
     /* ignore */
   }
   fs.symlinkSync(target, posix);
-  const win = path.join(binDir, "memory-cli.cmd");
-  fs.writeFileSync(win, `@echo off\r\n"${process.execPath}" "${target}" %*\r\n`, "utf8");
-  return { posix, win };
+  return posix;
 }
 
 function parseSingle(stdout: string): Record<string, unknown> {
@@ -97,10 +100,9 @@ describe("R08 packaged bin entry executes real store behavior", () => {
       const target = binTargetFromManifest();
       assert.ok(fs.existsSync(target), "manifest bin target missing: " + target);
       const { configPath, dbPath } = makeConfig(dir);
-      const { posix, win } = buildLaunchers(dir, target);
-      const launcher = process.platform === "win32" ? win : posix;
+      const launcher = buildLauncher(dir, target);
       if (process.platform === "win32") {
-        assert.ok(fs.existsSync(win));
+        assert.ok(launcher.endsWith(".cmd") && fs.existsSync(launcher));
       } else {
         const st = fs.statSync(target);
         assert.ok((st.mode & 0o111) !== 0, "bin target lacks POSIX exec bit");

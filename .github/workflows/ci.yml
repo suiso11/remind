@@ -16,4 +16,20 @@ jobs:
           node-version: "24.12.0"
           cache: npm
       - run: npm ci
-      - run: npm test
+      - if: matrix.os == 'ubuntu-latest'
+        run: npm test
+      - if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $kept = @()
+          foreach ($d in ($env:PATH -split ';')) {
+            if ([string]::IsNullOrWhiteSpace($d)) { continue }
+            try {
+              if (Test-Path (Join-Path $d 'chmod.exe')) { continue }
+            } catch { }
+            $kept += $d
+          }
+          $env:PATH = $kept -join ';'
+          if (Get-Command chmod -ErrorAction SilentlyContinue) { throw 'chmod still resolvable after PATH filter' }
+          if (Get-Command chmod.exe -ErrorAction SilentlyContinue) { throw 'chmod.exe still resolvable after PATH filter' }
+          npm test
