@@ -87,6 +87,8 @@ npm run acceptance  # M1 受け入れ 7 件
 
 受け入れ条件は `docs/acceptance-manifest.md`、保持方針は `docs/retention.md` を参照。
 
+R13 M1 synthetic baseline 観測証拠 (baseline-v1, M1 lexical+graph, synthetic-only): `npm run evaluate:baseline` (build + node dist/scripts/evaluate-baseline.js) exit 0。12 queries x3 rounds=36 recalls (21 positive incl semantic-gap miss, 15 negative)。positive mean P@3 0.571/recall 0.857/RR 0.857、negative 15 valid-empty、latency success median ~62ms (min ~61/max ~67/p95 ~65.6)。corrupt probe は direct exit 3/empty stdout と adapter STORE_UNAVAILABLE degraded/no citations を分離報告 (quality/degradation 除外)。feedback は実 recallId のみ報告。`npm test` 95 pass (prior 80 + score 12 + evaluator integration 3)、acceptance 7 pass、smoke OK。
+
 ## 未実装の明示
 
 - M2 ベクトル意味検索は未実装。想起は語彙 + グラフに縮退して動作する。
