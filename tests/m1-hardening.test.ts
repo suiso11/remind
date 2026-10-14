@@ -7,6 +7,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -462,49 +463,158 @@ describe("worker deadline contract", () => {
     assert.equal(effectiveBusyMs(2000, -5), 0);
   });
 
-  it("returns a committed envelope before a deliberately slow projection drain", async () => {
+  it("posts the committed envelope before the projection drain (deterministic FIFO proof)", async () => {
+    // Deterministic consumer-visible proof that the real production worker
+    // delivers the committed envelope before draining projections. No
+    // startup-inclusive timeout assertion: the probe worker loads the REAL
+    // worker-op.js with a pass-through exec wrapper that attaches an
+    // always-SQLITE_OK authorizer after the first real pragma. The authorizer
+    // observes SQLITE_READ of projection_queue.attempts -- per clean source
+    // src/projection.ts the ONLY statement reading that column is the drain
+    // SELECT (enqueue is INSERT, dequeue is DELETE) -- then posts a
+    // side-channel stage message on the SAME parentPort FIFO and blocks the
+    // native callback on a parent-held gate. FIFO order means the parent must
+    // already hold the real committed {res} before it can see the stage; if
+    // production post were moved after the drain, the stage would arrive
+    // first with no response and this test fails without any timing.
     const ctx = setup("post-before-drain");
+    const holder: { worker: Worker | null } = { worker: null };
+    const gate = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const gateView = new Int32Array(gate);
+    const releaseGate = (): void => {
+      try {
+        Atomics.store(gateView, 0, 1);
+        Atomics.notify(gateView, 0);
+      } catch {
+        /* ignore */
+      }
+    };
+    // Broad watchdog: failure cleanup only (release + terminate), never an
+    // ordering assertion.
+    let watchdogFired = false;
+    let workerExited = false;
+    const watchdog = setTimeout(() => {
+      watchdogFired = true;
+      releaseGate();
+      try {
+        void holder.worker?.terminate();
+      } catch {
+        /* ignore */
+      }
+    }, 30000);
     try {
       const ev = eventAppend(
         ctx.db,
         ctx.config,
         {
-          eventId: "e-worker-slow",
+          eventId: "e-worker-order",
           sessionId: "s1",
           turnId: "t1",
           body: "worker projection source",
           provenance: { source: "test", observedAt: OBS },
           scope: "personal/default",
         },
-        "worker-slow-event",
+        "worker-order-event",
       );
       assert.equal(ev.ok, true);
-      ctx.db.exec(`CREATE TRIGGER slow_projection_delete BEFORE DELETE ON projection_queue BEGIN
-        SELECT sum(x) FROM (WITH RECURSIVE c(x) AS (
-          VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 5000000
-        ) SELECT x FROM c);
-      END`);
-      const outcome = await runStoreOpWithDeadline(
-        {
-          dbFile: ctx.config.dbPath,
-          config: ctx.config,
-          configPath: ctx.configPath,
-          op: "record.remember",
-          params: {
-            body: "worker committed before projection",
-            kind: "user_fact",
-            provenance: { source: "test", observedAt: OBS },
-            scope: "personal/default",
-            sourceRefs: ["e-worker-slow"],
+      const workerPath = path.join(__dirname, "fixtures", "worker-post-order.js");
+      type ResMsg = { ok: boolean; data?: unknown };
+      let resMsg: ResMsg | null = null;
+      const stageSeen = await new Promise<boolean>((resolve, reject) => {
+        const w = new Worker(workerPath, {
+          workerData: {
+            dbFile: ctx.config.dbPath,
+            config: ctx.config,
+            configPath: ctx.configPath,
+            op: "record.remember",
+            params: {
+              body: "worker committed before projection",
+              kind: "user_fact",
+              provenance: { source: "test", observedAt: OBS },
+              scope: "personal/default",
+              sourceRefs: ["e-worker-order"],
+            },
+            idempotencyKey: "worker-order-remember",
+            effectiveBusyMs: 2000,
+            __gate: gate,
           },
-          idempotencyKey: "worker-slow-remember",
-          effectiveBusyMs: 500,
-        },
-        1000,
+        });
+        holder.worker = w;
+        w.once("error", reject);
+        w.once("exit", () => reject(new Error("worker exited before drain-entry stage")));
+        w.on("message", (msg: unknown) => {
+          const m = msg as { res?: ResMsg; stage?: string };
+          if (m && typeof m === "object" && m.res && typeof m.res === "object") {
+            if (resMsg === null) resMsg = m.res;
+          } else if (m && typeof m === "object" && m.stage === "drain-enter") {
+            // Drain entry observed: the real committed envelope must already
+            // have arrived via the same FIFO.
+            resolve(resMsg !== null);
+          }
+        });
+      });
+      assert.equal(stageSeen, true, "drain-entry stage arrived before any committed envelope: post is not before drain");
+      assert.ok(resMsg !== null);
+      assert.equal((resMsg as ResMsg).ok, true, JSON.stringify(resMsg));
+      assert.equal(watchdogFired, false);
+      const recId = ((resMsg as ResMsg).data as { record: { id: string } }).record.id;
+      // While the real drain is gated, the commit is already durable and the
+      // projection is still queued with no file written.
+      const recRow = ctx.db.prepare(`SELECT id, body FROM records WHERE id = ?`).get(recId) as
+        | { id: string; body: string }
+        | undefined;
+      assert.ok(recRow, "committed record missing while drain gated");
+      assert.equal(recRow?.body, "worker committed before projection");
+      const opRow = ctx.db.prepare(`SELECT op, responseJson FROM operations WHERE idempotencyKey = ?`).get("worker-order-remember") as
+        | { op: string; responseJson: string }
+        | undefined;
+      assert.ok(opRow, "stored operation missing while drain gated");
+      assert.equal(opRow?.op, "record.remember");
+      assert.equal((JSON.parse(opRow?.responseJson as string) as { ok: boolean }).ok, true);
+      const queued = ctx.db.prepare(`SELECT recordId FROM projection_queue WHERE recordId = ?`).get(recId) as
+        | { recordId: string }
+        | undefined;
+      assert.ok(queued, "projection not queued while drain gated");
+      const filePath = path.join(ctx.config.vaultPath, `${recId}.md`);
+      assert.equal(fs.existsSync(filePath), false, "projection file exists before gated drain runs");
+      // Release the real drain, then await the real worker exit.
+      releaseGate();
+      const exitCode = await new Promise<number>((resolve, reject) => {
+        const w = holder.worker as unknown as Worker;
+        const timer = setTimeout(() => reject(new Error("worker did not exit after gate release")), 25000);
+        try {
+          (timer as unknown as { unref?: () => void }).unref?.();
+        } catch {
+          /* ignore */
+        }
+        w.once("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+        w.once("exit", (code) => {
+          clearTimeout(timer);
+          resolve(code ?? 0);
+        });
+      });
+      workerExited = true;
+      assert.equal(exitCode, 0, `probe worker exit code ${exitCode}`);
+      // Real file projected and real dequeue observed after the release.
+      assert.ok(fs.existsSync(filePath), "projection file missing after gated drain released");
+      assert.ok(fs.readFileSync(filePath, "utf8").includes("worker committed before projection"));
+      assert.equal(
+        (ctx.db.prepare(`SELECT COUNT(*) AS n FROM projection_queue WHERE recordId = ?`).get(recId) as { n: number }).n,
+        0,
       );
-      assert.equal(outcome.timedOut, false);
-      if (!outcome.timedOut) assert.equal(outcome.res.ok, true, JSON.stringify(outcome.res));
     } finally {
+      clearTimeout(watchdog);
+      releaseGate();
+      if (!workerExited) {
+        try {
+          await holder.worker?.terminate();
+        } catch {
+          /* ignore */
+        }
+      }
       try {
         ctx.db.close();
       } catch {

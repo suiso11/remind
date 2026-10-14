@@ -1783,14 +1783,13 @@ export function recallRecords(
       for (const it of items) {
         exp.run(now, recallId, p.runId, p.scope, it.id, Buffer.byteLength(it.snippet, "utf8"), it.truncated ? 1 : 0, p.limit);
       }
-      // Bounded exposures ledger (prune oldest beyond cap).
-      try {
-        db.prepare(
-          `DELETE FROM exposures WHERE rowid NOT IN (SELECT rowid FROM exposures ORDER BY ts DESC, rowid DESC LIMIT ?)`,
-        ).run(EXPOSURES_CAP);
-      } catch {
-        /* prune failure must not fail the recall */
-      }
+      // Bounded exposures ledger (prune oldest beyond cap). Prune failure
+      // must fail the recall closed so the strict global 1000-row cap is
+      // never exceeded: the surrounding transaction rolls back the new
+      // exposures + audit together.
+      db.prepare(
+        `DELETE FROM exposures WHERE rowid NOT IN (SELECT rowid FROM exposures ORDER BY ts DESC, rowid DESC LIMIT ?)`,
+      ).run(EXPOSURES_CAP);
       // Recall metadata (audit + exposures) may exceed configured cap;
       // only real SQLite failures fail closed via the catch below.
       return stored;
