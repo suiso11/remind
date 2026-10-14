@@ -45,12 +45,22 @@ describe("baseline-score consumer edges", () => {
     assert.equal(validateReturnedIds(["x", "y"], 3).ok, true);
   });
 
-  it("boundary truncation R4 gold with L3 all-relevant gives P1 R3/4", () => {
-    const s = scorePositive(["a", "b", "c"], ["a", "b", "c", "d"], 3);
-    assert.equal(s.hits, 3);
-    assert.equal(s.pAt3, 1);
-    assert.equal(s.recall, 3 / 4);
-    assert.equal(s.rr, 1);
+  it("unsliced over-limit input scores only top-k: [x,y,z,a] gold [a] k3 is all-zero", () => {
+    // Actual responses stay REJECTED over-limit (validateReturnedIds below);
+    // scoring itself never silently truncates: it bounds at min(len,k).
+    const s = scorePositive(["x", "y", "z", "a"], ["a"], 3);
+    assert.equal(s.hits, 0);
+    assert.equal(s.pAt3, 0);
+    assert.equal(s.recall, 0);
+    assert.equal(s.rr, 0);
+    assert.equal(s.firstRank, null);
+    // 4 relevant unsliced with k=3 cannot exceed P=1: only top-3 count.
+    const full = scorePositive(["a", "b", "c", "d"], ["a", "b", "c", "d"], 3);
+    assert.equal(full.hits, 3);
+    assert.equal(full.pAt3, 1);
+    assert.equal(full.recall, 3 / 4);
+    // Over-limit actual responses remain INVALID, not truncated.
+    assert.equal(validateReturnedIds(["a", "b", "c", "d"], 3).ok, false);
   });
 
   it("k=2 rank2 hit vs top1 miss", () => {

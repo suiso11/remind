@@ -23,6 +23,8 @@ export interface InvalidIds {
   reason: string;
 }
 
+import { MESSAGES, type ErrorCode } from "../src/protocol.js";
+
 /** Intersection size of ordered-unique returned vs gold (both actual IDs). */
 export function scorePositive(
   returnedIds: string[],
@@ -32,7 +34,8 @@ export function scorePositive(
   const goldSet = new Set(goldIds);
   let hits = 0;
   let firstRank: number | null = null;
-  for (let i = 0; i < returnedIds.length; i++) {
+  const bound = Math.min(returnedIds.length, k);
+  for (let i = 0; i < bound; i++) {
     const id = returnedIds[i] as string;
     if (goldSet.has(id)) {
       hits += 1;
@@ -204,4 +207,144 @@ export function negativeFractions(outcomes: NegativeOutcome[]): NegativeFraction
     fracValidNonempty: frac(validNonempty),
     fracFailure: frac(failure),
   };
+}
+
+/* ---- R13 review: strict consumer-side envelope + recall-data validators ----
+ * Pure (no I/O/CLI). Reuses existing protocol definitions (MESSAGES/ErrorCode)
+ * and the adopted fake-adapter recall contract (data {recallId,items},
+ * items [{id,snippet,truncated,tags,createdAt}]). No API/store/schema change.
+ */
+
+const ALLOWED_CODES: ReadonlySet<string> = new Set<string>([
+  "OK",
+  "BAD_REQUEST",
+  "NOT_FOUND",
+  "CONFLICT",
+  "FORBIDDEN_SCOPE",
+  "STORE_UNAVAILABLE",
+  "LIMIT_EXCEEDED",
+  "TIMEOUT",
+]);
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+// eslint-disable-next-line no-control-regex
+const CONTROL_RE = /[\u0000-\u001F\u007F-\u009F]/;
+
+function hasLoneSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const n = i + 1 < s.length ? s.charCodeAt(i + 1) : -1;
+      if (n < 0xdc00 || n > 0xdfff) return true;
+      i++;
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function validRecallId(s: unknown): s is string {
+  return (
+    typeof s === "string" &&
+    s.length >= 1 &&
+    s.length <= 256 &&
+    !CONTROL_RE.test(s) &&
+    !hasLoneSurrogate(s)
+  );
+}
+
+function isCanonicalUtcMs(s: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(s)) return false;
+  const ms = Date.parse(s);
+  if (!Number.isFinite(ms)) return false;
+  try {
+    return new Date(ms).toISOString() === s;
+  } catch {
+    return false;
+  }
+}
+
+export interface RecallItem {
+  id: string;
+  snippet: string;
+  truncated: boolean;
+  tags: string[];
+  createdAt: string;
+}
+
+function validRecallItem(v: unknown): v is RecallItem {
+  if (!isPlainObject(v)) return false;
+  // Same adopted contract as fake-adapter: exactly these 5 fields.
+  if (Object.keys(v).sort().join(",") !== "createdAt,id,snippet,tags,truncated") return false;
+  if (!validRecallId(v["id"])) return false;
+  if (typeof v["snippet"] !== "string" || [...(v["snippet"] as string)].length > 200) return false;
+  if (hasLoneSurrogate(v["snippet"] as string)) return false;
+  if (typeof v["truncated"] !== "boolean") return false;
+  if (!Array.isArray(v["tags"])) return false;
+  const tags = v["tags"] as unknown[];
+  if (tags.length > 5) return false;
+  for (const t of tags) {
+    if (typeof t !== "string" || [...t].length < 1 || [...t].length > 256 || CONTROL_RE.test(t)) return false;
+    if (hasLoneSurrogate(t)) return false;
+  }
+  if (typeof v["createdAt"] !== "string" || !isCanonicalUtcMs(v["createdAt"] as string)) return false;
+  return true;
+}
+
+export type EnvelopeCheck =
+  | { ok: true; v: 1; success: boolean; code: ErrorCode }
+  | { ok: false; reason: string };
+
+/**
+ * Strict consumer-side envelope value check. Caller already verified the
+ * 6 key names; this verifies v/ok/code/message/deduplicated VALUES via the
+ * existing protocol MESSAGES table plus success/error shape consistency
+ * (success => data is a plain object; error => data is null).
+ */
+export function validateEnvelopeValues(parsed: Record<string, unknown>): EnvelopeCheck {
+  if ((parsed as { v?: unknown }).v !== 1) return { ok: false, reason: "bad-v" };
+  if (typeof parsed["ok"] !== "boolean") return { ok: false, reason: "bad-ok" };
+  if (typeof parsed["deduplicated"] !== "boolean") return { ok: false, reason: "bad-deduplicated" };
+  const code = parsed["code"];
+  if (typeof code !== "string" || !ALLOWED_CODES.has(code)) return { ok: false, reason: "bad-code" };
+  if (typeof parsed["message"] !== "string") return { ok: false, reason: "bad-message" };
+  if (parsed["message"] !== (MESSAGES as Record<string, string>)[code]) {
+    return { ok: false, reason: "bad-message" };
+  }
+  const success = parsed["ok"] === true;
+  if (success) {
+    if (code !== "OK") return { ok: false, reason: "ok-code-mismatch" };
+    if (!isPlainObject(parsed["data"])) return { ok: false, reason: "bad-data" };
+  } else {
+    if (code === "OK") return { ok: false, reason: "ok-code-mismatch" };
+    if (parsed["data"] !== null) return { ok: false, reason: "bad-data" };
+  }
+  return { ok: true, v: 1, success, code: code as ErrorCode };
+}
+
+export type RecallDataCheck =
+  | { ok: true; recallId: string; items: RecallItem[] }
+  | { ok: false; reason: string };
+
+/**
+ * Recall data contract check BEFORE any map: data must be {recallId,items}
+ * (exactly, per adopted adapter contract), recallId a real id string,
+ * items a real array, every item the real 5-field shape. Missing/null
+ * data or items is INVALID (never a fake valid empty); null items inside
+ * the array are invalid, not mappable.
+ */
+export function validateRecallData(data: unknown): RecallDataCheck {
+  if (!isPlainObject(data)) return { ok: false, reason: "bad-data" };
+  if (Object.keys(data).sort().join(",") !== "items,recallId") return { ok: false, reason: "bad-data" };
+  if (!validRecallId(data["recallId"])) return { ok: false, reason: "bad-recallId" };
+  if (!Array.isArray(data["items"])) return { ok: false, reason: "bad-items" };
+  const items = data["items"] as unknown[];
+  for (const it of items) {
+    if (!validRecallItem(it)) return { ok: false, reason: "bad-item" };
+  }
+  return { ok: true, recallId: data["recallId"] as string, items: items as RecallItem[] };
 }

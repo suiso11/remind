@@ -18,6 +18,8 @@ import {
   latencyStats,
   negativeFractions,
   scorePositive,
+  validateEnvelopeValues,
+  validateRecallData,
   validateReturnedIds,
   type NegativeOutcome,
 } from "./baseline-score.js";
@@ -160,6 +162,10 @@ function parseCliOutput(
   }
   const keys = Object.keys(parsed as Record<string, unknown>).sort().join(",");
   if (keys !== "code,data,deduplicated,message,ok,v") {
+    return { status, stdoutBuf, stderrText, timedOut, elapsedMs, envelope: null, envelopeValid: false, jsonBytes: jsonBytes.length, invalidReason: "bad-envelope" };
+  }
+  const env = parsed as Record<string, unknown>;
+  if (!validateEnvelopeValues(env).ok) {
     return { status, stdoutBuf, stderrText, timedOut, elapsedMs, envelope: null, envelopeValid: false, jsonBytes: jsonBytes.length, invalidReason: "bad-envelope" };
   }
   return { status, stdoutBuf, stderrText, timedOut, elapsedMs, envelope: parsed as Record<string, unknown>, envelopeValid: true, jsonBytes: jsonBytes.length, invalidReason: null };
@@ -542,9 +548,41 @@ function main(): void {
             }
             continue;
           }
-          // OK path: validate items.
-          const items = (env.data?.items ?? []) as Array<{ id: string; snippet: string; tags: string[]; createdAt: string }>;
-          const recallId = typeof env.data?.recallId === "string" ? (env.data.recallId as string) : null;
+          // OK path: validate recall data contract BEFORE any map.
+          // Missing/null data, non-array items, or malformed item shapes are
+          // a failed NORMAL attempt (positive zero / negative failure with
+          // failed latency), never a thrown setup failure and never a fake
+          // valid empty. Completed attempts/counts are preserved.
+          const checked = validateRecallData((env as { data?: unknown }).data);
+          if (!checked.ok) {
+            failureLatencies.push(res.elapsedMs);
+            normalFailures += 1;
+            invariantFailures.push(`${q.id}/r${round}: ${checked.reason}`);
+            stabilityByQuery.get(key)?.push([]);
+            if (q.kind === "positive") {
+              attempts.push({
+                queryId: q.id, round, ok: true, code: "OK", returnedIds: [],
+                snippets: [], tags: [],
+                recallId: null, goldIds, hits: 0, pAt3: 0, recall: 0, rr: 0, firstRank: null,
+                failed: true, invalid: true, invalidReason: checked.reason, invariantViolation: [],
+                latencyMs: res.elapsedMs, kind: q.kind,
+              });
+              positiveEntries.push({ failed: true, pAt3: 0, recall: 0, rr: 0 });
+            } else {
+              attempts.push({
+                queryId: q.id, round, ok: true, code: "OK", returnedIds: [],
+                snippets: [], tags: [],
+                recallId: null, goldIds, hits: 0, pAt3: null, recall: null, rr: null, firstRank: null,
+                failed: true, invalid: true, invalidReason: checked.reason, invariantViolation: [],
+                latencyMs: res.elapsedMs, kind: q.kind,
+              });
+              negativeOutcomes.push("failure");
+            }
+            exitCode = 1;
+            continue;
+          }
+          const items = checked.items;
+          const recallId: string | null = checked.recallId;
           const ids = items.map((i) => i.id);
           const v = validateReturnedIds(ids, BASELINE_K);
           if (!v.ok) {
