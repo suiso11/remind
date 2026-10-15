@@ -127,6 +127,25 @@ type Generator = (prompt: string, opts?: Record<string, unknown>) => Promise<unk
 
 let cachedGenerator: Generator | null = null;
 let cachedDir: string | null = null;
+// Single-flight for the expensive model load: concurrent callers share one
+// in-flight load instead of starting one load each while cachedGenerator is
+// still unset.
+let inflightLoad: { dir: string; promise: Promise<Generator> } | null = null;
+// Timeout poison: Promise.race cannot cancel an unexpired model load or
+// generation — the underlying work keeps running. After a load/generation
+// timeout for a model dir, no NEW model work is started for that dir (calls
+// resolve null fast for bounded retry) until resetLlmRuntime() clears it.
+// This is real ownership (refuse to start), not fake cancellation.
+let poisonedDir: string | null = null;
+
+/** True while new model work for `modelDir` is refused after a timeout. Never throws. */
+export function isLlmPoisoned(modelDir: string): boolean {
+  try {
+    return poisonedDir !== null && poisonedDir === modelDir;
+  } catch {
+    return false;
+  }
+}
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -141,6 +160,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 
 async function loadGenerator(modelDir: string, timeoutMs: number): Promise<Generator> {
   if (cachedGenerator && cachedDir === modelDir) return cachedGenerator;
+  if (inflightLoad && inflightLoad.dir === modelDir) return inflightLoad.promise;
   const mod = await import("@huggingface/transformers");
   const env = (mod as unknown as { env: Record<string, unknown> }).env;
   // Offline-only: local files, never remote, never telemetry.
@@ -149,14 +169,28 @@ async function loadGenerator(modelDir: string, timeoutMs: number): Promise<Gener
   const pipeline = (mod as unknown as { pipeline: (...a: unknown[]) => Promise<Generator> }).pipeline;
   // dtype "q4" selects the quantized variant; onnx-community ports resolve
   // decoder sessions as onnx/model_<quant>.onnx (here onnx/model_q4.onnx).
-  const generator = await withTimeout(
-    pipeline(LLM_TASK, modelDir, { dtype: LLM_DTYPE, local_files_only: true } as unknown as undefined),
-    timeoutMs,
-    "llm load timeout",
-  );
-  cachedGenerator = generator;
-  cachedDir = modelDir;
-  return generator;
+  const started = ((): Promise<Generator> => {
+    const p = withTimeout(
+      pipeline(LLM_TASK, modelDir, { dtype: LLM_DTYPE, local_files_only: true } as unknown as undefined),
+      timeoutMs,
+      "llm load timeout",
+    );
+    return p.then(
+      (generator) => {
+        if (inflightLoad && inflightLoad.promise === p) inflightLoad = null;
+        cachedGenerator = generator;
+        cachedDir = modelDir;
+        return generator;
+      },
+      (e) => {
+        if (inflightLoad && inflightLoad.promise === p) inflightLoad = null;
+        if (e instanceof Error && e.message === "llm load timeout") poisonedDir = modelDir;
+        throw e;
+      },
+    );
+  })();
+  inflightLoad = { dir: modelDir, promise: started };
+  return started;
 }
 
 function generatedTextOf(out: unknown): string | null {
@@ -184,16 +218,26 @@ export async function generateCompletion(
   try {
     if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 8000) return null;
     if (!modelFilesPresent(modelDir)) return null;
+    // Refuse to start new model work after a timeout for this dir (poison):
+    // the timed-out load/generation is still running uncancelled, so piling
+    // another 1.5B load/generation on top risks exhausting memory/CPU.
+    if (poisonedDir !== null && poisonedDir === modelDir) return null;
     const generator = await loadGenerator(modelDir, opts.timeoutMs);
-    const out = await withTimeout(
-      generator(prompt, {
-        max_new_tokens: opts.maxNewTokens,
-        do_sample: false,
-        return_full_text: false,
-      } as unknown as Record<string, unknown>),
-      opts.timeoutMs,
-      "llm generate timeout",
-    );
+    let out: unknown;
+    try {
+      out = await withTimeout(
+        generator(prompt, {
+          max_new_tokens: opts.maxNewTokens,
+          do_sample: false,
+          return_full_text: false,
+        } as unknown as Record<string, unknown>),
+        opts.timeoutMs,
+        "llm generate timeout",
+      );
+    } catch (e) {
+      if (e instanceof Error && e.message === "llm generate timeout") poisonedDir = modelDir;
+      return null;
+    }
     const text = generatedTextOf(out);
     if (typeof text !== "string" || text.length === 0) return null;
     if (containsLoneSurrogateDeep(text) || hasControl(text.replace(/\n/g, ""))) return null;
@@ -203,10 +247,13 @@ export async function generateCompletion(
   }
 }
 
-/** Forget the cached pipeline (tests/provisioning hygiene). Never throws. */
+/** Forget the cached pipeline (tests/provisioning hygiene). Also clears the
+ *  timeout poison and any shared in-flight load. Never throws. */
 export function resetLlmRuntime(): void {
   cachedGenerator = null;
   cachedDir = null;
+  inflightLoad = null;
+  poisonedDir = null;
 }
 
 /* ---------------- strict validation of untrusted model text ---------------- */

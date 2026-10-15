@@ -1338,6 +1338,12 @@ export function rememberRecord(
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
     const id = savedRecordId(saved.responseJson);
     if (id) postCommitEnqueueProjections(db, n.scope, [id], n.links);
+    if (id) {
+      // Recovery: a post-commit cultivation enqueue lost to a crash or a
+      // transient failure leaves no open review; replay re-enqueues (open
+      // dedupe makes the already-queued case a safe duplicate no-op).
+      enqueueCultivationReview(db, config, { recordId: id, scope: n.scope, trigger: "remember", runId: n.runId, now: nowIso() });
+    }
     return replaySaved(saved.responseJson, config);
   }
   {
@@ -1425,6 +1431,9 @@ export function rememberRecord(
       if (again && again.op === "record.remember" && again.requestHash === reqHash) {
         const replayId = savedRecordId(again.responseJson);
         if (replayId) postCommitEnqueueProjections(db, n.scope, [replayId], n.links);
+        if (replayId) {
+          enqueueCultivationReview(db, config, { recordId: replayId, scope: n.scope, trigger: "remember", runId: n.runId, now: nowIso() });
+        }
         return replaySaved(again.responseJson, config);
       }
       return budgeted(fail("CONFLICT"), config);
@@ -2080,6 +2089,12 @@ export function feedbackRecords(
     const denied = scopeGate(db, config, nScope);
     if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    // Recovery: validated-feedback reviews lost with the original post-commit
+    // enqueue are re-enqueued here (open dedupe keeps this safe). Reachable
+    // only with the same exposure-verified ids (requestHash matched).
+    for (const id of ids) {
+      enqueueCultivationReview(db, config, { recordId: id, scope: nScope, trigger: "feedback", runId: nRunId, now: nowIso() });
+    }
     return replaySaved(saved.responseJson, config);
   }
   {
@@ -2177,6 +2192,9 @@ export function feedbackRecords(
         return budgeted(fail("STORE_UNAVAILABLE"), config);
       }
       if (again && again.op === "record.feedback" && again.requestHash === reqHash) {
+        for (const id of ids) {
+          enqueueCultivationReview(db, config, { recordId: id, scope: nScope, trigger: "feedback", runId: nRunId, now: nowIso() });
+        }
         return replaySaved(again.responseJson, config);
       }
       return budgeted(fail("CONFLICT"), config);
@@ -2255,6 +2273,9 @@ export function correctRecord(
         [replayId, recordId],
         [...outboundRefsOf(db, recordId), ...nLinks],
       );
+      // Recovery: re-enqueue the corrected-revision review when the original
+      // post-commit enqueue was lost (open dedupe keeps this safe).
+      enqueueCultivationReview(db, config, { recordId: replayId, scope: nScope, trigger: "correct", runId: nRunId, now: nowIso() });
     }
     return replaySaved(saved.responseJson, config);
   }
@@ -2374,6 +2395,7 @@ export function correctRecord(
             [replayId, recordId],
             [...outboundRefsOf(db, recordId), ...nLinks],
           );
+          enqueueCultivationReview(db, config, { recordId: replayId, scope: nScope, trigger: "correct", runId: nRunId, now: nowIso() });
         }
         return replaySaved(again.responseJson, config);
       }
@@ -2808,11 +2830,14 @@ export function searchRecords(
         }
       }
       // Canonical bodyNorm fallback (active+retired): committed memory stays
-      // findable for multi-token queries when both derived lexical indexes
-      // (FTS + bigrams) are absent or stale. Whole-query instr first, then
-      // per-term OR — the same shape as recall's canonicalBodyNormHits.
+      // findable for multi-token queries when derived lexical indexes (FTS +
+      // bigrams) are absent or stale. Whole-query instr first, then per-term
+      // OR — the same shape as recall's canonicalBodyNormHits. Merged
+      // UNCONDITIONALLY (like record.recall): when only a subset of derived
+      // rows is lost, the surviving derived hits are nonempty and a gated
+      // fallback would skip the exact canonical match in the unindexed row.
       const canonRank = new Map<string, number>();
-      if (lexRank.size === 0 && biRank.size === 0) {
+      {
         try {
           const w = windowArgs("records");
           const whole = db

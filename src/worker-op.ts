@@ -34,6 +34,7 @@ import { maintainDistill } from "./distill.js";
 import {
   embedTexts,
   resolveModelDir,
+  vectorEmbedBudgetMs,
   vectorTimeoutMs,
   vectorTopK,
   vectorsEnabled,
@@ -47,10 +48,13 @@ interface Req {
   params: Record<string, unknown>;
   idempotencyKey?: string;
   effectiveBusyMs: number;
+  /** Remaining operation budget (ms) at dispatch; caps vector inference. */
+  remainingMs?: number;
 }
 
 async function recallVectorFor(
   req: Req,
+  workerStartMs: number,
 ): Promise<RecallVectorInput | undefined> {
   try {
     if (!vectorsEnabled(req.config)) return undefined;
@@ -58,8 +62,12 @@ async function recallVectorFor(
     if (typeof q !== "string" || q.length === 0) return undefined;
     const nq = normalizeBody(q);
     if (nq.length === 0) return undefined;
+    // Cap embedding by the remaining recall deadline with room for the
+    // lexical fallback; null => skip vectors now (lexical+graph recall).
+    const budget = vectorEmbedBudgetMs(vectorTimeoutMs(req.config), req.remainingMs, Date.now() - workerStartMs);
+    if (budget === null) return undefined;
     const modelDir = resolveModelDir(req.config, req.configPath);
-    const vecs = await embedTexts([nq], modelDir, vectorTimeoutMs(req.config));
+    const vecs = await embedTexts([nq], modelDir, budget);
     if (!vecs || vecs.length !== 1 || !vecs[0]) return undefined;
     return { vec: vecs[0] as Float32Array, topK: vectorTopK(req.config) };
   } catch {
@@ -118,7 +126,7 @@ function runOpSync(db: DatabaseSync, req: Req, vector?: RecallVectorInput) {
   }
 }
 
-async function runOpAsync(db: DatabaseSync, req: Req) {
+async function runOpAsync(db: DatabaseSync, req: Req, workerStartMs: number) {
   if (req.op === "maintain.distill") {
     if (typeof req.idempotencyKey !== "string") {
       return applyResponseBudget(fail("BAD_REQUEST"), req.config.limits.responseMaxBytes);
@@ -128,7 +136,7 @@ async function runOpAsync(db: DatabaseSync, req: Req) {
     // transactions around the inference phase).
     return maintainDistill(db, req.config, req.configPath, req.params, req.idempotencyKey);
   }
-  return runOpSync(db, req, req.op === "record.recall" ? await recallVectorFor(req) : undefined);
+  return runOpSync(db, req, req.op === "record.recall" ? await recallVectorFor(req, workerStartMs) : undefined);
 }
 
 async function main(): Promise<void> {
@@ -145,11 +153,12 @@ async function main(): Promise<void> {
     const busy = Math.max(0, Math.floor(req.effectiveBusyMs));
     db = new DatabaseSync(req.dbFile);
     db.exec(`PRAGMA busy_timeout = ${busy}`);
+    const workerStartMs = Date.now();
     // Vector query embedding happens BEFORE the recall transaction so the
     // same bounded fusion runs inside it. Any failure => undefined =>
     // lexical+graph fallback (never an error). maintain.distill runs its own
     // async drain (inference strictly outside canonical transactions).
-    const res = await runOpAsync(db, req);
+    const res = await runOpAsync(db, req, workerStartMs);
     // Deliver the committed envelope before optional projection work so a
     // slow drain cannot turn a known commit into a parent-side TIMEOUT.
     post(res);

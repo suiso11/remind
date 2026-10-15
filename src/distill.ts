@@ -409,10 +409,33 @@ export async function maintainDistill(
     const maintenanceMs = maintenanceTimeoutMs(config);
     const startedMs = Date.now();
     const overDeadline = (): boolean => Date.now() - startedMs > maintenanceMs;
+    // Renewal clock: production heartbeats use a fresh wall-clock timestamp
+    // per renewal so a multi-generation drain keeps extending the lease; the
+    // fixed drain clock is used only when the caller passed an explicit
+    // nowOverride (deterministic tests).
+    const testClock = nowOverride !== undefined;
+    const renewNow = (): string => (testClock ? nowValid : new Date().toISOString());
     const renewOrAbort = (): boolean => {
       if (overDeadline()) return false;
-      const r = acquireCultivationLease(db, config, { owner: execOwner, scope: p.scope, now: nowValid });
+      const r = acquireCultivationLease(db, config, { owner: execOwner, scope: p.scope, now: renewNow() });
       return r.acquired;
+    };
+    // Inference-failure latch: the LLM runtime cannot cancel an unexpired
+    // load/generation (Promise.race only rejects the wrapper), so after the
+    // first timed-out/failed inference this drain issues NO further model
+    // calls — remaining reviews go straight to bounded retry. This aborts the
+    // batch's model work instead of accumulating one live inference per
+    // subsequent review while an earlier load is still running.
+    let inferencePoisoned = false;
+    // Ownership-guarded settle for lost-lease paths: only rows still leased
+    // under this batch are failed for retry. Rows already reclaimed or
+    // re-leased by the stealing owner carry a different (or NULL) batchId and
+    // are left for the owner/reclaim path, never reset by this stale run.
+    const settleOwned = (queueIds: string[]): void => {
+      for (const qid of queueIds) {
+        if (batchId) completeCultivationReview(db, config, qid, "failed", nowValid, { batchId });
+        else completeCultivationReview(db, config, qid, "failed", nowValid);
+      }
     };
     const decide: DistillDecide =
       decideOverride ?? ((prompt) => generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens }));
@@ -430,10 +453,17 @@ export async function maintainDistill(
     for (const review of items) {
       // Bounded renewal: heartbeat the lease between model calls and stop the
       // drain before the maintenance deadline. A lost lease or an overrun
-      // aborts with nothing applied (leased rows go back for bounded retry).
+      // aborts with nothing applied (owned leased rows go back for bounded
+      // retry; rows already taken by a new owner are left alone).
       if (!renewOrAbort()) {
-        for (const it of items) completeCultivationReview(db, config, it.queueId, "failed", nowValid);
+        settleOwned(items.map((it) => it.queueId));
         return budgeted(overDeadline() ? fail("TIMEOUT") : conflict(), config);
+      }
+      if (inferencePoisoned) {
+        // A prior inference in this drain already timed out/failed: issue no
+        // further model calls, bounded retry for the rest.
+        planned.push({ review, action: null, retry: true });
+        continue;
       }
       const target = loadRecord(db, review.recordId);
       if (!target || target.scope !== p.scope) {
@@ -461,9 +491,10 @@ export async function maintainDistill(
         gateRaw = null;
       }
       if (gateRaw === null) {
+        inferencePoisoned = true; // uncancelled inference: stop issuing model calls
         planned.push({ review, action: null, retry: true }); // inference failure => retry, no apply
         if (!renewOrAbort()) {
-          for (const it of items) completeCultivationReview(db, config, it.queueId, "failed", nowValid);
+          settleOwned(items.map((it) => it.queueId));
           return budgeted(overDeadline() ? fail("TIMEOUT") : conflict(), config);
         }
         continue;
@@ -496,6 +527,7 @@ export async function maintainDistill(
         choiceRaw = null;
       }
       if (choiceRaw === null) {
+        inferencePoisoned = true; // uncancelled inference: stop issuing model calls
         planned.push({ review, action: null, retry: true });
         continue;
       }
@@ -519,11 +551,16 @@ export async function maintainDistill(
     // this batch, or it proposes straight back at the proposer (both model
     // judgments agree they say the same thing). One-sided picks — the
     // observed positional-bias failure mode — become audited keeps.
+    // Crucially, a peer that IS under review in this batch but produced no
+    // reciprocal proposal (KEEP, RETIRE, inference failure, or a merge aimed
+    // elsewhere) has explicitly declined: its absence from proposalByRecord
+    // is not permission, and the one-sided merge becomes an audited keep.
     const proposalByRecord = new Map(staged.map((s) => [s.target.id, s.otherId]));
+    const underReview = new Set(items.map((it) => it.recordId));
     const survivors: StagedProposal[] = [];
     for (const s of staged) {
       const back = proposalByRecord.get(s.otherId);
-      if (back === undefined || back === s.target.id) {
+      if (back === s.target.id || (back === undefined && !underReview.has(s.otherId))) {
         survivors.push(s);
       } else {
         planned.push({ review: s.review, action: keepOf(s.target.id, s.target.revision), retry: false });
@@ -559,8 +596,12 @@ export async function maintainDistill(
     }
     for (const s of deduped) {
       if (!renewOrAbort()) {
-        for (const it of items) completeCultivationReview(db, config, it.queueId, "failed", nowValid);
+        settleOwned(items.map((it) => it.queueId));
         return budgeted(overDeadline() ? fail("TIMEOUT") : conflict(), config);
+      }
+      if (inferencePoisoned) {
+        planned.push({ review: s.review, action: null, retry: true });
+        continue;
       }
       const target = s.target;
       const other = loadRecord(db, s.otherId);
@@ -568,6 +609,11 @@ export async function maintainDistill(
         planned.push({ review: s.review, action: keepOf(target.id, target.revision), retry: false });
         continue;
       }
+      // Capture the peer's live revision/status with the action so the apply
+      // transaction re-validates BOTH sources atomically: a peer corrected,
+      // retired, or archived during the confirmation/summary inference below
+      // (or before the commit) becomes a CONFLICT no-change there.
+      const peerGuard = { recordId: other.id, expectedRevision: other.revision, expectedStatus: "active" as const };
       // Stage 2b (shared-fact confirmation, conservative): the model must
       // state the fact both memories share; NONE/uncertain keeps. This is a
       // second real model judgment, not a heuristic substitute.
@@ -578,6 +624,7 @@ export async function maintainDistill(
         confirmRaw = null;
       }
       if (confirmRaw === null) {
+        inferencePoisoned = true; // uncancelled inference: stop issuing model calls
         planned.push({ review: s.review, action: null, retry: true });
         continue;
       }
@@ -595,15 +642,22 @@ export async function maintainDistill(
       const summaryBody = parseSummaryBody(summaryRaw, config.limits.bodyMaxCp);
       if (summaryRaw === null || summaryBody === null) {
         if (summaryRaw === null) {
+          inferencePoisoned = true; // uncancelled inference: stop issuing model calls
           planned.push({ review: s.review, action: null, retry: true }); // summary-stage failure => retry
         } else {
           planned.push({ review: s.review, action: keepOf(target.id, target.revision), retry: false });
         }
         continue;
       }
-      const refs = [...new Set([...loadSourceRefs(db, target.id), ...loadSourceRefs(db, other.id)])]
-        .sort()
-        .slice(0, config.limits.sourceRefsMax);
+      // Provenance union is conservative: when both sources together carry
+      // more distinct source refs than sourceRefsMax, the merge is skipped
+      // (audited keep) rather than written with truncated provenance.
+      const refUnion = [...new Set([...loadSourceRefs(db, target.id), ...loadSourceRefs(db, other.id)])].sort();
+      if (refUnion.length > config.limits.sourceRefsMax) {
+        planned.push({ review: s.review, action: keepOf(target.id, target.revision), retry: false });
+        continue;
+      }
+      const refs = refUnion;
       const tags = [...new Set([...loadTags(db, target.id, config.limits.tagsMax), ...loadTags(db, other.id, config.limits.tagsMax)])]
         .sort()
         .slice(0, config.limits.tagsMax);
@@ -614,6 +668,7 @@ export async function maintainDistill(
           action: "consolidate",
           expectedRevision: target.revision,
           expectedStatus: "active",
+          peer: peerGuard,
           summary: {
             body: summaryBody,
             provenance: { source: DISTILL_SUMMARY_SOURCE, observedAt: nowValid },
@@ -632,7 +687,7 @@ export async function maintainDistill(
     // this batchId, so a review cancelled after dequeue becomes an audited
     // no-change instead of a post-cancel mutation.
     if (!renewOrAbort()) {
-      for (const it of items) completeCultivationReview(db, config, it.queueId, "failed", nowValid);
+      settleOwned(items.map((it) => it.queueId));
       return budgeted(overDeadline() ? fail("TIMEOUT") : conflict(), config);
     }
     const actions = planned.filter((x) => x.action !== null).map((x) => x.action as CultivationAction);
@@ -671,11 +726,15 @@ export async function maintainDistill(
           if (r?.applied) applied++;
         }
       } else {
-        // Whole-batch failure (e.g. STORE_UNAVAILABLE): isolate it — every
-        // leased review goes back for bounded retry, memory untouched (the
-        // single apply transaction rolled back, so nothing was applied).
+        // Whole-batch failure: isolate it — memory untouched (the single
+        // apply transaction rolled back, so nothing was applied). Settle is
+        // ownership-guarded: on a fence CONFLICT (lease stolen) the rows may
+        // already belong to the new owner's batch, so only rows still leased
+        // under this batch go back for bounded retry; the rest stay with the
+        // owner/reclaim path. On STORE_UNAVAILABLE with the lease still held
+        // the guard matches every owned row (same outcome as before).
         for (const pl of planned) failedIds.push(pl.review.queueId);
-        for (const qid of failedIds) completeCultivationReview(db, config, qid, "failed", nowValid);
+        settleOwned(failedIds);
         // res is a failure envelope here (never OK): propagate its fixed code.
         const code = (res.code === "OK" ? "STORE_UNAVAILABLE" : res.code) as Exclude<ResponseEnvelope["code"], "OK">;
         return budgeted(fail(code), config);

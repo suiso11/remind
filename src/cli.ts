@@ -369,6 +369,11 @@ async function main(): Promise<void> {
   }
   const elapsed = (): number => Date.now() - started;
   const remaining = (): number => config.timeouts.cliMs - elapsed();
+  // Selected operation budget for final error handling: maintain.distill
+  // legitimately runs under the longer maintenance budget, so a distill
+  // failure inside maintenance.timeoutMs must keep its domain code and never
+  // be rewritten to TIMEOUT by the shorter cliMs comparison below.
+  let opBudget = config.timeouts.cliMs;
   let db: { close(): void } | null = null;
   let dbFile = "";
   try {
@@ -461,6 +466,7 @@ async function main(): Promise<void> {
             // budget (local-model inference); all other ops keep cliMs.
             const budget =
               v.req.op === "maintain.distill" ? maintenanceTimeoutMs(config) : config.timeouts.cliMs;
+            opBudget = budget;
             const opRemaining = budget - elapsed();
             if (opRemaining <= 0) {
               res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
@@ -469,18 +475,19 @@ async function main(): Promise<void> {
               db = null;
               const eff = effectiveBusyMs(config.timeouts.busyMs, opRemaining);
               try {
-                const outcome = await runStoreOpWithDeadline(
-                  {
-                    dbFile,
-                    config,
-                    configPath,
-                    op: v.req.op,
-                    params: v.req.params,
-                    idempotencyKey: v.req.idempotencyKey,
-                    effectiveBusyMs: eff,
-                  },
-                  opRemaining,
-                );
+              const outcome = await runStoreOpWithDeadline(
+                {
+                  dbFile,
+                  config,
+                  configPath,
+                  op: v.req.op,
+                  params: v.req.params,
+                  idempotencyKey: v.req.idempotencyKey,
+                  effectiveBusyMs: eff,
+                  remainingMs: opRemaining,
+                },
+                opRemaining,
+              );
                 if (outcome.timedOut) {
                   res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
                 } else {
@@ -498,7 +505,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const timedOut = elapsed() > config.timeouts.cliMs;
+  const timedOut = elapsed() > opBudget;
   let closeFailed = false;
   try {
     db?.close();

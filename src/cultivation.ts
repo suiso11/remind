@@ -263,33 +263,44 @@ export function enqueueCultivationReview(
     const now = input.now ?? nowIso();
     if (!Number.isFinite(Date.parse(now))) return "dropped_full";
     ensureCultivationSchema(db);
-    let open = 0;
-    try {
-      const row = db
-        .prepare(
-          `SELECT COUNT(*) AS n FROM cultivation_queue WHERE status IN ('pending','leased')`,
-        )
-        .get() as { n: number } | undefined;
-      open = typeof row?.n === "number" ? row.n : 0;
-    } catch {
-      return "dropped_full";
-    }
-    if (open >= bounds.queueMax) return "dropped_full";
+    // Atomic capacity check + insert as ONE statement: the COUNT subquery is
+    // evaluated while the statement holds the write lock, so concurrent
+    // remember/correct/feedback workers serialize and cannot jointly exceed
+    // queueMax. A single statement issues no explicit BEGIN/COMMIT (it stays
+    // invisible to transaction observers and is safe when the caller already
+    // holds an outer write transaction); contention or any failure drops
+    // (the canonical write already committed is unaffected).
     try {
       const res = db.prepare(
         `INSERT OR IGNORE INTO cultivation_queue(queueId, recordId, scope, trigger, status, attempts, nextAt, createdAt, runId, batchId)
-         VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, NULL)`,
-      ).run(genId("cq"), input.recordId, input.scope, input.trigger, now, now, input.runId ?? null) as unknown as {
-        changes?: unknown;
-      };
+         SELECT ?, ?, ?, ?, 'pending', 0, ?, ?, ?, NULL
+         WHERE (SELECT COUNT(*) FROM cultivation_queue WHERE status IN ('pending','leased')) < ?`,
+      ).run(
+        genId("cq"),
+        input.recordId,
+        input.scope,
+        input.trigger,
+        now,
+        now,
+        input.runId ?? null,
+        bounds.queueMax,
+      ) as unknown as { changes?: unknown };
       const changes = typeof res?.changes === "number" ? res.changes : Number(res?.changes ?? 0);
-      // INSERT OR IGNORE reports changes=0 on the partial-unique open-per-record
-      // hit: a review is already queued, so report duplicate (not enqueued).
-      if (changes === 0) return "duplicate";
-      return "enqueued";
+      if (changes === 1) return "enqueued";
+      // changes=0 is either the cap (WHERE false) or the partial-unique
+      // open-per-record hit (IGNORE): disambiguate by re-reading the row.
+      try {
+        const open = db
+          .prepare(
+            `SELECT 1 AS one FROM cultivation_queue WHERE recordId = ? AND status IN ('pending','leased') LIMIT 1`,
+          )
+          .get(input.recordId) as { one: number } | undefined;
+        return open ? "duplicate" : "dropped_full";
+      } catch {
+        return "dropped_full";
+      }
     } catch {
-      // UNIQUE open-per-record hit => duplicate (a review is already queued).
-      return "duplicate";
+      return "dropped_full";
     }
   } catch {
     return "dropped_full";
@@ -370,48 +381,65 @@ export function acquireCultivationLease(
         ? Math.max(1000, Math.min(Math.floor(input.ttlMs), 600000))
         : bounds.leaseTtlMs;
     const expiresAt = new Date(Date.parse(now) + ttl).toISOString();
-    const row = db
-      .prepare(`SELECT owner, expiresAt, scope, batchId FROM cultivation_lease WHERE leaseId = 'm3'`)
-      .get() as
-      | { owner: string; expiresAt: string; scope: string | null; batchId: string | null }
-      | undefined;
-    if (row && row.expiresAt > now) {
-      if (row.owner === input.owner) {
-        // Same-execution re-acquire refreshes the TTL (heartbeat/renewal).
-        // Owners are unique per distill execution (caller key + nonce), so a
-        // concurrent retry under the same caller key holds a different owner
-        // and is correctly refused below instead of hijacking the lease.
-        db.prepare(
-          `UPDATE cultivation_lease SET expiresAt = ?, scope = ?, updatedAt = ? WHERE leaseId = 'm3' AND owner = ?`,
-        ).run(expiresAt, input.scope ?? row.scope, now, input.owner);
+    // Atomic availability check + insert/steal: one IMMEDIATE write
+    // transaction so two concurrent acquirers cannot both observe an empty or
+    // expired lease and both return acquired:true (single-flight). A lock
+    // contender that cannot begin fails closed as refused (caller retries).
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = db
+        .prepare(`SELECT owner, expiresAt, scope, batchId FROM cultivation_lease WHERE leaseId = 'm3'`)
+        .get() as
+        | { owner: string; expiresAt: string; scope: string | null; batchId: string | null }
+        | undefined;
+      if (row && row.expiresAt > now) {
+        if (row.owner === input.owner) {
+          // Same-execution re-acquire refreshes the TTL (heartbeat/renewal).
+          // Owners are unique per distill execution (caller key + nonce), so a
+          // concurrent retry under the same caller key holds a different owner
+          // and is correctly refused below instead of hijacking the lease.
+          db.prepare(
+            `UPDATE cultivation_lease SET expiresAt = ?, scope = ?, updatedAt = ? WHERE leaseId = 'm3' AND owner = ?`,
+          ).run(expiresAt, input.scope ?? row.scope, now, input.owner);
+          db.exec("COMMIT");
+          return {
+            acquired: true,
+            lease: { owner: row.owner, expiresAt, scope: input.scope ?? row.scope, batchId: row.batchId },
+          };
+        }
+        db.exec("ROLLBACK");
         return {
-          acquired: true,
-          lease: { owner: row.owner, expiresAt, scope: input.scope ?? row.scope, batchId: row.batchId },
+          acquired: false,
+          lease: { owner: row.owner, expiresAt: row.expiresAt, scope: row.scope, batchId: row.batchId },
         };
       }
+      // No live lease (missing or expired): reclaim crashed orphans first,
+      // while the lease still reads expired, then take the lease. Reclaim
+      // runs inside this same transaction (no nested txn) and is best-effort.
+      try {
+        reclaimExpiredCultivationLeases(db, config, now);
+      } catch {
+        /* reclaim is best-effort */
+      }
+      db.prepare(
+        `INSERT INTO cultivation_lease(leaseId, owner, expiresAt, scope, batchId, updatedAt)
+         VALUES ('m3', ?, ?, ?, NULL, ?)
+         ON CONFLICT(leaseId) DO UPDATE SET owner=excluded.owner, expiresAt=excluded.expiresAt,
+           scope=excluded.scope, batchId=NULL, updatedAt=excluded.updatedAt`,
+      ).run(input.owner, expiresAt, input.scope ?? null, now);
+      db.exec("COMMIT");
       return {
-        acquired: false,
-        lease: { owner: row.owner, expiresAt: row.expiresAt, scope: row.scope, batchId: row.batchId },
+        acquired: true,
+        lease: { owner: input.owner, expiresAt, scope: input.scope ?? null, batchId: null },
       };
-    }
-    // No live lease (missing or expired): reclaim crashed orphans first, while
-    // the lease still reads expired, then take the lease. Reclaim is
-    // best-effort and never fails the acquire.
-    try {
-      reclaimExpiredCultivationLeases(db, config, now);
     } catch {
-      /* reclaim is best-effort */
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      return { acquired: false, lease: null };
     }
-    db.prepare(
-      `INSERT INTO cultivation_lease(leaseId, owner, expiresAt, scope, batchId, updatedAt)
-       VALUES ('m3', ?, ?, ?, NULL, ?)
-       ON CONFLICT(leaseId) DO UPDATE SET owner=excluded.owner, expiresAt=excluded.expiresAt,
-         scope=excluded.scope, batchId=NULL, updatedAt=excluded.updatedAt`,
-    ).run(input.owner, expiresAt, input.scope ?? null, now);
-    return {
-      acquired: true,
-      lease: { owner: input.owner, expiresAt, scope: input.scope ?? null, batchId: null },
-    };
   } catch {
     return { acquired: false, lease: null };
   }
@@ -627,6 +655,12 @@ export function dequeueCultivationBatch(
 /**
  * Settle one queued review: done/cancelled are terminal; failed retries with
  * capped backoff until reviewMaxAttempts, then terminal failed. Never throws.
+ *
+ * Optional `guard.batchId` restricts the settle to rows still leased under
+ * that batch: rows reclaimed or re-leased by a newer lease owner (different
+ * batchId, or back to pending with batchId NULL) are left untouched for the
+ * owner/reclaim path instead of being reset by a stale execution. Returns
+ * false when the guard does not match (nothing settled).
  */
 export function completeCultivationReview(
   db: DatabaseSync,
@@ -634,6 +668,7 @@ export function completeCultivationReview(
   queueId: string,
   outcome: "done" | "failed" | "cancelled",
   now?: string,
+  guard?: { batchId: string },
 ): boolean {
   try {
     ensureCultivationSchema(db);
@@ -641,13 +676,39 @@ export function completeCultivationReview(
     const ts = now ?? nowIso();
     if (!Number.isFinite(Date.parse(ts))) return false;
     if (outcome === "done" || outcome === "cancelled") {
-      const res = db
-        .prepare(
-          `UPDATE cultivation_queue SET status=?, batchId=NULL WHERE queueId=? AND status IN ('pending','leased')`,
-        )
-        .run(outcome, queueId) as unknown as { changes?: unknown };
+      const res = guard
+        ? db
+            .prepare(
+              `UPDATE cultivation_queue SET status=?, batchId=NULL WHERE queueId=? AND status='leased' AND batchId=?`,
+            )
+            .run(outcome, queueId, guard.batchId)
+        : db
+            .prepare(
+              `UPDATE cultivation_queue SET status=?, batchId=NULL WHERE queueId=? AND status IN ('pending','leased')`,
+            )
+            .run(outcome, queueId) as unknown as { changes?: unknown };
       const c = (res as { changes?: unknown })?.changes;
       return (typeof c === "number" ? c : 0) === 1;
+    }
+    if (guard) {
+      const row = db
+        .prepare(`SELECT attempts FROM cultivation_queue WHERE queueId=? AND status='leased' AND batchId=?`)
+        .get(queueId, guard.batchId) as { attempts: number } | undefined;
+      if (!row) return false;
+      const attempts = row.attempts + 1;
+      if (attempts >= bounds.reviewMaxAttempts) {
+        db.prepare(`UPDATE cultivation_queue SET status='failed', attempts=?, batchId=NULL WHERE queueId=? AND status='leased' AND batchId=?`).run(
+          attempts,
+          queueId,
+          guard.batchId,
+        );
+      } else {
+        const nextAt = new Date(Date.parse(ts) + cultivationBackoffMs(attempts)).toISOString();
+        db.prepare(
+          `UPDATE cultivation_queue SET status='pending', attempts=?, nextAt=?, batchId=NULL WHERE queueId=? AND status='leased' AND batchId=?`,
+        ).run(attempts, nextAt, queueId, guard.batchId);
+      }
+      return true;
     }
     const row = db
       .prepare(`SELECT attempts FROM cultivation_queue WHERE queueId=? AND status IN ('pending','leased')`)
@@ -692,6 +753,17 @@ export interface CultivationAction {
   expectedRevision?: number;
   /** Optimistic guard: skip (stale) when the row status differs. */
   expectedStatus?: "active" | "retired";
+  /**
+   * Consolidation peer guard: the second source of a merge, re-validated
+   * atomically in the apply transaction. A peer corrected, retired, or
+   * archived after inference (stale body) becomes a per-action CONFLICT
+   * no-change instead of a summary derived from stale content.
+   */
+  peer?: {
+    recordId: string;
+    expectedRevision?: number;
+    expectedStatus?: "active" | "retired";
+  };
   /** Required for retire/reactivate (fixed codes, metadata-only audit). */
   reasonCode?: string;
   /** Required for consolidate (real summary insert). */
@@ -963,6 +1035,44 @@ export function applyCultivationBatch(
         }
 
         // consolidate: real summary insert, history kept, no auto-retire.
+        // Peer guard: when the caller names the second merge source, its
+        // revision/status are re-validated atomically here (same txn). A peer
+        // corrected/retired/archived after inference is stale: conservative
+        // CONFLICT no-change, never a summary from the stale body. Links are
+        // additionally required to resolve to existing same-scope rows below.
+        if (isPlainObject(a.peer as unknown as Record<string, unknown>)) {
+          const peer = a.peer as NonNullable<CultivationAction["peer"]>;
+          if (
+            typeof peer.recordId !== "string" ||
+            peer.recordId.length === 0 ||
+            peer.recordId.length > 256 ||
+            hasControl(peer.recordId) ||
+            peer.recordId === recordId
+          ) {
+            skip("BAD_REQUEST");
+            continue;
+          }
+          let peerRow: { scope: string; status: string; revision: number } | undefined;
+          try {
+            peerRow = db
+              .prepare(`SELECT scope, status, revision FROM records WHERE id = ?`)
+              .get(peer.recordId) as { scope: string; status: string; revision: number } | undefined;
+          } catch {
+            throw new Error("read failed");
+          }
+          if (!peerRow || peerRow.scope !== nScope || peerRow.status !== "active") {
+            skip(!peerRow ? "NOT_FOUND" : peerRow.scope !== nScope ? "FORBIDDEN_SCOPE" : "CONFLICT");
+            continue;
+          }
+          if (
+            (peer.expectedRevision !== undefined &&
+              (!Number.isInteger(peer.expectedRevision) || peer.expectedRevision !== peerRow.revision)) ||
+            (peer.expectedStatus !== undefined && peer.expectedStatus !== peerRow.status)
+          ) {
+            skip("CONFLICT"); // peer went stale after inference: no summary
+            continue;
+          }
+        }
         if (!isPlainObject(summary as unknown as Record<string, unknown>)) {
           skip("BAD_REQUEST");
           continue;

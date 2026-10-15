@@ -56,8 +56,36 @@ export function vectorTimeoutMs(config: AppConfig): number {
   return Number.isInteger(t) && t >= 500 && t <= 60000 ? t : VECTOR_DEFAULT_TIMEOUT_MS;
 }
 
+/** True only when the operator explicitly enabled the vectors section. Absent
+ *  (or enabled:false) => false: existing configurations without the optional
+ *  block keep the prior lexical-plus-graph behavior (M1) instead of silently
+ *  enabling semantic recall because a default model directory happens to
+ *  exist. Same convention as the optional llm section. */
 export function vectorsEnabled(config: AppConfig): boolean {
-  return config.vectors?.enabled ?? true;
+  return config.vectors?.enabled === true;
+}
+
+/**
+ * Bound a vector query-embedding call by the remaining recall deadline.
+ * Returns the embedding budget (ms), or null when embedding must be skipped
+ * outright so the lexical fallback still fits: the reserve leaves room for
+ * the fallback recall inside the same operation budget. Unknown remaining
+ * (legacy callers) => the configured timeout, unchanged.
+ */
+export function vectorEmbedBudgetMs(
+  configuredMs: number,
+  remainingMs: number | undefined,
+  elapsedMs: number,
+): number | null {
+  const configured = Number.isFinite(configuredMs) && configuredMs > 0 ? Math.floor(configuredMs) : 0;
+  if (configured <= 0) return null;
+  if (remainingMs === undefined || !Number.isFinite(remainingMs)) return configured;
+  const remaining = Math.floor(remainingMs) - Math.max(0, Math.floor(elapsedMs));
+  // Reserve for the lexical+graph fallback recall inside the same budget.
+  const RESERVE_MS = 750;
+  const MIN_EMBED_MS = 500;
+  const budget = Math.min(configured, remaining - RESERVE_MS);
+  return budget >= MIN_EMBED_MS ? budget : null;
 }
 
 interface ManifestFile { sha256: string; bytes: number }
