@@ -54,6 +54,7 @@ npm run build
 - `record.feedback` は引用・採用の明示報告のみ熱を加算する。見るだけでは加算しない。露出集合外の ID は全体拒否。
 - `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。
 - `record.archive` は `active -> archived` の終端遷移 (復帰なし)。`reasonCode` は `USER_ARCHIVED / OBSOLETE / DUPLICATE` の固定コードのみ。行は保持され、削除ではない。
+- `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード)。`record.list` に `status:"retired"` を指定すると引退済みを一覧できる。`record.search` は active + retired の明示的検索。
 
 ## リンク・backlink・Markdown 投影
 
@@ -61,9 +62,18 @@ npm run build
 - backlink は正本 outbound からの派生表示であり、独立に書き込まない。グラフ走査は active・同一 scope に解決する ref のみ辿り、深さ上限 2・展開上限 40。dangling は保持して飛ばす。
 - `vaultPath/<id>.md` に `[[ref]]` と backlink 節を持つ Obsidian 互換表示を投影する。正本は SQLite のみ。投影・索引の失敗は確定済み記憶を取り消さない。直接の Markdown 編集の取込みはない。編集は `record.correct` を使う。
 
+## グラフ表示 (実装済み・派生投影)
+
+- `npm run rebuild:graph -- --config ./memory.config.json --scope personal/default` で単一 scope の有界・自己完結・オフライン HTML グラフ (`<vault>/graph.html`、既定) を再構築する。正本は SQLite のみで不変。サーバ・外部資産 (CDN/フォント)・Obsidian 依存・テレメトリ・モデルは不要。表示・検索・選択は静的ファイル内のみで完結し、再活性化・heat 加算は起きない。
+- 既定は active のみ。`--include-retired` で引退、`--include-history` で履歴 (`superseded`・`archived`) を明示的に含める (`record.search` の active+retired とは別の viewer 側選択で、検索プロトコルを広げない)。他 scope の辺・backlink・source 参照は含まず、未解決/dangling 参照は辺を引かず件数・識別子の標識表示に留める。
+- 辺の種別は区別表示する: `related` ([[リンク]] 実線)、`consolidation` (summary/correction からの統合元指示・破線)、`supersedes` (訂正連鎖・点線)。訂正の新旧は `supersedes` 列で辿る。選択ノードの panel は snippet・tag・provenance 由来識別子・sourceRef ID・backlink と安全な投影 Markdown (`./<id>.md`) への導線のみを示し、raw 本文は埋め込まない (raw は DB に残る)。全 untrusted 文字列は escape し、埋め込み JSON は `</script>`  breakout 不可に直列化する。
+- 起動時 bounds (既定 `300 ノード / 800 辺 / 512KiB`、`--max-nodes/--max-edges/--max-bytes` で変更): 読取りは `LIMIT+1` で有界・決定論的順序 (`createdAt DESC, id ASC`)、超過は黙って切詰めず固定エラー (`error: graph over bound`、終了 2) で既存 view を残す。書込みは owned view ファイルのみ原子置換 (temp+rename) で Markdown 投影に触れない。`--out` は単一 `.html` のみ。
+- 実測 (合成 DB・8 記憶・scope 分離・訂正/引退/他 scope 含む): 既定 4 ノード・3 辺・8.2KB、全状態 6 ノード・4 辺・9.0KB、前後 canonical 行比較で DB 不変、超過時 `graph over bound` で prior view 保持を確認。実 headless ブラウザ (file://) で SVG 6 ノード・4 辺の描画、ノード/辺選択 panel、active 除外・履歴除外・検索絞込み、要求が当該 file のみ・console エラーなしを確認した (`tests/graph-view.test.ts` 8 件も通る)。
+- renderer 選択: 依存なし・決定論配置 (build 時円配置) の inline SVG。canvas/WebGL・外部 JS を避け、DOM 選択可能・file:// 動作・再構築の安定性を優先した。Obsidian 固定依存は置かず、残る可視化の layout 高度化・資源 bounds 最終値は未決定のまま (`plan.md` §14.5)。
+
 ## 想起方式
 
-語彙 (FTS5/BM25 + char-bigram) + raw 下降 (`record_source_refs` 経由で active・同一 scope レコードへ写像) + タグ・リンク種 + 有界グラフ展開の融合。同一の正本・索引・heat 状態では同一順序。同点は `createdAt DESC, id ASC`。超過は切り詰めず `LIMIT_EXCEEDED`。
+語彙 (FTS5/BM25 + char-bigram) + raw 下降 (`record_source_refs` 経由で active・同一 scope レコードへ写像) + タグ・リンク種 + 有界グラフ展開に、M2 のベクトル候補 (ローカル多言語埋め込みのコサイン上位) を固定重みで融合する。同一の正本・索引・heat 状態では同一順序。同点は `createdAt DESC, id ASC`。超過は切り詰めず `LIMIT_EXCEEDED`。モデル・索引の欠落・無効時は語彙 + グラフに縮退して継続する (エラーにしない)。
 
 ## 冪等・エラー
 
@@ -81,11 +91,34 @@ npm run build
 npm test         # build + 全テスト
 npm run smoke    # 一時 DB での event.append -> remember -> recall 確認
 npm run acceptance  # M1 受け入れ 7 件
+npm run provision:model  # 埋め込みモデルの取得 (唯一の M2 ネットワーク工程)
+npm run rebuild:vectors  # 派生ベクトル索引の再構築 (オフライン)
+npm run smoke:semantic   # 実モデルでの CLI 意味スモーク (一時 DB)
+npm run eval:m2          # 合成データでの語彙/意味の比較評価 (一時 DB)
+npm run provision:llm    # 育成 LLM の取得 (唯一の M3 ネットワーク工程)
+npm run smoke:m3         # 実 LLM での CLI 育成スモーク (一時 DB)
 ```
 
 <書き込み永続化失敗時の巻き戻しは `tests/m1-rollback.test.ts` で確認する (audit/operations の INSERT 拒否で 5 操作とも `STORE_UNAVAILABLE`・正本不変・再送で 1 件のみ確定)。露出上限の原子性は `tests/r06-exposure-cap.test.ts` (2 件: 実 recallId で厳密 1000 行・最古逐語刈り込み・消去後 feedback 行列・DELETE 拒否の全行巻戻し+再送成功) で確認する。 投影キューの耐久回復は `tests/r07-projection-recovery.test.ts` (3 件: close+reopen 永続 + 独立 future 行不変/分離回復・同一宛先 regular 最終 Markdown への実 rename 段階 primitive fault 保持/再 drain 復元・recall+feedback populated な 8 列 exposures/usage/heat を含む完全再構築 + exposure 有効/二重 heat なし)、実子プロセス CLI の境界・リプレイは `tests/r08-cli-boundary-replay.test.ts` (9 件: 先行 LF/EOF・多行・保持 TIMEOUT (cliMs 有界 assert)・不正 UTF-8・32768 境界・保持 multibyte streaming byte cap (20000 文字/40000 バイト)・起動 busy・実 worker TIMEOUT (positive threadId の BEGIN 到達、子時計での親 TIMEOUT+exit 有界: preload の実起動・実 stdout・実 exit 刻みを cliMs+1000 で assert し設定無視の 5000 固定を棄却、negative control で 5000 固定時に子時計 5016ms で fail 確認) 後の同キー再送単一確定→deduplicated replay) で確認する。fault 相は厳密 2500/10000 注入のまま、回復相は同一 DB・同一 scope・同一キー+同一 params を既存標準 (出荷例 5000/2000) で再送する (設定は冪等 hash ではない)。包装 bin 契約は `tests/r08-bin-entry.test.ts` (1 件: manifest 解決の platform 対応 launcher 経由で event.append 永続・remember/get 往復・同キー replay が正準効果ちょうど 1 件→deduplicated) で確認する。同一正本への同時訂正競合は `tests/m1-recall.test.ts` の共有ファイル競合試験 (2 件: 2 本の実 worker スレッドが各々の実 DatabaseSync で native BEGIN rendezvous し、ちょうど 1 件 OK/1 件 CONFLICT、勝者の正準/ref/link/heat/operation/成功 audit のみ残留、敗者残滓ゼロ; ready/done の settled outcome を起動直後に束縛し失敗時も全 settlement を消費する即時 lifecycle、無効 temp DB path での実 open 失敗前に ready が settled 失敗・両 completion 消費・両 worker 実 exit・fixture 除去の failure-edge) で確認する。build は外部 chmod なし (Node fs.chmodSync、win32 guard) で、Windows CI は chmod.exe を含む PATH だけを除去して chmod 不可を確認してから `npm test` する。全 80 件が Linux ローカルで成功、smoke も一時 DB/実 CLI で成功。独立 temp-only smoke (実 API での厳密 cap+DELETE 拒否/再送/feedback heat 行列、および POSIX symlink launcher 経由の write/read/replay) も成功。独立 native failure smoke (無効 DB path の実 worker error+exit 1/除去) と実コンパイル API の winning-key replay smoke (同キー再送 deduplicated) も成功。
 
-受け入れ条件は `docs/acceptance-manifest.md`、保持方針は `docs/retention.md` を参照。
+  受け入れ条件は `docs/acceptance-manifest.md`、保持・育成方針は `docs/retention.md` を参照。M3 育成 (`record.retire / reactivate / search` + 有界キュー・単一 flight・二段階実モデル `maintain.distill`) は実装済みで、`tests/m3-state.test.ts` (23 件：回帰 9 件含む) と実モデル `npm run smoke:m3` が通る。終端 `archive` を可逆引退とみなさない。同一バッチの相互指名ペアは無順序ペアで 1 回のみ統合する (代表 1 件が要約、対は監査付き keep、重複サマリなし)。
+
+## M2 セマンティック検索 (実装済み)
+
+- モデル: `Xenova/paraphrase-multilingual-MiniLM-L12-v2` (pinned revision `2c4055b1`、Apache-2.0、384 次元、量子化 ONNX)。ランタイムは `@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`。取得は `npm run provision:model` のみが行い、想起・再構築の実行時は外部送信なしの完全オフライン。
+- 設定は起動時 `vectors{modelDir, topK(既定 20・上限 60), timeoutMs, enabled}` (任意。欠落時は M1 の語彙 + グラフ動作)。`vec_notes` は正本から再構築可能な派生索引であり、`npm run rebuild:vectors` で再作成できる。正本表は変えない。
+- `record.recall` は正規化クエリを同モデルで埋め込み (有界 `timeoutMs`)、ベクトル上位と語彙・raw・グラフを固定重みで融合する。書込みは埋め込まない (期限保護)。モデル欠落・無効・タイムアウト時は語彙 + グラフに縮退する。
+- 実測 (合成 8 記憶・4 probe、`docs/m2-eval.json`): 語彙のみ hit@1 0.25 / hit@3 0.5 → 融合で hit@1 1.0 / hit@3 1.0。プロセス内遅延増分 +1ms 未満 (クエリ埋め込み warm 平均 ~2ms、冷間モデル load ~0.8s)。索引削除時は 4/4 で語彙順序に一致 (縮退確認)。実 CLI スモークでも言い換えクエリが対象を 1 位に引用し、語彙のみでは外すことを確認した。
+
+## M3 育てる保守 (実装済み)
+
+- 状態: `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード、メタデータのみ監査)。`superseded / archived` は動かさない。通常想起・一覧 (既定)・raw 下降・グラフ・ベクトルは active のみ。
+- `record.search`: 利用者指示の明示的検索で active + retired を返す (`archived / superseded` 除外)。heat・再活性化・feedback 露出なし。
+ - LLM: `onnx-community/Qwen2.5-1.5B-Instruct` (pinned revision `d54957e3af1be04546436e874a60fe386041b244`、基盤 `Qwen/Qwen2.5-1.5B-Instruct`、license `apache-2.0`、量子化 ONNX `onnx/model_q4.onnx`)。ランタイムは `@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`。取得は `npm run provision:llm` のみが行い、想起・蒸留の実行時は外部送信なしの完全オフライン。greedy 生成のため同一入力には決定論的。旧 `Xenova/bloomz-560m` は実プロンプト検証で不適（保持ゲートは不確実・要約は繰返し幻覚）、`Qwen2.5-0.5B-Instruct` は `RETIRE` を一切出さず引退不能のため不採用。
+ - `maintain.distill`: 有界バッチ (既定上限 20)・単一 flight (SQLite リース、TTL 既定 120000ms、crash 時は steal・再利用)・per-action 監査・失敗隔離・取消可能で、summary/consolidation を通常の冪等 op で直接・自律的に書く。判定は二段階＋確認の実モデル推論のみ（ヒューリスティック代替なし）：(1) 保持ゲート（永続内容の抽出か `NONE`。厳密 `NONE` のみ引退候補、不確実・無効は keep）。(2) 位置指定の統合選択（関連記憶を番号 `1..N` で提示し `MERGE <n> / KEEP`。コードが実際の同一 scope 有界入力に写像するため、モデルは record ID を複写しない。表示 2 件未満・範囲外・陳腐化は keep）。(3) 共有事実の確認（両記憶の共有事実の抽出か `NONE`。`NONE`・不確実は keep）。確認済みのみ実要約を草案し、正準 provenance（`cultivation:llm-derived`）・links（両源）・sourceRefs（和集合、コード再解決）で書く。推論は正準トランザクションの外、モデル文脈は同一 scope 最大 6 件の断片に有界。不確実・無効・失敗・欠落・タイムアウト時は状態不変 (keep/有界リトライ)。モデル欠落時は縮退 OK (適用 0・キュー不変)。
+  - `remember / correct / 検証済み feedback` の確定後に有界レビューをキューへ (0 リンク含む、インライン推論なし、キュー満杯でも書込み不変)。起動時 `cultivation{queueMax, batchMax, leaseTtlMs, reviewMaxAttempts}` (任意・既定 `500/20/120000/5`)、`llm{modelDir, timeoutMs, enabled, maxNewTokens, maxPromptChars}` (既定 `./models/qwen25-15b-instruct/60000/false/48/2000`)、`maintenance{timeoutMs}` (既定 120000)。キュー寿命：crash で孤立した `leased` 行は次回 steal 時に `pending` へ回収 (試行回数加算・上限で `failed`)、取消は `cancelled` 終端。drain の lease 所有者は実行ごとに一意 (`idempotencyKey#nonce`) のため同一キー並行 drain は単一 flight を失わず、再開 cursor は `(nextAt, queueId)` 複合で順序飛ばしなし。適用は lease 存続＋行 `leased` 存続の二重 fence を同一 txn 内で再検査し、取消後・奪取後の書込みを `CONFLICT` 無変更にする。`record.search` は派生索引 (FTS/bigram) 喪失時も正準 `bodyNorm` fallback で active + retired を返す。プロンプトは構造尾部 (指示＋assistant cue) を保って `maxPromptChars` (500..8000) に収める。
+   - 実測 (一時 DB・6 記憶・実モデル、`npm run smoke:m3`): retire 往復・recall 除外・search 取戻し・実モデル drain（保持ゲートで一過性気分を実際の引退 1 件、位置指定＋共有事実確認＋相互合意＋無順序ペア重複排除で近似重複の実際の統合 1 件のみ、耐久事実・不確実記録は保全、原物は全件行保持、適用 2）・同一キー再送 `deduplicated`・欠落モデル縮退 (適用 0・正本不変)・他者 lease 下 `CONFLICT`・cancel の全 check が ok。重複サマリの deferred 課題は残さない。実モデル drain 中の同一キー競合は `CONFLICT`、完了後の再送は `deduplicated` になることを CLI 並行実行でも確認した (degraded 並行は先勝 drain＋後発 `deduplicated` 再送に直列化し二重 drain なし)。
+   - 実モデルと決定論的証明の区別 (正直な申告): 実モデル drain の引退・統合判定は genuine のモデル生成であり、スタブをモデルの出力として主張しない。失敗隔離・リトライ・merge 位置写像・ゲート safeguard・相互ペア重複排除・孤立回収・縮退無変更・単一 flight・cursor 頁送り・取消 fence・重複投入・索引喪失 fallback・プロンプト構造保持の機構自体は手渡し decide／純粋関数による決定論的テスト (`tests/m3-state.test.ts` 23 件) でも証明する。
 
 R13 M1 synthetic baseline 観測証拠 (baseline-v1, M1 lexical+graph, synthetic-only): `npm run evaluate:baseline` (build + node dist/scripts/evaluate-baseline.js) exit 0。12 queries x3 rounds=36 recalls (21 positive incl semantic-gap miss, 15 negative)。positive mean P@3 0.571/recall 0.857/RR 0.857、negative 15 valid-empty、latency success median ~62.7ms (min ~61.0/max ~103.5/p95 ~66.8)。corrupt probe は direct exit 3/empty stdout と adapter STORE_UNAVAILABLE degraded/empty citations を分離報告し contract ok (quality/degradation 除外、契約違反時は非ゼロ)。feedback は実 recallId のみ報告し、failed は invariants+非ゼロ (unavailable は正常)。setup は lens links を beacon/chart 実 ID で照合・sourceRefs [b1-lens] 完全一致・list P 厳密 8。`npm test` 101 pass (prior 80 + score 12 + evaluator integration 6 + validators 3)、acceptance 7 pass、smoke OK。
 
@@ -97,6 +130,4 @@ R09 (M2/M3 承認ゲート用) 公式候補提案記録 (metadata のみ、未�
 
 ## 未実装の明示
 
-- M2 ベクトル意味検索は未実装。想起は語彙 + グラフに縮退して動作する。
-- M3 `maintain.distill` (蒸留・統合) は未実装。
-- Companion 連携、削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みはない。`archive` は検索除外であり削除ではない。
+- Companion 連携、削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みはない。`archive` は検索除外であり削除ではなく、可逆引退ではない。`archived` の明示的検索範囲は未決定。高度なスケジューリング (起動条件・熱重み調整) は任意の将来課題。`usedCount` は `record.feedback` の引用計数の累積のみ。

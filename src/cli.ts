@@ -24,13 +24,18 @@
  *
  * Autonomous ops (all direct-commit, no approval/TTY):
  *   event.append, record.remember, record.get, record.list,
- *   record.recall, record.feedback, record.correct, record.archive
+ *   record.recall, record.search, record.feedback, record.correct,
+ *   record.archive, record.retire, record.reactivate, maintain.distill
+ *
+ * maintain.distill runs under the startup-configured maintenance.timeoutMs
+ * budget (default 120s, separate from the regular 5s cliMs) because it
+ * performs bounded local-model inference; every other op keeps cliMs.
  *
  * Startup: missing vaultPath, unknown config fields, legacy approval-schema
  * DBs, and unreadable DBs fail with a FIXED stderr line + non-zero exit and
  * never emit stdout JSON. A legacy DB is never mutated or deleted.
  */
-import { loadConfig } from "./config.js";
+import { loadConfig, maintenanceTimeoutMs } from "./config.js";
 import {
   RAW_MAX_BYTES,
   applyResponseBudget,
@@ -49,8 +54,11 @@ import {
   feedbackRecords,
   getRecord,
   listRecords,
+  reactivateRecord,
   recallRecords,
   rememberRecord,
+  retireRecord,
+  searchRecords,
 } from "./store.js";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
@@ -297,6 +305,14 @@ export function handleValidatedRequest(
     case "record.archive":
       if (!needKey(idempotencyKey)) return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
       return archiveRecord(db, config, params, idempotencyKey);
+    case "record.retire":
+      if (!needKey(idempotencyKey)) return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+      return retireRecord(db, config, params, idempotencyKey);
+    case "record.reactivate":
+      if (!needKey(idempotencyKey)) return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+      return reactivateRecord(db, config, params, idempotencyKey);
+    case "record.search":
+      return searchRecords(db, config, params);
     default:
       return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
   }
@@ -323,9 +339,13 @@ const STORE_OPS = new Set([
   "record.get",
   "record.list",
   "record.recall",
+  "record.search",
   "record.feedback",
   "record.correct",
   "record.archive",
+  "record.retire",
+  "record.reactivate",
+  "maintain.distill",
 ]);
 
 async function main(): Promise<void> {
@@ -349,6 +369,11 @@ async function main(): Promise<void> {
   }
   const elapsed = (): number => Date.now() - started;
   const remaining = (): number => config.timeouts.cliMs - elapsed();
+  // Selected operation budget for final error handling: maintain.distill
+  // legitimately runs under the longer maintenance budget, so a distill
+  // failure inside maintenance.timeoutMs must keep its domain code and never
+  // be rewritten to TIMEOUT by the shorter cliMs comparison below.
+  let opBudget = config.timeouts.cliMs;
   let db: { close(): void } | null = null;
   let dbFile = "";
   try {
@@ -437,7 +462,12 @@ async function main(): Promise<void> {
           if (!v.ok) {
             res = applyResponseBudget(v.res, config.limits.responseMaxBytes);
           } else if (STORE_OPS.has(v.req.op)) {
-            const opRemaining = remaining();
+            // maintain.distill gets the long startup-configured maintenance
+            // budget (local-model inference); all other ops keep cliMs.
+            const budget =
+              v.req.op === "maintain.distill" ? maintenanceTimeoutMs(config) : config.timeouts.cliMs;
+            opBudget = budget;
+            const opRemaining = budget - elapsed();
             if (opRemaining <= 0) {
               res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
             } else {
@@ -445,18 +475,19 @@ async function main(): Promise<void> {
               db = null;
               const eff = effectiveBusyMs(config.timeouts.busyMs, opRemaining);
               try {
-                const outcome = await runStoreOpWithDeadline(
-                  {
-                    dbFile,
-                    config,
-                    configPath,
-                    op: v.req.op,
-                    params: v.req.params,
-                    idempotencyKey: v.req.idempotencyKey,
-                    effectiveBusyMs: eff,
-                  },
-                  opRemaining,
-                );
+              const outcome = await runStoreOpWithDeadline(
+                {
+                  dbFile,
+                  config,
+                  configPath,
+                  op: v.req.op,
+                  params: v.req.params,
+                  idempotencyKey: v.req.idempotencyKey,
+                  effectiveBusyMs: eff,
+                  remainingMs: opRemaining,
+                },
+                opRemaining,
+              );
                 if (outcome.timedOut) {
                   res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
                 } else {
@@ -474,7 +505,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const timedOut = elapsed() > config.timeouts.cliMs;
+  const timedOut = elapsed() > opBudget;
   let closeFailed = false;
   try {
     db?.close();
@@ -486,4 +517,5 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
+// CommonJS resolves the entry module even when npm invokes a bin symlink.
 if (require.main === module) void main();

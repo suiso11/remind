@@ -43,6 +43,13 @@ export interface WorkerOpRequest {
   params: Record<string, unknown>;
   idempotencyKey?: string;
   effectiveBusyMs: number;
+  /**
+   * Remaining operation budget (ms) at dispatch. The worker caps bounded
+   * pre-transaction inference (vector query embedding) inside this budget
+   * with room left for the lexical fallback, so a stalled embedding can
+   * never burn the whole deadline and turn recall into TIMEOUT.
+   */
+  remainingMs?: number;
 }
 
 export type WorkerOpOutcome =

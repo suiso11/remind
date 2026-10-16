@@ -310,7 +310,7 @@ describe("m1 strict startup config", () => {
 });
 
 describe("m1 protocol op allowlist: no approval-era ops", () => {
-  it("accepts exactly the 8 autonomous M1 ops", () => {
+  it("accepts exactly the autonomous ops (M1 + M2 recall + M3 state core + distill)", () => {
     for (const op of WRITE_OPS) {
       const r = validateRequest({ v: 1, op, idempotencyKey: "k-1", params: {} });
       assert.equal(r.ok, true, op);
@@ -321,12 +321,12 @@ describe("m1 protocol op allowlist: no approval-era ops", () => {
     }
     assert.deepEqual(
       [...WRITE_OPS].sort(),
-      ["event.append", "record.archive", "record.correct", "record.feedback", "record.remember"].sort(),
+      ["event.append", "maintain.distill", "record.archive", "record.correct", "record.feedback", "record.reactivate", "record.remember", "record.retire"].sort(),
     );
-    assert.deepEqual([...READ_OPS].sort(), ["record.get", "record.list", "record.recall"].sort());
+    assert.deepEqual([...READ_OPS].sort(), ["record.get", "record.list", "record.recall", "record.search"].sort());
   });
 
-  it("rejects candidate/approval/TTY/distill-era ops as BAD_REQUEST", () => {
+  it("rejects candidate/approval/TTY-era ops as BAD_REQUEST", () => {
     const oldOps = [
       "candidate.create",
       "candidate.get",
@@ -336,7 +336,6 @@ describe("m1 protocol op allowlist: no approval-era ops", () => {
       "archive",
       "record.correct-request",
       "record.vector-search",
-      "maintain.distill",
       "admin.export",
     ];
     for (const op of oldOps) {

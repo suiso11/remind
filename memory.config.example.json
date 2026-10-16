@@ -17,5 +17,27 @@
     "cliMs": 5000,
     "busyMs": 2000
   },
-  "dbMaxBytes": 104857600
+  "dbMaxBytes": 104857600,
+  "vectors": {
+    "modelDir": "./models/paraphrase-multilingual-MiniLM-L12-v2",
+    "topK": 20,
+    "timeoutMs": 15000,
+    "enabled": true
+  },
+  "cultivation": {
+    "queueMax": 500,
+    "batchMax": 20,
+    "leaseTtlMs": 120000,
+    "reviewMaxAttempts": 5
+  },
+  "llm": {
+    "modelDir": "./models/qwen25-15b-instruct",
+    "timeoutMs": 60000,
+    "enabled": false,
+    "maxNewTokens": 48,
+    "maxPromptChars": 2000
+  },
+  "maintenance": {
+    "timeoutMs": 120000
+  }
 }

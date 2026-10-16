@@ -1,6 +1,8 @@
 /**
  * Shared-file concurrent correction race contender (test-only fixture).
  *
+ * Unified for both sequential-race (type: ready/result) and hardened
+ * shared-file race (ready:true + begin/commit/rollback) consumers.
  * Each worker owns an ACTUAL new DatabaseSync on the same shared file with
  * its own PRAGMA busy_timeout, verifies the real main filename via
  * `PRAGMA database_list` plus the live target status, posts ready with its
@@ -17,21 +19,46 @@
  *
  * workerData: { config, params, idempotencyKey, barrier } where barrier is a
  * SharedArrayBuffer of 2 Int32: index 0 = parent start gate, index 1 = BEGIN
- * arrivals. The worker posts { ready, threadId, dbFile, status }, then on
- * release posts the actual { res, begin, commit, rollback, isTransaction,
- * threadId }, closes its db, and closes its port so the parent observes a
- * successful worker exit before resolving the result.
+ * arrivals. The worker posts a dual-shape ready
+ * { type:"ready", ready:true, threadId, dbFile, targetStatus, status }, then
+ * on release posts the actual dual-shape result
+ * { type:"result", res, transactions:{begin,commit,rollback},
+ *   begin, commit, rollback, inTransaction, isTransaction, threadId },
+ * closes its db, and closes its port so the parent observes a successful
+ * worker exit before resolving the result.
  */
 import { parentPort, threadId, workerData } from "node:worker_threads";
 import { DatabaseSync, constants } from "node:sqlite";
 import { correctRecord } from "../../src/store.js";
 import type { AppConfig } from "../../src/config.js";
+import type { ResponseEnvelope } from "../../src/protocol.js";
 
-interface RaceRequest {
+export interface CorrectionRaceRequest {
   config: AppConfig;
   params: Record<string, unknown>;
   idempotencyKey: string;
   barrier: SharedArrayBuffer;
+}
+
+export interface CorrectionRaceReady {
+  type: "ready";
+  ready: true;
+  threadId: number;
+  dbFile: string;
+  targetStatus: string;
+  status: string | null;
+}
+
+export interface CorrectionRaceResult {
+  type: "result";
+  res: ResponseEnvelope;
+  transactions: { begin: number; commit: number; rollback: number };
+  begin: number;
+  commit: number;
+  rollback: number;
+  inTransaction: boolean;
+  isTransaction: unknown;
+  threadId: number;
 }
 
 const RENDEZVOUS_MS = 10000;
@@ -46,15 +73,15 @@ function spinUntil(barr: Int32Array, index: 0 | 1, want: number, what: string): 
 }
 
 function main(): void {
-  const req = workerData as RaceRequest;
+  const req = workerData as CorrectionRaceRequest;
   const barr = new Int32Array(req.barrier);
-  const recordId = req.params["recordId"];
-  if (typeof recordId !== "string" || recordId.length === 0) {
-    throw new Error("correction-race fixture: params.recordId must be a non-empty string");
-  }
   const db = new DatabaseSync(req.config.dbPath);
   try {
     db.exec(`PRAGMA busy_timeout = 10000`);
+    const recordId = req.params["recordId"];
+    if (typeof recordId !== "string" || recordId.length === 0) {
+      throw new Error("correction-race fixture: params.recordId must be a non-empty string");
+    }
     let begin = 0;
     let commit = 0;
     let rollback = 0;
@@ -65,6 +92,7 @@ function main(): void {
         if (arg1 === "BEGIN") {
           begin += 1;
           Atomics.add(barr, 1, 1);
+          Atomics.notify(barr, 1);
           spinUntil(barr, 1, 2, "BEGIN rendezvous");
         } else if (arg1 === "COMMIT") {
           commit += 1;
@@ -79,11 +107,29 @@ function main(): void {
     const target = db.prepare(`SELECT status FROM records WHERE id = ?`).get(recordId) as
       | { status: string }
       | undefined;
-    parentPort?.postMessage({ ready: true, threadId, dbFile: mainFile, status: target?.status ?? null });
+    const status = target?.status ?? null;
+    parentPort?.postMessage({
+      type: "ready",
+      ready: true,
+      threadId,
+      dbFile: mainFile,
+      targetStatus: status ?? "",
+      status,
+    } satisfies CorrectionRaceReady);
     spinUntil(barr, 0, 1, "parent start gate");
     const res = correctRecord(db, req.config, req.params, req.idempotencyKey);
     const isTransaction: unknown = (db as DatabaseSync).isTransaction;
-    parentPort?.postMessage({ res, begin, commit, rollback, isTransaction, threadId });
+    parentPort?.postMessage({
+      type: "result",
+      res,
+      transactions: { begin, commit, rollback },
+      begin,
+      commit,
+      rollback,
+      inTransaction: Boolean(isTransaction),
+      isTransaction,
+      threadId,
+    } satisfies CorrectionRaceResult);
   } finally {
     try {
       db.close();

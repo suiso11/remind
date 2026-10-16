@@ -5,8 +5,9 @@
  * record.feedback -> record.correct -> record.archive, legacy fail-fast,
  * old-op rejection, metadata-only ledgers, and budget enforcement.
  *
- * Explicitly out of scope (asserted absent): M2 vector search and M3
- * distillation. No candidate/approval/TTY behavior exists in M1.
+ * Explicitly out of scope (asserted absent): M2 standalone vector ops and
+ * M3 distillation (M2 ships as fusion inside record.recall, not a new op).
+ * No candidate/approval/TTY behavior exists.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -231,12 +232,18 @@ describe("M1 acceptance walkthrough", () => {
     }
   });
 
-  it("A7 M2 vector search and M3 distillation are deferred, not present", () => {
-    for (const op of ["record.vector-search", "maintain.distill", "record.recall-semantic"]) {
+  it("A7 M2 ships as recall fusion (no new ops); M3 distillation is a write op", () => {
+    // M2 adds no protocol ops: semantic vectors fuse inside record.recall and
+    // degrade to lexical+graph when unavailable. Standalone vector ops remain
+    // unknown ops; M3 maintain.distill is a real write op (idempotencyKey
+    // mandatory) served by the local LLM drain.
+    for (const op of ["record.vector-search", "record.recall-semantic"]) {
       const r = validateRequest({ v: 1, op, idempotencyKey: "k-x", params: {} });
       assert.equal(r.ok, false, op);
       if (!r.ok) assert.equal(r.res.code, "BAD_REQUEST");
     }
+    const d = validateRequest({ v: 1, op: "maintain.distill", idempotencyKey: "k-x", params: {} });
+    assert.equal(d.ok, true, "maintain.distill");
     assert.ok(effectiveBusyMs(2000, 5000) > 0);
   });
 });

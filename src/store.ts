@@ -10,6 +10,13 @@
  * - record.feedback: exposure-verified usage + heat in a single txn (mere recall adds no heat)
  * - record.correct: new revision + conditional active->superseded in one txn (one winner)
  * - record.archive: conditional active->archived (terminal, row kept)
+ * - record.retire / record.reactivate: reversible active<->retired (M3 state
+ *   core; idempotent, fixed reason codes, metadata-only audit)
+ * - record.search: explicit active+retired lexical search (M3; excludes
+ *   archived/superseded; no heat, no reactivation, no exposures)
+ * - cultivation queue: bounded post-commit review enqueue on
+ *   remember/correct/validated-feedback (M3; no inline inference, never fails
+ *   the canonical write); lease/apply live in src/cultivation.ts
  *
  * Vector search is NOT implemented in M1: recall degrades to lexical+graph
  * by construction (§8). maintain.distill is NOT implemented (M3).
@@ -38,11 +45,24 @@ import {
 } from "./normalize.js";
 import { enqueueProjection } from "./projection.js";
 import {
+  REACTIVATE_REASONS,
+  RETIRE_REASONS,
+  enqueueCultivationReview,
+  ensureCultivationSchema,
+} from "./cultivation.js";
+import {
   applyResponseBudget,
   fail,
   ok,
   type ResponseEnvelope,
 } from "./protocol.js";
+import {
+  VECTOR_DIM,
+  cosine,
+  deserializeVec,
+  isValidVector,
+  serializeVec,
+} from "./vectors.js";
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -57,11 +77,20 @@ export const ARCHIVE_REASONS = [
   "DUPLICATE",
 ] as const;
 
+/** M3 fixed reason codes (defined in cultivation.ts; re-exported for callers). */
+export { REACTIVATE_REASONS, RETIRE_REASONS };
+
 /** Recall/graph bounds (plan §8 defaults; fixed, documented, deterministic). */
 export const GRAPH_DEPTH_MAX = 2;
 export const GRAPH_EXPAND_MAX = 40;
 export const RAW_DESCENT_MAX = 3;
 export const FUSION_CANDIDATE_MAX = 60;
+/** Vector candidates cap (bounded; M2 default topK=20, hard cap 60 like fusion). */
+export const VECTOR_CANDIDATE_MAX = 20;
+/** Fixed vector fusion weight: 4/(1+rank), above lexical 3/(1+rank) so true
+ *  paraphrase similarity outranks weak lexical overlap, below raw+seed sums
+ *  so exact citations still win. Deterministic; ties break createdAt DESC, id ASC. */
+export const VECTOR_FUSION_WEIGHT = 4;
 /** Exposures ledger cap: oldest rows pruned beyond this (feedback stays verifiable while fresh). */
 export const EXPOSURES_CAP = 1000;
 
@@ -71,7 +100,63 @@ const ID_RE = /^[A-Za-z0-9_-]+$/;
 /* Schema                                                              */
 /* ------------------------------------------------------------------ */
 
+export const RECORD_STATUSES = [
+  "active",
+  "superseded",
+  "archived",
+  "retired",
+] as const;
+
+/**
+ * M3 migration: add the reversible 'retired' status to pre-M3 databases whose
+ * records CHECK only allows ('active','superseded','archived'). Additive table
+ * rebuild preserving every canonical row (no deletes, no status rewrites);
+ * fresh DBs skip it. Savepoint-based so it works both standalone and inside
+ * initDb's outer transaction. Never throws for missing tables.
+ */
+function migrateRecordsStatusForRetired(db: DatabaseSync): void {
+  let sql: string | null = null;
+  try {
+    const row = db
+      .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='records'`)
+      .get() as { sql: string | null } | undefined;
+    sql = row?.sql ?? null;
+  } catch {
+    return;
+  }
+  if (!sql) return; // fresh DB: CREATE below already carries the new CHECK
+  if (sql.includes("retired")) return; // already migrated
+  db.exec(`SAVEPOINT m3_retired_status`);
+  try {
+    db.exec(`CREATE TABLE records_new(
+      id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyNorm TEXT NOT NULL, bodyHash TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','summary','correction')),
+      source TEXT NOT NULL, observedAt TEXT NOT NULL, scope TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('active','superseded','archived','retired')),
+      supersedes TEXT NULL, revision INTEGER NOT NULL, createdAt TEXT NOT NULL)`);
+    db.exec(`INSERT INTO records_new(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
+      SELECT id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt FROM records`);
+    db.exec(`DROP TABLE records`);
+    db.exec(`ALTER TABLE records_new RENAME TO records`);
+    db.exec(`RELEASE SAVEPOINT m3_retired_status`);
+  } catch (e) {
+    try {
+      db.exec(`ROLLBACK TO SAVEPOINT m3_retired_status`);
+    } catch {
+      /* preserve the migration error */
+    }
+    try {
+      db.exec(`RELEASE SAVEPOINT m3_retired_status`);
+    } catch {
+      /* preserve the migration error */
+    }
+    throw e;
+  }
+}
+
 export function ensureM1Schema(db: DatabaseSync): void {
+  // M3 additive migration first: pre-M3 files keep every canonical row.
+  migrateRecordsStatusForRetired(db);
   db.exec(`CREATE TABLE IF NOT EXISTS raw_events(
     eventId TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT NOT NULL,
     body TEXT NOT NULL, bodyNorm TEXT NOT NULL,
@@ -81,7 +166,7 @@ export function ensureM1Schema(db: DatabaseSync): void {
     id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyNorm TEXT NOT NULL, bodyHash TEXT NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','summary','correction')),
     source TEXT NOT NULL, observedAt TEXT NOT NULL, scope TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('active','superseded','archived')),
+    status TEXT NOT NULL CHECK(status IN ('active','superseded','archived','retired')),
     supersedes TEXT NULL, revision INTEGER NOT NULL, createdAt TEXT NOT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS record_tags(recordId TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(recordId, tag))`);
   db.exec(`CREATE TABLE IF NOT EXISTS record_links(fromId TEXT NOT NULL, toRef TEXT NOT NULL, PRIMARY KEY(fromId, toRef))`);
@@ -104,6 +189,11 @@ export function ensureM1Schema(db: DatabaseSync): void {
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_raw USING fts5(eventId UNINDEXED, body)`);
   db.exec(`CREATE TABLE IF NOT EXISTS char_bigrams(kind TEXT NOT NULL, id TEXT NOT NULL, bigram TEXT NOT NULL, PRIMARY KEY(kind, id, bigram))`);
+  // Derived vector index (rebuildable; never canonical). One row per record:
+  // L2-normalized float32 LE embedding of the normalized body (dim pinned).
+  // Missing rows, dim mismatches, and non-finite/zero vectors are ignored by
+  // recall (offline lexical+graph fallback, §8). Rebuilt by scripts/rebuild-vectors.
+  db.exec(`CREATE TABLE IF NOT EXISTS vec_notes(recordId TEXT PRIMARY KEY, dim INTEGER NOT NULL, vec BLOB NOT NULL, bodyHash TEXT NOT NULL, updatedAt TEXT NOT NULL)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_records_scope_status_created_id ON records(scope, status, createdAt, id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_record_tags_tag_record ON record_tags(tag, recordId)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_record_links_toref_from ON record_links(toRef, fromId)`);
@@ -129,6 +219,12 @@ export function ensureM1Schema(db: DatabaseSync): void {
     }
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_raw_scope_created ON raw_events(scope, createdAt, eventId)`);
+  // M3 cultivation queue + single-flight lease (additive; never canonical).
+  try {
+    ensureCultivationSchema(db);
+  } catch {
+    /* queue/lease absence never fails schema init; writers enqueue best-effort */
+  }
   // Self-heal derived indexes when they are obviously out of sync with
   // canonical tables (empty or smaller than canonical). Best-effort only:
   // never throws, never touches canonical rows; recall's bodyNorm fallback
@@ -156,6 +252,10 @@ export function hasLegacyApprovalSchema(db: DatabaseSync): boolean {
     return true;
   }
   for (const r of names) {
+    // M3 cultivation tables (cultivation_lease.expiresAt, cultivation_queue)
+    // are current-schema, not approval-era traces: skip them so the widened
+    // schema is never mistaken for a legacy approval database.
+    if (r.name.startsWith("cultivation_")) continue;
     const sql = r.sql ?? "";
     if (/candidateId/i.test(sql) || /approvalToken/i.test(sql) || /expiresAt/i.test(sql)) {
       return true;
@@ -572,6 +672,108 @@ function maybeRebuildDerivedIndexes(db: DatabaseSync): void {
     }
   } catch {
     /* never fail schema init on index repair */
+  }
+}
+
+/* ---------------- derived vector index (M2, rebuildable) --------------- */
+
+/**
+ * Upsert one record embedding (derived only; never canonical). Validates dim
+ * and finiteness; invalid input deletes any stale row and reports false.
+ * Never throws.
+ */
+export function upsertRecordVector(
+  db: DatabaseSync,
+  recordId: string,
+  vec: Float32Array,
+  bodyHash: string,
+  now: string,
+  dim: number = VECTOR_DIM,
+): boolean {
+  try {
+    if (!isValidVector(vec, dim)) {
+      try {
+        db.prepare(`DELETE FROM vec_notes WHERE recordId = ?`).run(recordId);
+      } catch {
+        /* ignore */
+      }
+      return false;
+    }
+    db.prepare(
+      `INSERT INTO vec_notes(recordId, dim, vec, bodyHash, updatedAt) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(recordId) DO UPDATE SET dim=excluded.dim, vec=excluded.vec, bodyHash=excluded.bodyHash, updatedAt=excluded.updatedAt`,
+    ).run(recordId, dim, serializeVec(vec), bodyHash, now);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Count usable vector rows (diagnostics; never throws). */
+export function countVectors(db: DatabaseSync): number {
+  try {
+    const row = db.prepare(`SELECT COUNT(*) AS n FROM vec_notes`).get() as { n: number } | undefined;
+    return typeof row?.n === "number" ? row.n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export interface VectorHit { id: string; sim: number; createdAt: string }
+
+/**
+ * Brute-force cosine candidates over the derived vec_notes table.
+ * Bounded (topK), deterministic (sim DESC, createdAt DESC, id ASC),
+ * scope/status/time-window isolated. Invalid rows (dim mismatch, corrupt
+ * blob, non-finite) are skipped. Empty array on ANY problem: the caller
+ * falls back to lexical+graph (§8). Never throws.
+ */
+export function vectorHits(
+  db: DatabaseSync,
+  scope: string,
+  queryVec: Float32Array | null | undefined,
+  since: string | null,
+  until: string | null,
+  topK: number,
+  dim: number = VECTOR_DIM,
+): VectorHit[] {
+  try {
+    if (!isValidVector(queryVec, dim)) return [];
+    const q = queryVec as Float32Array;
+    const cap = Number.isInteger(topK) && topK >= 1 ? Math.min(topK, FUSION_CANDIDATE_MAX) : VECTOR_CANDIDATE_MAX;
+    let sql = `SELECT v.recordId AS id, v.vec AS vec, r.createdAt AS createdAt
+      FROM vec_notes v JOIN records r ON r.id = v.recordId
+      WHERE r.scope = ? AND r.status = 'active' AND v.dim = ?`;
+    const args: Array<string | number | Buffer> = [scope, dim];
+    if (since !== null) {
+      sql += ` AND r.createdAt >= ?`;
+      args.push(since);
+    }
+    if (until !== null) {
+      sql += ` AND r.createdAt < ?`;
+      args.push(until);
+    }
+    const rows = db.prepare(sql).all(...(args as [])) as Array<{ id: string; vec: Buffer | Uint8Array; createdAt: string }>;
+    const scored: VectorHit[] = [];
+    for (const r of rows) {
+      try {
+        const v = deserializeVec(r.vec as Buffer, dim);
+        if (!v) continue;
+        const sim = cosine(q, v);
+        if (!Number.isFinite(sim) || sim <= -1.5) continue;
+        scored.push({ id: r.id, sim, createdAt: r.createdAt });
+      } catch {
+        /* per-row best effort */
+      }
+    }
+    scored.sort((a, b) =>
+      a.sim !== b.sim ? b.sim - a.sim
+        : a.createdAt !== b.createdAt ? (a.createdAt < b.createdAt ? 1 : -1)
+        : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+    );
+    return scored.slice(0, cap);
+  } catch {
+    return [];
   }
 }
 
@@ -1136,6 +1338,12 @@ export function rememberRecord(
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
     const id = savedRecordId(saved.responseJson);
     if (id) postCommitEnqueueProjections(db, n.scope, [id], n.links);
+    if (id) {
+      // Recovery: a post-commit cultivation enqueue lost to a crash or a
+      // transient failure leaves no open review; replay re-enqueues (open
+      // dedupe makes the already-queued case a safe duplicate no-op).
+      enqueueCultivationReview(db, config, { recordId: id, scope: n.scope, trigger: "remember", runId: n.runId, now: nowIso() });
+    }
     return replaySaved(saved.responseJson, config);
   }
   {
@@ -1202,6 +1410,9 @@ export function rememberRecord(
     // outbound targets whose Backlinks section now includes the new record.
     // Never changes the committed response.
     postCommitEnqueueProjections(db, n.scope, [id], n.links);
+    // M3 cultivation review (bounded, zero-link notes included, no inline
+    // inference): best-effort, never affects the committed envelope.
+    enqueueCultivationReview(db, config, { recordId: id, scope: n.scope, trigger: "remember", runId: n.runId, now });
     // Derived indexes post-commit, best-effort: failure never rolls back canonical.
     bestEffortIndexNote(db, id, n.bodyNorm);
   } catch (e) {
@@ -1220,6 +1431,9 @@ export function rememberRecord(
       if (again && again.op === "record.remember" && again.requestHash === reqHash) {
         const replayId = savedRecordId(again.responseJson);
         if (replayId) postCommitEnqueueProjections(db, n.scope, [replayId], n.links);
+        if (replayId) {
+          enqueueCultivationReview(db, config, { recordId: replayId, scope: n.scope, trigger: "remember", runId: n.runId, now: nowIso() });
+        }
         return replaySaved(again.responseJson, config);
       }
       return budgeted(fail("CONFLICT"), config);
@@ -1376,7 +1590,7 @@ export function listRecords(
   }
   let nStatus = "active";
   if (status !== undefined && status !== null) {
-    if (status !== "active" && status !== "superseded" && status !== "archived") {
+    if (status !== "active" && status !== "superseded" && status !== "archived" && status !== "retired") {
       return budgeted(bad(), config);
     }
     nStatus = status as string;
@@ -1608,11 +1822,19 @@ function expandGraph(
   return dist;
 }
 
+export interface RecallVectorInput {
+  /** L2-normalized query embedding (dim VECTOR_DIM). Null/invalid => lexical+graph fallback. */
+  vec: Float32Array | null | undefined;
+  /** Candidates cap (default VECTOR_CANDIDATE_MAX, hard cap FUSION_CANDIDATE_MAX). */
+  topK?: number;
+}
+
 export function recallRecords(
   db: DatabaseSync,
   config: AppConfig,
   params: Record<string, unknown>,
   nowOverride?: string,
+  vector?: RecallVectorInput,
 ): ResponseEnvelope {
   const parsed = parseRecallParams(config, params);
   if (!parsed.ok) return budgeted(parsed.res, config);
@@ -1639,6 +1861,15 @@ export function recallRecords(
       // findable when derived FTS/bigram indexes are absent or stale.
       const canonHits = canonicalBodyNormHits(db, p.scope, p.query, p.since, p.until, FUSION_CANDIDATE_MAX);
       const canonSet = new Set(canonHits.map((r) => r.id));
+      // 2c) Vector candidates (M2): derived vec_notes cosine over active
+      // same-scope rows. Missing/invalid model or vectors => empty here and
+      // the rest of this recall is exactly the M1 lexical+graph path (§8).
+      const vecTopK = vector?.topK ?? VECTOR_CANDIDATE_MAX;
+      const vecHits = vectorHits(db, p.scope, vector?.vec, p.since, p.until, vecTopK, VECTOR_DIM);
+      const vecRank = new Map<string, number>();
+      vecHits.forEach((h, i) => {
+        if (!vecRank.has(h.id)) vecRank.set(h.id, i);
+      });
       // 3) Exact tag/link seeds.
       const seedIds = new Set<string>(tagSeedIds(db, p.scope, p.tags, p.since, p.until));
       if (p.link !== null) {
@@ -1669,20 +1900,22 @@ export function recallRecords(
       biHits.forEach((h, i) => {
         if (!biRank.has(h.id)) biRank.set(h.id, i);
       });
-      const pool = new Set<string>([...lexRank.keys(), ...biRank.keys(), ...rawSet, ...canonSet, ...seedIds]);
-      // Pool cap: keep top 60 by lexical pre-order (lex rank, then id).
+      const pool = new Set<string>([...lexRank.keys(), ...biRank.keys(), ...rawSet, ...canonSet, ...vecRank.keys(), ...seedIds]);
+      // Pool cap: keep top 60 by lexical+vector pre-order (lex rank, then id).
       let poolIds = [...pool];
       if (poolIds.length > FUSION_CANDIDATE_MAX) {
         const preScore = (id: string): number => {
           const lr = lexRank.has(id) ? 1 / (1 + (lexRank.get(id) as number)) : 0;
           const br = biRank.has(id) ? 0.5 / (1 + (biRank.get(id) as number)) : 0;
-          return lr + br + (rawSet.has(id) ? 2 : 0) + (canonSet.has(id) ? 1 : 0) + (seedIds.has(id) ? 0.25 : 0);
+          const vr = vecRank.has(id) ? VECTOR_FUSION_WEIGHT / 4 / (1 + (vecRank.get(id) as number)) : 0;
+          return lr + br + vr + (rawSet.has(id) ? 2 : 0) + (canonSet.has(id) ? 1 : 0) + (seedIds.has(id) ? 0.25 : 0);
         };
         poolIds.sort((a, b) => preScore(b) - preScore(a) || (a < b ? -1 : a > b ? 1 : 0));
         poolIds = poolIds.slice(0, FUSION_CANDIDATE_MAX);
       }
-      // 4) Bounded graph expansion from seeds + top lexical ids.
-      const frontier0 = [...new Set<string>([...seedIds, ...poolIds.slice(0, 10)])].slice(0, 20);
+      // 4) Bounded graph expansion from seeds + top lexical/vector ids.
+      const vecTopIds = [...vecRank.keys()].slice(0, 10);
+      const frontier0 = [...new Set<string>([...seedIds, ...poolIds.slice(0, 10), ...vecTopIds])].slice(0, 20);
       const graphDist = expandGraph(db, p.scope, frontier0, p.since, p.until);
 
       // Heat lookup for the bounded pool only.
@@ -1704,6 +1937,7 @@ export function recallRecords(
         let s = 0;
         if (lexRank.has(id)) s += 3 / (1 + (lexRank.get(id) as number));
         if (biRank.has(id)) s += 1.5 / (1 + (biRank.get(id) as number));
+        if (vecRank.has(id)) s += VECTOR_FUSION_WEIGHT / (1 + (vecRank.get(id) as number));
         if (rawSet.has(id)) s += 2;
         if (canonSet.has(id)) s += 1;
         if (seedIds.has(id)) s += 1;
@@ -1855,6 +2089,12 @@ export function feedbackRecords(
     const denied = scopeGate(db, config, nScope);
     if (denied) return denied;
     if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    // Recovery: validated-feedback reviews lost with the original post-commit
+    // enqueue are re-enqueued here (open dedupe keeps this safe). Reachable
+    // only with the same exposure-verified ids (requestHash matched).
+    for (const id of ids) {
+      enqueueCultivationReview(db, config, { recordId: id, scope: nScope, trigger: "feedback", runId: nRunId, now: nowIso() });
+    }
     return replaySaved(saved.responseJson, config);
   }
   {
@@ -1864,8 +2104,9 @@ export function feedbackRecords(
 
   const now = nowOverride ?? nowIso();
   if (!Number.isFinite(Date.parse(now))) return budgeted(fail("STORE_UNAVAILABLE"), config);
+  let committedFeedback: ResponseEnvelope;
   try {
-    return withTransaction(db, (): ResponseEnvelope => {
+    committedFeedback = withTransaction(db, (): ResponseEnvelope => {
       // Exposure verification: the recall must exist in this scope, and every
       // reported id must be a member of its exposure set. Any deviation
       // rejects the WHOLE report with no usage/heat change.
@@ -1930,6 +2171,13 @@ export function feedbackRecords(
       assertDbUnderCap(db, config);
       return stored;
     });
+    // M3 cultivation reviews for validated ACTUAL use only: this point is
+    // reachable solely after exposure verification passed, so every id here
+    // is genuinely cited. Best-effort; never affects the committed envelope.
+    for (const id of ids) {
+      enqueueCultivationReview(db, config, { recordId: id, scope: nScope, trigger: "feedback", runId: nRunId, now });
+    }
+    return committedFeedback;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
@@ -1944,6 +2192,9 @@ export function feedbackRecords(
         return budgeted(fail("STORE_UNAVAILABLE"), config);
       }
       if (again && again.op === "record.feedback" && again.requestHash === reqHash) {
+        for (const id of ids) {
+          enqueueCultivationReview(db, config, { recordId: id, scope: nScope, trigger: "feedback", runId: nRunId, now: nowIso() });
+        }
         return replaySaved(again.responseJson, config);
       }
       return budgeted(fail("CONFLICT"), config);
@@ -2022,6 +2273,9 @@ export function correctRecord(
         [replayId, recordId],
         [...outboundRefsOf(db, recordId), ...nLinks],
       );
+      // Recovery: re-enqueue the corrected-revision review when the original
+      // post-commit enqueue was lost (open dedupe keeps this safe).
+      enqueueCultivationReview(db, config, { recordId: replayId, scope: nScope, trigger: "correct", runId: nRunId, now: nowIso() });
     }
     return replaySaved(saved.responseJson, config);
   }
@@ -2109,6 +2363,8 @@ export function correctRecord(
       [newId, recordId as string],
       [...outboundRefsOf(db, recordId as string), ...nLinks],
     );
+    // M3 cultivation review for the corrected revision (best-effort).
+    enqueueCultivationReview(db, config, { recordId: newId, scope: nScope, trigger: "correct", runId: nRunId, now });
     // Derived indexes post-commit, best-effort: failure never rolls back canonical.
     bestEffortIndexNote(db, newId, nBody);
     return committed;
@@ -2139,6 +2395,7 @@ export function correctRecord(
             [replayId, recordId],
             [...outboundRefsOf(db, recordId), ...nLinks],
           );
+          enqueueCultivationReview(db, config, { recordId: replayId, scope: nScope, trigger: "correct", runId: nRunId, now: nowIso() });
         }
         return replaySaved(again.responseJson, config);
       }
@@ -2273,6 +2530,505 @@ export function archiveRecord(
       }
       return budgeted(fail("CONFLICT"), config);
     }
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* record.retire / record.reactivate (reversible durable retirement)  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Shared reversible-transition core: active<->retired only. Already-there is
+ * an idempotent OK no-op (operations + audit still commit so replays are
+ * stable); superseded/archived are never moved here (CONFLICT). Rows are
+ * always kept; heat/usage untouched; projection re-queued post-commit.
+ */
+function transitionRetirement(
+  db: DatabaseSync,
+  config: AppConfig,
+  op: "record.retire" | "record.reactivate",
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride: string | undefined,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["id", "scope", "reasonCode"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { id, scope, reasonCode } = params;
+  if (typeof id !== "string" || id.length === 0 || id.length > 256) return budgeted(bad(), config);
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  const codes = op === "record.retire" ? RETIRE_REASONS : REACTIVATE_REASONS;
+  if (typeof reasonCode !== "string" || !(codes as readonly string[]).includes(reasonCode)) {
+    return budgeted(bad(), config);
+  }
+  const from = op === "record.retire" ? "active" : "retired";
+  const to = op === "record.retire" ? "retired" : "active";
+
+  const reqHash = sha256HexUtf8(
+    canonicalStringify({ op, id, scope: nScope, reasonCode }),
+  );
+
+  let saved: StoredOp | null = null;
+  try {
+    saved = readOperation(db, idempotencyKey);
+  } catch {
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+  if (saved) {
+    if (saved.op !== op) return budgeted(fail("CONFLICT"), config);
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+    if (saved.requestHash !== reqHash) return budgeted(fail("CONFLICT"), config);
+    postCommitEnqueueProjections(db, nScope, [id], outboundRefsOf(db, id));
+    return replaySaved(saved.responseJson, config);
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+
+  const now = nowOverride ?? nowIso();
+  if (!Number.isFinite(Date.parse(now))) return budgeted(fail("STORE_UNAVAILABLE"), config);
+  let committed: ResponseEnvelope;
+  try {
+    committed = withTransaction(db, (): ResponseEnvelope => {
+      let target: { scope: string; status: string } | undefined;
+      try {
+        target = db.prepare(`SELECT scope, status FROM records WHERE id = ?`).get(id) as
+          | { scope: string; status: string }
+          | undefined;
+      } catch {
+        throw new Error("read failed");
+      }
+      if (!target) throw new Error("missing");
+      if (target.scope !== nScope) throw new Error("scope mismatch");
+      if (target.status !== from && target.status !== to) throw new Error("not reversible");
+      const probe: ResponseEnvelope = ok({ record: { id, status: to } });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      if (target.status === from) {
+        let moved: unknown;
+        try {
+          moved = db
+            .prepare(`UPDATE records SET status=? WHERE id=? AND status=? AND scope=?`)
+            .run(to, id, from, nScope);
+        } catch {
+          throw new Error("db over cap");
+        }
+        if (changedRows(moved) !== 1) throw new Error("not reversible");
+      }
+      // target.status === to: idempotent no-op, still ledgers below.
+      const stored = budgeted(probe, config);
+      db.prepare(
+        `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
+      ).run(idempotencyKey, op, reqHash, JSON.stringify(stored), now);
+      auditInsert(db, {
+        ts: now,
+        op,
+        targetId: id as string,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: null,
+        runId: null,
+        recallId: null,
+        reasonCode: reasonCode as string,
+      });
+      assertDbUnderCap(db, config);
+      return stored;
+    });
+    postCommitEnqueueProjections(db, nScope, [id as string], outboundRefsOf(db, id as string));
+    return committed;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "missing") return budgeted(fail("NOT_FOUND"), config);
+    if (msg === "scope mismatch") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "not reversible") return budgeted(fail("CONFLICT"), config);
+    if (/UNIQUE constraint failed: operations/.test(msg)) {
+      let again: StoredOp | null = null;
+      try {
+        again = readOperation(db, idempotencyKey);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
+      if (again && again.op === op && again.requestHash === reqHash) {
+        postCommitEnqueueProjections(db, nScope, [id], outboundRefsOf(db, id));
+        return replaySaved(again.responseJson, config);
+      }
+      return budgeted(fail("CONFLICT"), config);
+    }
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+export function retireRecord(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride?: string,
+): ResponseEnvelope {
+  return transitionRetirement(db, config, "record.retire", params, idempotencyKey, nowOverride);
+}
+
+export function reactivateRecord(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  idempotencyKey: string,
+  nowOverride?: string,
+): ResponseEnvelope {
+  return transitionRetirement(db, config, "record.reactivate", params, idempotencyKey, nowOverride);
+}
+
+/* ------------------------------------------------------------------ */
+/* record.search (explicit active+retired, no heat/reactivation)        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Explicit user-directed search over active+retired (archived/superseded
+ * excluded). Lexical (FTS5/BM25 + char-bigram + canonical fallback) + raw
+ * descent (active+retired same-scope targets) + exact tag/link seeds;
+ * deterministic fusion (score DESC, createdAt DESC, id ASC). Audit-only: NO
+ * exposures row (so feedback/searchId can never heat), NO heat change, NO
+ * status change — one explicit retrieval never reactivates.
+ */
+export function searchRecords(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["query", "tags", "link", "since", "until", "limit", "scope", "runId"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { query, tags, link, since, until, limit, scope, runId } = params;
+  if (typeof query !== "string") return budgeted(bad(), config);
+  if (countCp(query) > config.limits.queryMaxCp) return budgeted(limitExceeded(), config);
+  const nq = normalizeBody(query);
+  if (countCp(nq) < 1) return budgeted(bad(), config);
+  if (countCp(nq) > config.limits.queryMaxCp) return budgeted(limitExceeded(), config);
+  const nTags = parseTags(tags, config.limits.tagsMax);
+  if (nTags === "bad") return budgeted(bad(), config);
+  if (nTags === "over") return budgeted(limitExceeded(), config);
+  let nLink: string | null = null;
+  if (link !== undefined && link !== null) {
+    if (typeof link !== "string") return budgeted(bad(), config);
+    const ll = checkLenCp(link, 1, 256);
+    if (ll === "long") return budgeted(limitExceeded(), config);
+    if (ll === "short" || hasControl(link)) return budgeted(bad(), config);
+    const nl = normalizeField(link, false);
+    if (countCp(nl) < 1 || countCp(nl) > 256) return budgeted(bad(), config);
+    nLink = nl;
+  }
+  let nSince: string | null = null;
+  if (since !== undefined && since !== null) {
+    const c = canonicalTime(since);
+    if (c === null) return budgeted(bad(), config);
+    nSince = c;
+  }
+  let nUntil: string | null = null;
+  if (until !== undefined && until !== null) {
+    const c = canonicalTime(until);
+    if (c === null) return budgeted(bad(), config);
+    nUntil = c;
+  }
+  let nLimit = config.limits.limitDefault;
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
+    if (limit < 1) return budgeted(bad(), config);
+    if (limit > config.limits.limitMax) return budgeted(limitExceeded(), config);
+    nLimit = limit;
+  }
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  const nRunId = parseRunId(runId);
+  if (nRunId === "invalid") return budgeted(bad(), config);
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+
+  const now = nowOverride ?? nowIso();
+  const searchId = genId("search");
+  const windowArgs = (alias: string): { frag: string; args: Array<string | number> } => {
+    let frag = "";
+    const args: Array<string | number> = [];
+    if (nSince !== null) {
+      frag += ` AND ${alias}.createdAt >= ?`;
+      args.push(nSince);
+    }
+    if (nUntil !== null) {
+      frag += ` AND ${alias}.createdAt < ?`;
+      args.push(nUntil);
+    }
+    return { frag, args };
+  };
+
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      const lexRank = new Map<string, number>();
+      const terms = nq.split(" ").map((t) => t.trim()).filter((t) => t.length > 0).slice(0, 8);
+      if (terms.length > 0) {
+        const match = terms.map((t) => `"${ftsEscapeTerm(t)}"*`).join(" OR ");
+        try {
+          const w = windowArgs("records");
+          const rows = db
+            .prepare(
+              `SELECT f.recordId AS id, bm25(fts_notes) AS r FROM fts_notes f
+               JOIN records ON records.id = f.recordId
+               WHERE f.body MATCH ? AND records.scope = ? AND records.status IN ('active','retired')${w.frag}
+               ORDER BY r ASC, records.createdAt DESC, f.recordId ASC LIMIT ?`,
+            )
+            .all(match, nScope, ...w.args, FUSION_CANDIDATE_MAX) as Array<{ id: string; r: number }>;
+          rows.forEach((h, i) => {
+            if (!lexRank.has(h.id)) lexRank.set(h.id, i);
+          });
+        } catch {
+          /* bigram/canonical paths cover */
+        }
+      }
+      const biRank = new Map<string, number>();
+      {
+        const bigrams = bigramsOf(nq);
+        try {
+          if (bigrams.length === 0) {
+            const w = windowArgs("records");
+            const rows = db
+              .prepare(
+                `SELECT id FROM records WHERE scope = ? AND status IN ('active','retired') AND instr(bodyNorm, ?) > 0${w.frag}
+                 ORDER BY createdAt DESC, id ASC LIMIT ?`,
+              )
+              .all(nScope, nq, ...w.args, FUSION_CANDIDATE_MAX) as Array<{ id: string }>;
+            rows.forEach((h, i) => {
+              if (!biRank.has(h.id)) biRank.set(h.id, i);
+            });
+          } else {
+            const placeholders = bigrams.map(() => "?").join(",");
+            const w = windowArgs("records");
+            const rows = db
+              .prepare(
+                `SELECT b.id AS id, COUNT(*) AS overlap FROM char_bigrams b
+                 JOIN records ON records.id = b.id
+                 WHERE b.kind = 'note' AND b.bigram IN (${placeholders}) AND records.scope = ? AND records.status IN ('active','retired')${w.frag}
+                 GROUP BY b.id ORDER BY overlap DESC, records.createdAt DESC, b.id ASC LIMIT ?`,
+              )
+              .all(...[...bigrams, nScope, ...w.args, FUSION_CANDIDATE_MAX]) as Array<{ id: string }>;
+            rows.forEach((h, i) => {
+              if (!biRank.has(h.id)) biRank.set(h.id, i);
+            });
+          }
+        } catch {
+          /* canonical fallback covers */
+        }
+      }
+      // Canonical bodyNorm fallback (active+retired): committed memory stays
+      // findable for multi-token queries when derived lexical indexes (FTS +
+      // bigrams) are absent or stale. Whole-query instr first, then per-term
+      // OR — the same shape as recall's canonicalBodyNormHits. Merged
+      // UNCONDITIONALLY (like record.recall): when only a subset of derived
+      // rows is lost, the surviving derived hits are nonempty and a gated
+      // fallback would skip the exact canonical match in the unindexed row.
+      const canonRank = new Map<string, number>();
+      {
+        try {
+          const w = windowArgs("records");
+          const whole = db
+            .prepare(
+              `SELECT id FROM records WHERE scope = ? AND status IN ('active','retired') AND instr(bodyNorm, ?) > 0${w.frag}
+               ORDER BY createdAt DESC, id ASC LIMIT ?`,
+            )
+            .all(nScope, nq, ...w.args, FUSION_CANDIDATE_MAX) as Array<{ id: string }>;
+          whole.forEach((h, i) => {
+            if (!canonRank.has(h.id)) canonRank.set(h.id, i);
+          });
+          if (whole.length === 0 && terms.length > 1) {
+            const conds = terms.map(() => `instr(bodyNorm, ?) > 0`).join(" OR ");
+            const w2 = windowArgs("records");
+            const perTerm = db
+              .prepare(
+                `SELECT id FROM records WHERE scope = ? AND status IN ('active','retired') AND (${conds})${w2.frag}
+                 ORDER BY createdAt DESC, id ASC LIMIT ?`,
+              )
+              .all(nScope, ...terms, ...w2.args, FUSION_CANDIDATE_MAX) as Array<{ id: string }>;
+            perTerm.forEach((h, i) => {
+              if (!canonRank.has(h.id)) canonRank.set(h.id, i);
+            });
+          }
+        } catch {
+          /* lexical paths already cover */
+        }
+      }
+      // Raw descent mapped to active+retired same-scope records.
+      const rawSet = new Set<string>();
+      try {
+        let eventIds: string[] = [];
+        if (terms.length > 0) {
+          const match = terms.map((t) => `"${ftsEscapeTerm(t)}"*`).join(" OR ");
+          try {
+            const rows = db
+              .prepare(
+                `SELECT f.eventId AS eventId FROM fts_raw f
+                 JOIN raw_events ON raw_events.eventId = f.eventId
+                 WHERE f.body MATCH ? AND raw_events.scope = ?
+                 ORDER BY bm25(fts_raw) ASC, raw_events.createdAt DESC, f.eventId ASC LIMIT ?`,
+              )
+              .all(match, nScope, RAW_DESCENT_MAX) as Array<{ eventId: string }>;
+            eventIds = rows.map((r) => r.eventId);
+          } catch {
+            eventIds = [];
+          }
+        }
+        if (eventIds.length === 0) {
+          try {
+            const rows = db
+              .prepare(
+                `SELECT eventId FROM raw_events WHERE scope = ? AND instr(bodyNorm, ?) > 0
+                 ORDER BY createdAt DESC, eventId ASC LIMIT ?`,
+              )
+              .all(nScope, nq, RAW_DESCENT_MAX) as Array<{ eventId: string }>;
+            eventIds = rows.map((r) => r.eventId);
+          } catch {
+            eventIds = [];
+          }
+        }
+        if (eventIds.length > 0) {
+          const placeholders = eventIds.map(() => "?").join(",");
+          const w = windowArgs("records");
+          const rows = db
+            .prepare(
+              `SELECT DISTINCT s.recordId AS id FROM record_source_refs s
+               JOIN records ON records.id = s.recordId
+               WHERE s.eventId IN (${placeholders}) AND records.scope = ? AND records.status IN ('active','retired')${w.frag}`,
+            )
+            .all(...[...eventIds, nScope, ...w.args]) as Array<{ id: string }>;
+          for (const r of rows) rawSet.add(r.id);
+        }
+      } catch {
+        /* lexical paths already cover */
+      }
+      // Exact tag/link seeds (active+retired, same scope, windowed).
+      const seedIds = new Set<string>();
+      if (nTags.length > 0) {
+        try {
+          let sql = `SELECT records.id AS id FROM records WHERE scope = ? AND status IN ('active','retired')`;
+          const args: Array<string | number> = [nScope];
+          const w = windowArgs("records");
+          sql += w.frag;
+          args.push(...w.args);
+          for (const t of nTags) {
+            sql += ` AND EXISTS (SELECT 1 FROM record_tags WHERE recordId = records.id AND tag = ?)`;
+            args.push(t);
+          }
+          sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
+          args.push(FUSION_CANDIDATE_MAX);
+          for (const r of db.prepare(sql).all(...args) as Array<{ id: string }>) seedIds.add(r.id);
+        } catch {
+          /* ignore */
+        }
+      }
+      if (nLink !== null) {
+        try {
+          const w = windowArgs("records");
+          const target = db
+            .prepare(
+              `SELECT id FROM records WHERE id = ? AND scope = ? AND status IN ('active','retired')${w.frag}`,
+            )
+            .get(nLink, nScope, ...w.args) as { id: string } | undefined;
+          if (target) seedIds.add(target.id);
+        } catch {
+          /* ignore */
+        }
+      }
+
+      const score = (id: string): number => {
+        let s = 0;
+        if (lexRank.has(id)) s += 3 / (1 + (lexRank.get(id) as number));
+        if (biRank.has(id)) s += 1.5 / (1 + (biRank.get(id) as number));
+        if (canonRank.has(id)) s += 1.5 / (1 + (canonRank.get(id) as number));
+        if (rawSet.has(id)) s += 2;
+        if (seedIds.has(id)) s += 1;
+        return s;
+      };
+      const pool = [...new Set<string>([...lexRank.keys(), ...biRank.keys(), ...canonRank.keys(), ...rawSet, ...seedIds])];
+      const meta = new Map<string, { createdAt: string; status: string }>();
+      if (pool.length > 0) {
+        try {
+          const placeholders = pool.map(() => "?").join(",");
+          const rows = db
+            .prepare(`SELECT id, createdAt, status FROM records WHERE id IN (${placeholders})`)
+            .all(...pool) as Array<{ id: string; createdAt: string; status: string }>;
+          for (const r of rows) meta.set(r.id, { createdAt: r.createdAt, status: r.status });
+        } catch {
+          throw new Error("read failed");
+        }
+      }
+      const ranked = pool
+        .filter((id) => meta.has(id))
+        .sort((a, b) => {
+          const sa = score(a);
+          const sb = score(b);
+          if (sa !== sb) return sb - sa;
+          const ca = (meta.get(a) as { createdAt: string }).createdAt;
+          const cb = (meta.get(b) as { createdAt: string }).createdAt;
+          if (ca !== cb) return ca < cb ? 1 : -1;
+          return a < b ? -1 : a > b ? 1 : 0;
+        })
+        .slice(0, nLimit);
+
+      let items: Array<{
+        id: string;
+        snippet: string;
+        truncated: boolean;
+        tags: string[];
+        status: string;
+        createdAt: string;
+      }>;
+      try {
+        items = ranked.map((id) => {
+          const row = db
+            .prepare(`SELECT body, createdAt, status FROM records WHERE id = ?`)
+            .get(id) as { body: string; createdAt: string; status: string };
+          const { snippet, truncated } = snippetFor(row.body, config.limits.snippetMaxCp);
+          const tags = (
+            db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
+          ).map((r) => r.tag);
+          return { id, snippet, truncated, tags, status: row.status, createdAt: row.createdAt };
+        });
+      } catch {
+        throw new Error("read failed");
+      }
+
+      const probe: ResponseEnvelope = ok({ searchId, items });
+      if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+      const stored = budgeted(probe, config);
+      if (!stored.ok) throw new Error("response over budget");
+      // Audit-only: deliberately NO exposures insert (feedback can never heat
+      // from a searchId) and NO heat/reactivation side effects.
+      auditInsert(db, {
+        ts: now,
+        op: "record.search",
+        targetId: searchId,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: nLimit,
+        runId: nRunId,
+        recallId: searchId,
+        reasonCode: null,
+      });
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }

@@ -11,6 +11,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
+import type {
+  CorrectionRaceReady,
+  CorrectionRaceRequest,
+  CorrectionRaceResult,
+} from "./fixtures/correction-race-worker.js";
 import type { AppConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
 import { bodyHashFor, normalizeBody } from "../src/normalize.js";
@@ -432,6 +437,193 @@ describe("correction atomicity and idempotency", () => {
       assert.equal((newView.data as { record: { status: string } }).record.status, "active");
     } finally {
       ctx.cleanup();
+    }
+  });
+
+  it("rolls back the losing correction from concurrent independent shared-file connections", { timeout: 20_000 }, async (t) => {
+    const ctx = setup();
+    const workers: Worker[] = [];
+    function assertObject(value: unknown): asserts value is Record<string, unknown> {
+      assert.ok(value !== null && typeof value === "object" && !Array.isArray(value));
+    }
+    try {
+      assert.equal(path.dirname(ctx.config.dbPath), ctx.dir);
+      assert.equal(path.dirname(ctx.config.vaultPath), ctx.dir);
+      assert.ok(fs.existsSync(ctx.config.dbPath));
+      const leftLink = remember(ctx.db, ctx.config, "left race link target", "race-link-left");
+      const rightLink = remember(ctx.db, ctx.config, "right race link target", "race-link-right");
+      const originalBody = "shared correction race original meeting time";
+      const original = remember(ctx.db, ctx.config, originalBody, "race-original");
+      const contenders = [leftLink, rightLink].map((link, index) => {
+        const key = `race-correct-${index}`;
+        const eventId = `corr-ev-${key}`;
+        raw(ctx.db, ctx.config, eventId);
+        return {
+          key,
+          eventId,
+          link,
+          params: {
+            recordId: original,
+            body: `shared correction race replacement ${index}`,
+            kind: "correction",
+            provenance: { source: "session:s1:turn:9", observedAt: OBS },
+            scope: "personal/default",
+            sourceRefs: [eventId],
+            links: [link],
+            runId: key,
+          },
+        };
+      });
+      assert.notEqual(contenders[0].key, contenders[1].key);
+      const barrier = new SharedArrayBuffer(2 * Int32Array.BYTES_PER_ELEMENT);
+      const shared = new Int32Array(barrier);
+
+      // Launch both workers without awaiting either; each opens its own handle.
+      const running = contenders.map(({ key, params }) => {
+        const worker = new Worker(path.join(__dirname, "fixtures", "correction-race-worker.js"), {
+          workerData: { config: ctx.config, params, idempotencyKey: key, barrier } satisfies CorrectionRaceRequest,
+        });
+        workers.push(worker);
+        let resolveReady!: (message: CorrectionRaceReady) => void;
+        let rejectReady!: (error: Error) => void;
+        let resolveResult!: (message: CorrectionRaceResult) => void;
+        let rejectResult!: (error: Error) => void;
+        const ready = new Promise<CorrectionRaceReady>((resolve, reject) => {
+          resolveReady = resolve;
+          rejectReady = reject;
+        });
+        const result = new Promise<CorrectionRaceResult>((resolve, reject) => {
+          resolveResult = resolve;
+          rejectResult = reject;
+        });
+        let final: CorrectionRaceResult | undefined;
+        worker.on("message", (message: CorrectionRaceReady | CorrectionRaceResult) => {
+          if (message.type === "ready") resolveReady(message);
+          else final = message;
+        });
+        worker.once("error", (error) => {
+          rejectReady(error);
+          rejectResult(error);
+        });
+        worker.once("exit", (code) => {
+          rejectReady(new Error(`correction worker exited before ready: ${code}`));
+          if (code === 0 && final) resolveResult(final);
+          else rejectResult(new Error(`correction worker exited without a result: ${code}`));
+        });
+        return { ready, result };
+      });
+      const [ready, results] = await Promise.all([
+        Promise.all(running.map((worker) => worker.ready)).then((messages) => {
+          assert.notEqual(messages[0].threadId, messages[1].threadId);
+          for (const message of messages) {
+            assert.ok(message.threadId > 0);
+            assert.equal(message.dbFile, fs.realpathSync(ctx.config.dbPath));
+            assert.equal(message.targetStatus, "active");
+          }
+          assert.equal(Atomics.load(shared, 1), 0, "no correction starts before both connections are ready");
+          Atomics.store(shared, 0, 1);
+          Atomics.notify(shared, 0, 2);
+          return messages;
+        }),
+        Promise.all(running.map((worker) => worker.result)),
+      ]);
+      assert.equal(Atomics.load(shared, 1), 2, "both store calls rendezvoused at real SQLite BEGIN");
+      assert.deepEqual(results.map((result) => result.res.code).sort(), ["CONFLICT", "OK"]);
+      assert.equal(results.filter((result) => result.res.ok).length, 1);
+      const winnerIndex = results.findIndex((result) => result.res.ok);
+      const loserIndex = 1 - winnerIndex;
+      const winner = contenders[winnerIndex];
+      const loser = contenders[loserIndex];
+      assert.deepEqual(results[winnerIndex].transactions, { begin: 1, commit: 1, rollback: 0 });
+      assert.deepEqual(results[loserIndex].transactions, { begin: 1, commit: 0, rollback: 1 });
+      assert.ok(results.every((result) => !result.inTransaction), "neither connection retains a transaction");
+      const winningRecord = results[winnerIndex].res.data?.record;
+      assertObject(winningRecord);
+      assert.ok(typeof winningRecord.id === "string");
+      const newId = winningRecord.id;
+      const oldView = getRecord(ctx.db, ctx.config, { id: original, scope: "personal/default" });
+      assert.equal(oldView.ok, true, JSON.stringify(oldView));
+      const oldRecord = oldView.data?.record;
+      assertObject(oldRecord);
+      assert.equal(oldRecord.status, "superseded");
+      assert.equal(oldRecord.body, originalBody);
+      const newView = getRecord(ctx.db, ctx.config, { id: newId, scope: "personal/default" });
+      assert.equal(newView.ok, true, JSON.stringify(newView));
+      const newRecord = newView.data?.record;
+      assertObject(newRecord);
+      assert.equal(newRecord.status, "active");
+      assert.equal(newRecord.supersedes, original);
+      assert.equal(newRecord.revision, 2);
+      assert.equal(newRecord.body, winner.params.body);
+      assert.deepEqual(newRecord.sourceRefs, [winner.eventId]);
+      assert.deepEqual(newRecord.links, [winner.link]);
+      const listed = listRecords(ctx.db, ctx.config, { scope: "personal/default", limit: 25 });
+      assert.equal(listed.ok, true, JSON.stringify(listed));
+      const items = listed.data?.items;
+      assert.ok(Array.isArray(items));
+      const activeIds = items.map((item: unknown) => {
+        assertObject(item);
+        assert.ok(typeof item.id === "string");
+        return item.id;
+      }).sort();
+      assert.deepEqual(activeIds, [leftLink, rightLink, newId].sort());
+      const recalled = recallIds(ctx.db, ctx.config, "shared correction race");
+      assert.ok(recalled.includes(newId));
+      assert.ok(!recalled.includes(original));
+
+      const count = (sql: string, ...args: string[]): number => {
+        const row = ctx.db.prepare(sql).get(...args);
+        assert.ok(row && typeof row.n === "number");
+        return row.n;
+      };
+      assert.equal(count("SELECT COUNT(*) AS n FROM records"), 4);
+      const revisions = ctx.db.prepare(
+        "SELECT id, status, supersedes, revision FROM records WHERE kind='correction' OR supersedes IS NOT NULL",
+      ).all().map((row) => ({ ...row }));
+      assert.deepEqual(revisions, [{ id: newId, status: "active", supersedes: original, revision: 2 }]);
+      assert.equal(count("SELECT COUNT(*) AS n FROM records WHERE body=?", loser.params.body), 0);
+      assert.equal(count("SELECT COUNT(*) AS n FROM record_source_refs WHERE eventId=?", loser.eventId), 0);
+      assert.equal(count("SELECT COUNT(*) AS n FROM record_links WHERE toRef=?", loser.link), 0);
+      assert.equal(count(`SELECT COUNT(*) AS n FROM record_source_refs s
+        LEFT JOIN records r ON r.id=s.recordId LEFT JOIN raw_events e ON e.eventId=s.eventId
+        WHERE r.id IS NULL OR e.eventId IS NULL`), 0);
+      assert.equal(count(`SELECT COUNT(*) AS n FROM record_links l
+        LEFT JOIN records r ON r.id=l.fromId LEFT JOIN records target ON target.id=l.toRef
+        WHERE r.id IS NULL OR target.id IS NULL`), 0);
+      assert.equal(count("SELECT COUNT(*) AS n FROM record_links"), 1);
+      assert.equal(count("SELECT COUNT(*) AS n FROM record_source_refs"), 4);
+      assert.equal(count("SELECT COUNT(*) AS n FROM note_heat"), 4);
+      for (const [table, column] of [
+        ["note_heat", "recordId"], ["projection_queue", "recordId"],
+        ["fts_notes", "recordId"], ["char_bigrams", "id"],
+      ]) {
+        const kind = table === "char_bigrams" ? "AND d.kind='note'" : "";
+        assert.equal(count(`SELECT COUNT(*) AS n FROM ${table} d
+          LEFT JOIN records r ON r.id=d.${column} WHERE r.id IS NULL ${kind}`), 0, `${table} has no orphan`);
+      }
+      const operations = ctx.db.prepare(
+        "SELECT idempotencyKey, responseJson FROM operations WHERE op='record.correct'",
+      ).all();
+      assert.equal(operations.length, 1);
+      assert.equal(operations[0].idempotencyKey, winner.key);
+      assert.equal(count("SELECT COUNT(*) AS n FROM operations WHERE idempotencyKey=?", loser.key), 0);
+      const storedResponse = operations[0].responseJson;
+      assert.ok(typeof storedResponse === "string");
+      assert.deepEqual(JSON.parse(storedResponse), results[winnerIndex].res);
+      const audit = ctx.db.prepare(
+        "SELECT targetId, code, runId FROM audit WHERE op='record.correct'",
+      ).all().map((row) => ({ ...row }));
+      assert.deepEqual(audit, [{ targetId: newId, code: "OK", runId: winner.key }]);
+      assert.equal(count("SELECT COUNT(*) AS n FROM audit WHERE runId=? AND code='OK'", loser.key), 0);
+      t.diagnostic(`shared file ${ctx.config.dbPath}; independent workers ${ready.map((message) => message.threadId).join("/")}; BEGIN barrier=2; OK=1/CONFLICT=1; loser ROLLBACK=1; loser revision/ref/link/operation/audit success=0`);
+    } finally {
+      try {
+        await Promise.all(workers.map((worker) => worker.terminate()));
+      } finally {
+        ctx.cleanup();
+        assert.ok(!fs.existsSync(ctx.dir), "shared DB, sidecars and vault are removed");
+        t.diagnostic(`temporary DB/vault fixture removed: ${ctx.dir}`);
+      }
     }
   });
 
