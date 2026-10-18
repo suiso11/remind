@@ -46,7 +46,13 @@ export const OPS_SCOPE = "personal/default";
 export const OPS_RUN = "operations-v1-run";
 export const OPS_OBSERVED_AT = "2026-09-01T00:00:00.000Z";
 
-const CLI_TIMEOUT_MS = 6000;
+// Spawn-kill budget for the harness. The CLI's op-level deadline contract
+// stays config.timeouts.cliMs; this budget only needs headroom above it for
+// process startup (node + module load), which loaded CI runners (windows
+// Defender real-time scanning, parallel test files) can stretch to seconds.
+// Killing a healthy child mid-startup reads as a transport failure, so the
+// budget is generous; the op deadline itself is unchanged.
+const CLI_TIMEOUT_MS = 30000;
 const MAX_BUFFER = 64 * 1024;
 const MAX_STDERR = 16 * 1024;
 const RESPONSE_MAX_BYTES = 8192;
@@ -304,6 +310,43 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
     return r;
   };
 
+  // Seed writes are idempotencyKey'd ops, so per the CLI deadline contract
+  // ("a TIMEOUT must never be read as rolled back; callers replay with the
+  // same idempotency key + params") ONLY a commit-unknown outcome is replayed
+  // ONCE with the byte-identical request: a commit that did land returns the
+  // stored envelope with deduplicated:true, an uncommitted one re-executes.
+  // Commit-unknown means the harness killed the child (invalidReason
+  // timeout/spawn-failure) or the CLI itself answered its cliMs deadline with
+  // a TIMEOUT envelope. Any other non-ok code (NOT_FOUND, VALIDATION, ...) is
+  // a definitive answer, never retried. A second non-ok still fails the seed
+  // honestly. Latency of both spawns is recorded (each is a real CLI call).
+  const commitUnknown = (r: CliResult): boolean => {
+    if (r.invalidReason === "timeout" || r.invalidReason === "spawn-failure") return true;
+    if (r.envelopeValid && r.envelope !== null) {
+      const code = (r.envelope as { code?: unknown })["code"];
+      if (code === "TIMEOUT") return true;
+    }
+    return false;
+  };
+  const callSeed = (req: Record<string, unknown>): CliResult => {
+    const first = call(req);
+    if (okEnvelope(first) !== null || !commitUnknown(first)) return first;
+    const second = call(req);
+    return okEnvelope(second) !== null ? second : first;
+  };
+
+  /** Fixed-text code/message for a non-ok CliResult (no config/param echo). */
+  const failReason = (r: CliResult): string => {
+    if (r.invalidReason !== null) return r.invalidReason;
+    if (r.status !== 0) return `exit-${String(r.status)}`;
+    const env = (r.envelope ?? {}) as { code?: unknown; message?: unknown };
+    const code = typeof env["code"] === "string" ? env["code"] : "NOT-OK";
+    const msg = typeof env["message"] === "string" && env["message"].length > 0
+      ? ` ${env["message"].slice(0, 120)}`
+      : "";
+    return `envelope-${code}${msg}`;
+  };
+
   const recallIds = (
     query: string,
     limit: number = OPS_K,
@@ -337,7 +380,7 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
     // Seed fillers: event.append + record.remember each, dependency order.
     for (let i = 0; i < scale; i++) {
       const evId = `ops-s${scale}-e${i}`;
-      const ev = call({
+      const ev = callSeed({
         v: 1, op: "event.append", idempotencyKey: `ops-s${scale}-ev-${i}`,
         params: {
           eventId: evId, sessionId: `ops-s${scale}`, turnId: `t${i}`,
@@ -345,8 +388,12 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           provenance: provenanceFor(evId), scope: OPS_SCOPE, runId: OPS_RUN,
         },
       });
-      if (!okEnvelope(ev)) { seedWritesOk = false; break; }
-      const rem = call({
+      if (!okEnvelope(ev)) {
+        invariants.push(`s${scale} seed event.append ${i} not ok: ${failReason(ev)}`);
+        seedWritesOk = false;
+        break;
+      }
+      const rem = callSeed({
         v: 1, op: "record.remember", idempotencyKey: `ops-s${scale}-rem-${i}`,
         params: {
           body: fillerBody(scale, i), kind: "user_fact",
@@ -356,7 +403,11 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
       });
       const env = okEnvelope(rem);
       const id = (env?.["data"] as { record?: { id?: unknown } } | undefined)?.record?.id;
-      if (!env || typeof id !== "string") { seedWritesOk = false; break; }
+      if (!env || typeof id !== "string") {
+        invariants.push(`s${scale} seed record.remember ${i} not ok: ${failReason(rem)}`);
+        seedWritesOk = false;
+        break;
+      }
       fillerIds.push(id);
     }
 
@@ -516,16 +567,21 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
         feedbackProof = { status: "no-eligible-exposure", recallOk: probe.ok, exposedGold: probe.ids.includes(gold) };
       } else {
         const others = probe.ids.filter((id) => id !== gold);
-        let db: DatabaseSync | null = null;
-        try {
-          db = new DatabaseSync(dbPath);
-          const heatBefore = new Map<string, number>([gold, ...others].map((id) => [id, heatOf(db as DatabaseSync, id)]));
+        // Heat snapshots use short-lived connections (heatViaPath) that are
+        // fully closed BEFORE any CLI child is spawned: the evaluator never
+        // holds a second DB handle open across a CLI process (Windows keeps
+        // file handles alive until close, and a lingering -shm/-wal sharing
+        // handle must never race the child's open or its close checkpoint).
+        const heatOfAll = (ids: string[]): Map<string, number> =>
+          new Map<string, number>(ids.map((id) => [id, heatViaPath(dbPath, id)]));
+        {
+          const heatBefore = heatOfAll([gold, ...others]);
           const fb = call({
             v: 1, op: "record.feedback", idempotencyKey: `ops-s${scale}-fb-1`,
             params: { recallId: probe.recallId, recordIds: [gold], scope: OPS_SCOPE, runId: OPS_RUN },
           });
           const fbOk = okEnvelope(fb) !== null;
-          const heatAfter = new Map<string, number>([gold, ...others].map((id) => [id, heatOf(db as DatabaseSync, id)]));
+          const heatAfter = heatOfAll([gold, ...others]);
           const selectedRose = (heatAfter.get(gold) ?? -2) === (heatBefore.get(gold) ?? -1) + 1;
           const othersUnchanged = others.every((id) => heatAfter.get(id) === heatBefore.get(id));
           // Invalid: outside-exposure id must be rejected whole with no heat change.
@@ -535,7 +591,7 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           });
           const badRejected = fbBad.envelopeValid && (fbBad.envelope as { ok?: unknown })["ok"] === false
             && (fbBad.envelope as { code?: unknown })["code"] === "NOT_FOUND";
-          const heatAfterBad = new Map<string, number>([gold, ...others].map((id) => [id, heatOf(db as DatabaseSync, id)]));
+          const heatAfterBad = heatOfAll([gold, ...others]);
           const badUnchanged = [gold, ...others].every((id) => heatAfterBad.get(id) === heatAfter.get(id));
           feedbackProof = {
             status: "ok",
@@ -549,8 +605,6 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
             failed = true;
             invariants.push(`s${scale} feedback heat violated: ${JSON.stringify(feedbackProof)}`);
           }
-        } finally {
-          try { (db as DatabaseSync | null)?.close(); } catch { /* ignore */ }
         }
       }
     }
