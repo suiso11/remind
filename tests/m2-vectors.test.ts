@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Worker } from "node:worker_threads";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
@@ -30,7 +31,11 @@ import {
   eventAppend,
 } from "../src/store.js";
 import { VECTOR_DIM } from "../src/vectors.js";
-import { runStoreOpWithDeadline } from "../src/deadline.js";
+import { applyResponseBudget, fail, type ResponseEnvelope } from "../src/protocol.js";
+import {
+  type WorkerOpOutcome,
+  type WorkerOpRequest,
+} from "../src/deadline.js";
 
 const OBS = "2026-09-01T00:00:00.000Z";
 const SCOPE = "personal/default";
@@ -73,7 +78,7 @@ function setup(
       } catch {
         /* ignore */
       }
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     },
   };
 }
@@ -129,6 +134,104 @@ function recallTop(
   );
   assert.equal(res.ok, true, JSON.stringify(res));
   return ((res.data as { items: Array<{ id: string }> }).items).map((i) => i.id);
+}
+
+/** Same entry path resolution as src/deadline.ts's private workerEntryPath. */
+function workerEntryPathForTest(): string {
+  try {
+    if (typeof __filename === "string" && __filename.length > 0) {
+      return path.join(path.dirname(__filename), "..", "src", "worker-op.js");
+    }
+  } catch {
+    /* fall through */
+  }
+  return path.join(process.cwd(), "dist", "src", "worker-op.js");
+}
+
+function unavailableEnvelope(req: WorkerOpRequest): ResponseEnvelope {
+  try {
+    return applyResponseBudget(
+      fail("STORE_UNAVAILABLE"),
+      req.config.limits.responseMaxBytes,
+    );
+  } catch {
+    return fail("STORE_UNAVAILABLE");
+  }
+}
+
+/**
+ * Mirrors runStoreOpWithDeadline (same worker entry, same WorkerOpRequest
+ * contract) but fixes one flaw that matters to this test file: the
+ * production helper settles as soon as the worker's envelope arrives and
+ * fires terminate() best-effort without awaiting thread teardown. On
+ * Windows the worker's native SQLite handle keeps the temp db (and WAL /
+ * journal siblings) locked until the thread fully exits, so removing the
+ * temp dir right after the promise resolves races the teardown and fails
+ * with EPERM. Here we always await the worker's 'exit' before resolving,
+ * ensuring no open handle remains when the test's rmSync cleanup runs.
+ */
+async function runStoreOpAwaitWorkerExit(
+  req: WorkerOpRequest,
+  remainingMs: number,
+): Promise<WorkerOpOutcome> {
+  const budget = Math.max(0, Math.floor(remainingMs));
+  if (budget <= 0) return { timedOut: true };
+  let worker: Worker;
+  try {
+    worker = new Worker(workerEntryPathForTest(), { workerData: req });
+  } catch {
+    return { timedOut: false, res: unavailableEnvelope(req) };
+  }
+  // Created synchronously right after spawn so the exit event can never be
+  // missed, even when the worker exits before sending a usable message.
+  const exitWaiter = new Promise<void>((resolve) => {
+    worker.once("exit", () => resolve());
+  });
+  const outcome = await new Promise<WorkerOpOutcome>((resolve) => {
+    let done = false;
+    const finish = (o: WorkerOpOutcome): void => {
+      if (!done) {
+        done = true;
+        try {
+          void worker.terminate();
+        } catch {
+          /* ignore */
+        }
+        resolve(o);
+      }
+    };
+    const timer = setTimeout(() => finish({ timedOut: true }), budget);
+    try {
+      (timer as unknown as { unref?: () => void }).unref?.();
+    } catch {
+      /* ignore */
+    }
+    worker.once("message", (msg: unknown) => {
+      const res = (msg as { res?: ResponseEnvelope } | null)?.res;
+      if (res && typeof res === "object" && typeof (res as { ok?: unknown }).ok === "boolean") {
+        finish({ timedOut: false, res });
+      } else {
+        finish({ timedOut: false, res: unavailableEnvelope(req) });
+      }
+    });
+    worker.once("error", () => finish({ timedOut: false, res: unavailableEnvelope(req) }));
+    worker.once("exit", () => finish({ timedOut: false, res: unavailableEnvelope(req) }));
+  });
+  // The fix itself: no resolution without full thread teardown so the db
+  // file lock is released before cleanup removes the temp directory.
+  // Bounded by a generous guard so a pathological teardown cannot hang CI.
+  await Promise.race([
+    exitWaiter,
+    new Promise<void>((resolve) => {
+      const guard = setTimeout(resolve, 5000);
+      try {
+        (guard as unknown as { unref?: () => void }).unref?.();
+      } catch {
+        /* ignore */
+      }
+    }),
+  ]);
+  return outcome;
 }
 
 describe("M2 vector fusion fallback and promotion", () => {
@@ -283,7 +386,9 @@ describe("M2 recall vector availability report (F-I01-06)", () => {
       const okRes = recallRecords(ctx.db, ctx.config, { query: "seed lexical", scope: SCOPE, limit: 10 });
       assert.equal(okRes.ok, true, JSON.stringify(okRes));
       ctx.db.close();
-      const out = await runStoreOpWithDeadline(
+      // Real worker path; unlike the raw deadline helper this await
+      // includes the worker thread's exit before cleanup rmSync runs.
+      const out = await runStoreOpAwaitWorkerExit(
         {
           dbFile: ctx.config.dbPath,
           config: ctx.config,
