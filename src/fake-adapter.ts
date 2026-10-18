@@ -323,14 +323,20 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
     accBytes += Buffer.byteLength(h.snippet, "utf8") + Buffer.byteLength(h.id, "utf8");
     if (accBytes > maxOutput) return degraded("LIMIT_EXCEEDED");
     // Bounded projection: keep the CLI snippet as-is (already bounded by
-    // snippetMaxCp + response budget); copy only the fixed fields.
-    hits.push({
+    // snippetMaxCp + response budget); copy the fixed fields plus the
+    // additive F-I01-01 record-identity fields (revision, kind) when the
+    // validated item carried them, so consumers see the same contract the
+    // CLI emitted instead of silently dropping identity.
+    const hit: FakeMemoryHit = {
       id: h.id,
       snippet: h.snippet,
       truncated: h.truncated,
       tags: [...h.tags],
       createdAt: h.createdAt,
-    });
+    };
+    if (h.revision !== undefined) hit.revision = h.revision;
+    if (h.kind !== undefined) hit.kind = h.kind;
+    hits.push(hit);
   }
   // The adapter only exposes the scope it actually requested: no cross-scope
   // promotion happens here (the CLI already enforces the authorized scope).

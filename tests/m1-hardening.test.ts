@@ -792,6 +792,25 @@ describe("fake adapter: recall and degraded fallback", () => {
     }
   });
 
+  it("projects validated revision/kind identity fields into adapter hits", () => {
+    const a = adapterSetup();
+    try {
+      const res = queryMemory({ cliPath: a.cliPath, configPath: a.cfgPath, scope: "personal/default", query: "persimmon orchard" });
+      assert.equal(res.degraded, false);
+      if (!res.degraded) {
+        const hit = res.items.find((i) => i.id === a.recordId);
+        assert.ok(hit, JSON.stringify(res.items));
+        // F-I01-01 additive identity fields must survive the bounded
+        // projection, not be silently dropped (PR15 review finding 1).
+        assert.equal(typeof hit.revision, "number");
+        assert.ok((hit.revision as number) >= 1);
+        assert.equal(hit.kind, "user_fact");
+      }
+    } finally {
+      a.cleanup();
+    }
+  });
+
   it("degrades memoryless with fixed text on every failure mode", () => {
     const a = adapterSetup();
     try {
