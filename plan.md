@@ -4,7 +4,7 @@
 > - 本書は外部長期記憶システムの**正本計画**であり、旧版の承認ベース計画を**置き換える**。
 > - **決定済み要件:** AI が記憶すべき内容を自律的に判断し、durable な active 記憶として**即時に書き込む**。通常の書き込み・想起に、候補化・承認・承認トークン・承認猶予期限・TTY ゲート・人間の同意ステップを**要求しない**。これは提案ではなく決定である。
 > - **passive-vault 問題:** 書いた記憶が孤立ノートの集積に留まり、結び付かない・呼び戻されない・育たない vault は本計画の失敗である。記憶は**書く・結ぶ・呼び戻す・育てる**の四機能を満たさなければならない（§2 P1）。
-> - **現行実装の到達点（M1–M3 エンジン済み）:** `src/store.ts` の実装は語彙想起（FTS5/BM25＋char-bigram）・raw 下降（`record_source_refs` 経由）・複数 `links[]`（上限 8）・派生 backlink・有界グラフ展開（深さ 2・上限 40）・`feedback` による引用計数（`note_heat.usedCount`）を持つ。加えて M2 ベクトル／意味検索（`src/vectors.ts`・縮退付きハイブリッド想起・`scripts/eval-m2.ts`）・M3 育成（`src/cultivation.ts`・`src/distill.ts`・ローカル LLM `src/llm.ts`・可逆 `retired`＋明示的 `record.search`・`scripts/smoke-m3.ts`）・派生グラフ投影（`src/graph.ts`）を実装した。**未実装（将来・TODO）:** Companion 連携（§12 U1・§14 全般）・常時知覚の取込み（§14.6）は未着手であり実装済みとみなさない。
+> - **現行実装の到達点（M1–M3 エンジン済み）:** `src/store.ts` の実装は語彙想起（FTS5/BM25＋char-bigram）・raw 下降（`record_source_refs` 経由）・複数 `links[]`（上限 8）・派生 backlink・有界グラフ展開（深さ 2・上限 40）・`feedback` による引用計数（`note_heat.usedCount`）を持つ。加えて M2 ベクトル／意味検索（`src/vectors.ts`・縮退付きハイブリッド想起・`scripts/eval-m2.ts`）・M3 育成（`src/cultivation.ts`・`src/distill.ts`・ローカル LLM `src/llm.ts`・可逆 `retired`＋明示的 `record.search`・`scripts/smoke-m3.ts`）・派生グラフ投影（`src/graph.ts`）を実装した。**未実装（将来・TODO）:** Companion 連携の契約部分は I01/I04 決定 (2026-10-18、F-I01-01..08・F-I04-01..06) で採択済みであり remind 側契約フィールドは実装済み（§12 U1・§14.4 の決定記録参照。Companion 側 opt-in・既定無効）、常時知覚の取込み（§14.6）は未着手であり実装済みとみなさない。
 - **育成（cultivation）の合意済み方針（必読）:** 育成とは強化だけではなく、**有用な記憶の保持・統合（consolidation）と不要な記憶の可逆的な引退（retirement）**である。保持バイアスの自律 AI が判断し、通常の書き込み・想起・保守に人間の承認・分類を**要求しない**。固定 TTL・経過時間のみの忘却則は持たない。原記録は保持し、自動忘却は通常想起からの一時的除外（`retired`、可逆）に留め、利用者指示の明示的検索では取り戻せる。一度の明示的取り出しは再活性化しない。最新訂正を通常利用し、旧版・実験の元観察は履歴として残す。内容・文脈の判定は外部送信なしのローカル小規模 LLM が行い、有界の関連記憶見直しは追加・訂正・実際の引用を契機とし、会話応答を阻害しない。既存の終端 `archived` は可逆引退ではない。詳細は §2・§5–§7・§9–§10・§12、保持文書は `docs/retention.md` を参照。合意済み方針・提案 safeguard・未解決技術詳細・現行実装の区別を厳守する。
 > - 旧計画から継承するのは「別リポジトリ・ローカル運用・ネットワーク公開なし・共有 DB なし」のみである（§1）。T1–T6 の承認採用 ledger・per-task テスト件数は正本記録から**除外**する。
 > - FIO 由来の知見は**パターン採用**であり実績主張ではない。FIO は Markdown を正本に置くが、本計画は単一 SQLite 正本へ**適応**した（§13 参照）。出典は §13、p11 の未検証申告を参照。
@@ -197,9 +197,10 @@ raw 現物は event.append で不変保持。record 本文に raw 複写なし�
 ## 12. 未解決事項
 
 - **U1 Companion 連携契約:** 連携の可否・時期・手段（MCP・ローカル API 等を含む）。連携までは Companion 側への記憶書き込みを行わない。
+- **U1 決定記録（2026-10-18）:** I01 連携契約 (F-I01-01..08) と I04 retrieval 契約 (F-I04-01..06) を採択（decider haruka、source: companion_harness/docs/plan/decision_inputs_2026-10-18.md）。remind 側契約部分（record.recall の revision/kind/vector、record.search の revision、v≠1 の固定 `unsupported protocol version` メッセージ）は実装済み（README「I01/I04 契約決定の記録」参照）。Companion 側は opt-in・既定無効。F-I04-07（privacy metadata の使用フィールド）は実装せず調査待ちで未採用であり、連携手段・時期・Companion 側実装は本 U1 未確定部分として残る。
 - **U2 保持・エクスポート・削除方針:** 保持期間・削除可否・エクスポート要否。`archive` は除外であり削除ではない。消去保証は主張しない。容量枯渇時の回復は上限引上げか本方針の解決による。**合意済み育成方針として、自動忘却は可逆引退（通常想起の対象外・明示的検索で取戻し可・行保持）に留め、物理削除・固定 TTL・経過時間則は持たない。終端 `archived` は可逆引退ではなく、履歴 `superseded`・実験の元観察は保持し最新訂正を通常利用する（詳細は §7・`docs/retention.md`）。`archived` の明示的検索範囲は未決定（§12 U5）。**
 - **U3 ベクトル索引:** モデル選定・pin・ライセンス・チャンク方針（M2 で柔軟に判断。意味検索能力自体は計画完成に必須。欠落時は語彙＋グラフ縮退）。
-- **U4 残件:** 高度なスケジューリング（起動条件・バッチ幅・熱重み調整、MVP・完成の必須外）・評価（データセット・指標・閾値）・有界定数の最終値（§8 既定値は暫定、実測で見直し）。
+- **U4 残件:** 高度なスケジューリング（起動条件・バッチ幅・熱重み調整、MVP・完成の必須外）・評価（データセット・指標・閾値）・有界定数の最終値（§8 既定値は暫定、実測で見直し）。運用ライフサイクル＋規模の実測 harness（`scripts/evaluate-operations.ts`・`npm run eval:operations`、訂正/引退・再活性化・feedback heat・索引 fallback・キュー有界を 10/30/60 件で実 CLI 実証、閾値なし）は到達したが、評価閾値・資源 bounds 最終値の決定は本 U4 に残る。
  - **U5 育成の技術詳細（M3 の実装選択で確定・残件は任意のみ）:** `retired` を第 4 `status` 値とする状態・スキーマ表現（savepoint 再構築移行、`user_version` 不変）、明示的検索 API（`record.search`・active+retired・heat/再活性化なし）、`retire/reactivate` の固定理由コード、有界キュー・単一 flight リース・per-action 保守適用・safeguard（不確実・失敗・欠落時は不変、削除禁止、provision 以外の外的送信禁止）は M3 で確定済み（`docs/retention.md`）。モデル・ランタイム（`onnx-community/Qwen2.5-1.5B-Instruct` @ `d54957e3`、apache-2.0、`@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`、量子化 `onnx/model_q4.onnx`、完全オフライン・greedy 決定論）、二段階判定（保持ゲート＋位置指定統合＋共有事実確認、モデルは ID を複写しない）も確定。残件は高度なスケジューリング・評価閾値・資源 bounds の最終値のみであり、固定 TTL・`archived` の可逆扱い・外的送信は主張しない。
 
 - **R09 決定記録: M2 埋め込みモデルの選定（決定者 haruka・2026-10-18）:** 既存の公式候補提案記録群（README「R09 (M2/M3 承認ゲート用) 公式候補提案記録」・metadata のみ取得、重みダウンロードなし）から**狭めて**選定した。比較（metadata 根拠のみ）:
@@ -258,6 +259,7 @@ raw 現物は event.append で不変保持。record 本文に raw 複写なし�
 - **U1 連携（AV-10）:** 上位ビジョンは U1 連携契約の自動承認ではない。§12 U1（連携の可否・時期・手段）は未確定のままとし、I01 gate が依然必要である。連携まで Companion 側への記憶書込みは行わない。
 - **M5 承認（AV-10）:** M5 の操作毎承認 vs 継続許可（standing authorization）は契約決定を要する調整事項であり、本節で変更しない。
 - **育成保守と上位 lifecycle（AV-10）:** 上位の自律 lifecycle は remind の有界育成保守（§7・`docs/retention.md`・R9/R13）より広範であり、現行 scope を拡大しない。task manager・`pi-orch` 統合の acceptance は不在のままとし、M1–M3 の milestone・要件・順序を保全する。
+- **決定記録（2026-10-18）:** I01 連携契約 (F-I01-01..08) と I04 retrieval 契約 (F-I04-01..06) を採択（decider haruka、source: companion_harness/docs/plan/decision_inputs_2026-10-18.md）。F-I04-07 は調査待ちで未採用。本小節の「TODO・実装主張なし」は変えないが、I01 採択分のみ**: remind 側は commits 1–3 で実装済み**（`feat/i01-contract-recall-fields`: record.recall item の `revision`/`kind`・成功 data の top-level `vector` 状態、`unsupported protocol version` 固定メッセージ、及び #15 `feat/search-item-revision` の record.search `revision`）。Companion 側は opt-in・既定無効。既存 M1–M3 完了条件・§8 数値・モデル pin は不変、新規 op・新規 error code なし。privacy metadata（F-I01-05）は未実装・未決定。
 
 ### 14.5 可視化の展望（remind 自身の将来機能・TODO・実証主張なし）
 

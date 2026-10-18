@@ -95,6 +95,7 @@ npm run provision:model  # 埋め込みモデルの取得 (唯一の M2 ネッ�
 npm run rebuild:vectors  # 派生ベクトル索引の再構築 (オフライン)
 npm run smoke:semantic   # 実モデルでの CLI 意味スモーク (一時 DB)
 npm run eval:m2          # 合成データでの語彙/意味の比較評価 (一時 DB)
+npm run eval:operations   # 運用ライフサイクル+規模の合成評価 (一時 DB、実 CLI)
 npm run provision:llm    # 育成 LLM の取得 (唯一の M3 ネットワーク工程)
 npm run smoke:m3         # 実 LLM での CLI 育成スモーク (一時 DB)
 ```
@@ -113,7 +114,7 @@ npm run smoke:m3         # 実 LLM での CLI 育成スモーク (一時 DB)
 ## M3 育てる保守 (実装済み)
 
 - 状態: `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード、メタデータのみ監査)。`superseded / archived` は動かさない。通常想起・一覧 (既定)・raw 下降・グラフ・ベクトルは active のみ。
-- `record.search`: 利用者指示の明示的検索で active + retired を返す (`archived / superseded` 除外)。heat・再活性化・feedback 露出なし。
+- `record.search`: 利用者指示の明示的検索で active + retired を返す (`archived / superseded` 除外)。各 item は `revision` を含む。heat・再活性化・feedback 露出なし。
  - LLM: `onnx-community/Qwen2.5-1.5B-Instruct` (pinned revision `d54957e3af1be04546436e874a60fe386041b244`、基盤 `Qwen/Qwen2.5-1.5B-Instruct`、license `apache-2.0`、量子化 ONNX `onnx/model_q4.onnx`)。ランタイムは `@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`。取得は `npm run provision:llm` のみが行い、想起・蒸留の実行時は外部送信なしの完全オフライン。greedy 生成のため同一入力には決定論的。旧 `Xenova/bloomz-560m` は実プロンプト検証で不適（保持ゲートは不確実・要約は繰返し幻覚）、`Qwen2.5-0.5B-Instruct` は `RETIRE` を一切出さず引退不能のため不採用。
  - `maintain.distill`: 有界バッチ (既定上限 20)・単一 flight (SQLite リース、TTL 既定 120000ms、crash 時は steal・再利用)・per-action 監査・失敗隔離・取消可能で、summary/consolidation を通常の冪等 op で直接・自律的に書く。判定は二段階＋確認の実モデル推論のみ（ヒューリスティック代替なし）：(1) 保持ゲート（永続内容の抽出か `NONE`。厳密 `NONE` のみ引退候補、不確実・無効は keep）。(2) 位置指定の統合選択（関連記憶を番号 `1..N` で提示し `MERGE <n> / KEEP`。コードが実際の同一 scope 有界入力に写像するため、モデルは record ID を複写しない。表示 2 件未満・範囲外・陳腐化は keep）。(3) 共有事実の確認（両記憶の共有事実の抽出か `NONE`。`NONE`・不確実は keep）。確認済みのみ実要約を草案し、正準 provenance（`cultivation:llm-derived`）・links（両源）・sourceRefs（和集合、コード再解決）で書く。推論は正準トランザクションの外、モデル文脈は同一 scope 最大 6 件の断片に有界。不確実・無効・失敗・欠落・タイムアウト時は状態不変 (keep/有界リトライ)。モデル欠落時は縮退 OK (適用 0・キュー不変)。
   - `remember / correct / 検証済み feedback` の確定後に有界レビューをキューへ (0 リンク含む、インライン推論なし、キュー満杯でも書込み不変)。起動時 `cultivation{queueMax, batchMax, leaseTtlMs, reviewMaxAttempts}` (任意・既定 `500/20/120000/5`)、`llm{modelDir, timeoutMs, enabled, maxNewTokens, maxPromptChars}` (既定 `./models/qwen25-15b-instruct/60000/false/48/2000`)、`maintenance{timeoutMs}` (既定 120000)。キュー寿命：crash で孤立した `leased` 行は次回 steal 時に `pending` へ回収 (試行回数加算・上限で `failed`)、取消は `cancelled` 終端。drain の lease 所有者は実行ごとに一意 (`idempotencyKey#nonce`) のため同一キー並行 drain は単一 flight を失わず、再開 cursor は `(nextAt, queueId)` 複合で順序飛ばしなし。適用は lease 存続＋行 `leased` 存続の二重 fence を同一 txn 内で再検査し、取消後・奪取後の書込みを `CONFLICT` 無変更にする。`record.search` は派生索引 (FTS/bigram) 喪失時も正準 `bodyNorm` fallback で active + retired を返す。プロンプトは構造尾部 (指示＋assistant cue) を保って `maxPromptChars` (500..8000) に収める。
@@ -121,6 +122,8 @@ npm run smoke:m3         # 実 LLM での CLI 育成スモーク (一時 DB)
    - 実モデルと決定論的証明の区別 (正直な申告): 実モデル drain の引退・統合判定は genuine のモデル生成であり、スタブをモデルの出力として主張しない。失敗隔離・リトライ・merge 位置写像・ゲート safeguard・相互ペア重複排除・孤立回収・縮退無変更・単一 flight・cursor 頁送り・取消 fence・重複投入・索引喪失 fallback・プロンプト構造保持の機構自体は手渡し decide／純粋関数による決定論的テスト (`tests/m3-state.test.ts` 23 件) でも証明する。
 
 R13 M1 synthetic baseline 観測証拠 (baseline-v1, M1 lexical+graph, synthetic-only): `npm run evaluate:baseline` (build + node dist/scripts/evaluate-baseline.js) exit 0。12 queries x3 rounds=36 recalls (21 positive incl semantic-gap miss, 15 negative)。positive mean P@3 0.571/recall 0.857/RR 0.857、negative 15 valid-empty、latency success median ~62.7ms (min ~61.0/max ~103.5/p95 ~66.8)。corrupt probe は direct exit 3/empty stdout と adapter STORE_UNAVAILABLE degraded/empty citations を分離報告し contract ok (quality/degradation 除外、契約違反時は非ゼロ)。feedback は実 recallId のみ報告し、failed は invariants+非ゼロ (unavailable は正常)。setup は lens links を beacon/chart 実 ID で照合・sourceRefs [b1-lens] 完全一致・list P 厳密 8。`npm test` 101 pass (prior 80 + score 12 + evaluator integration 6 + validators 3)、acceptance 7 pass、smoke OK。
+
+運用ライフサイクル+規模の合成評価 (operations-v1, synthetic-only, lexical): `npm run eval:operations` (build + node dist/scripts/evaluate-operations.js) exit 0。一時 DB・実 CLI のみで、会話形クエリを 3 規模 (10/30/60 件) で実行する。各規模で次を実証する: 訂正は旧版を `superseded` 化し通常想起から除外して最新版を返す、引退は通常想起から除外される一方で明示的 `record.search` (active+retired、`searchId` 応答・heat なし) が取戻し `reactivate` で想起に復帰する、`record.feedback` は露出検証済みの選択引用のみ heat+1 し範囲外 ID 混入は全体 `NOT_FOUND` で heat 不変、派生索引の部分欠落 (1 件の bigram 削除)・全欠落 (`fts_notes` 削除) でも正準 `bodyNorm` fallback で想起が継続する、設定 `cultivation.queueMax=8` で open review が有界のまま全正準書込みが確定する。報告は決定論的構造の単一行 JSON (規模別の retrieval 指標・CLI 遅延統計・DB バイト・正直に観測可能な資源量のみ)。観測例: 全規模で positive recall 1.0/RR 1.0 (P@3 0.333 は k=3 に対する 1 件的中の算術であり閾値ではない)、CLI 遅延 median ~69.5ms で規模に鈍感、DB 356KB/582KB/942KB と規模に比例。合否閾値を設けず、低スコア単独では exit 0 (invariant 違反時のみ非ゼロ)。語彙結果を意味/モデル品質と呼ばない。モデル leg は既定で不試行 (`--model-dir` 指定時のみ参照・取得なし) のため、実ベースラインはモデル不在でも完走する。制限: 検索語彙は合成 anchor 中心で実会話の言い換え耐性は主張しない、vault 投影は観測時点で未生成 (queue 滞留の best-effort) のため件数は 0 報告、RSS/heap は評価 harness プロセスの値であり CLI 子プロセスの資源ではない。再現は `npm run eval:operations` のみ。
 
 R09 (M2/M3 承認ゲート用) 公式候補提案記録 (metadata のみ、未採用・未 pin・未 install・runtime 互換/採用主張なし):
 
@@ -131,3 +134,15 @@ R09 (M2/M3 承認ゲート用) 公式候補提案記録 (metadata のみ、未�
 ## 未実装の明示
 
 - Companion 連携、削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みはない。`archive` は検索除外であり削除ではなく、可逆引退ではない。`archived` の明示的検索範囲は未決定。高度なスケジューリング (起動条件・熱重み調整) は任意の将来課題。`usedCount` は `record.feedback` の引用計数の累積のみ。
+- Companion 連携の契約部分は I01 決定 (2026-10-18、F-I01-01..08) で採択済み (詳細は下記「I01/I04 契約決定の記録」)。削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みは引き続き未実装であり、privacy metadata (F-I01-05) は使用するフィールドが未決定のため未実装。
+
+## I01/I04 契約決定の記録 (2026-10-18・実装済み・追加のみ)
+
+I01 (Companion 連携契約) と I04 (retrieval 契約) の決定 F-I01-01..08・F-I04-01..06 (decider haruka、source: companion_harness/docs/plan/decision_inputs_2026-10-18.md) を受けて、既存 op へ追加フィールドのみを実装した (新規 op・新規 error code なし、 既存の順序・上限・heat・露出・byte 予算の挙動不変):
+
+- `record.recall` の各 item は元記録の `revision` と `kind` を含む (同じ行から付加的に返す。引用が実使用 revision を固定し、`model_inference` を `user_fact` と区別できる)。`recallId + items[{..., revision, kind}]`。
+- `record.recall` 成功 data は必ず top-level `vector` 状態を持つ (F-I01-06): `"disabled"` (設定 `vectors` 無効/欠落)、`"used"` (クエリ埋め込みが計算されベクトル候補が実際に参加)、`"unavailable"` (有効だがモデル/索引/クエリ埋め込みが欠落または失敗で語彙+グラフ縮退で実行)。計算追加なし・順位変更なし・byte 予算 probe はそのまま正しい。
+- `record.search` の各 item も `revision` を含む (PR #15、`feat/search-item-revision`)。
+- 数値 `v` が 1 以外の JSON は `BAD_REQUEST` で固定メッセージ `unsupported protocol version` を返す (envelope は `v:1` のまま、新 error code なし)。`v` 欠落・非数値は従来どおり `bad request`。
+
+これらは後方互換の付加フィールドであり、未知招来キーを検証する呼出側 (`src/fake-adapter.ts`・`scripts/baseline-score.ts`) は付加 superset を受け入れる。

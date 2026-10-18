@@ -321,21 +321,20 @@ describe("m3 record.search isolation", () => {
         true,
       );
       const supOld = remember(ctx.db, ctx.config, "searchable lighthouse tide table", "m3-s4");
-      assert.equal(
-        correctRecord(
-          ctx.db,
-          ctx.config,
-          {
-            recordId: supOld,
-            body: "searchable lighthouse tide table revised",
-            kind: "correction",
-            provenance: prov(),
-            scope: "personal/default",
-          },
-          "m3-s-corr",
-        ).ok,
-        true,
+      const corrRes = correctRecord(
+        ctx.db,
+        ctx.config,
+        {
+          recordId: supOld,
+          body: "searchable lighthouse tide table revised",
+          kind: "correction",
+          provenance: prov(),
+          scope: "personal/default",
+        },
+        "m3-s-corr",
       );
+      assert.equal(corrRes.ok, true, JSON.stringify(corrRes));
+      const supNew = (corrRes.data as { record: { id: string } }).record.id;
       const before = heatOf(ctx.db, retiredId);
       const res = searchRecords(ctx.db, ctx.config, { query: "lighthouse", scope: "personal/default", limit: 25 });
       assert.equal(res.ok, true, JSON.stringify(res));
@@ -345,6 +344,18 @@ describe("m3 record.search isolation", () => {
       assert.equal(byId.get(retiredId), "retired");
       assert.ok(!byId.has(archId), "archived excluded from search");
       assert.ok(!byId.has(supOld), "superseded excluded from search");
+      // Every search item carries the same revision as record.get for that id.
+      for (const it of items as unknown as Array<{ id: string; revision: number }>) {
+        const got = getRecord(ctx.db, ctx.config, { id: it.id, scope: "personal/default" });
+        assert.equal(got.ok, true);
+        const rec = (got.data as { record: { revision: number } }).record;
+        assert.equal(it.revision, rec.revision, `revision mismatch for ${it.id}`);
+      }
+      // Corrected record case: search excludes the superseded original and
+      // surfaces the active successor, whose revision is > 1.
+      assert.ok(byId.has(supNew), "corrected successor searchable");
+      const supNewItem = (items as unknown as Array<{ id: string; revision: number }>).find((i) => i.id === supNew);
+      assert.ok(supNewItem && supNewItem.revision > 1, "successor revision > 1");
       assert.equal(heatOf(ctx.db, retiredId), before, "search adds no heat");
       const still = getRecord(ctx.db, ctx.config, { id: retiredId, scope: "personal/default" });
       assert.equal((still.data as { record: { status: string } }).record.status, "retired");

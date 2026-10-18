@@ -62,6 +62,7 @@ import {
   deserializeVec,
   isValidVector,
   serializeVec,
+  vectorsEnabled,
 } from "./vectors.js";
 
 export const RECORD_KINDS = [
@@ -1866,6 +1867,20 @@ export function recallRecords(
       // the rest of this recall is exactly the M1 lexical+graph path (§8).
       const vecTopK = vector?.topK ?? VECTOR_CANDIDATE_MAX;
       const vecHits = vectorHits(db, p.scope, vector?.vec, p.since, p.until, vecTopK, VECTOR_DIM);
+      // F-I01-06: top-level availability report, derived from state the fused
+      // recall already computed (no extra embedding or cosine computation):
+      // "used" — a query vector was computed and vector candidates actually
+      //   participated (vectorHits returned candidates);
+      // "disabled" — the optional vectors section is not enabled;
+      // "unavailable" — enabled but the query vector or in-scope index produced
+      //   no candidates (model/index/query missing or failed): this recall ran
+      //   the lexical+graph fallback.
+      const vectorState: "used" | "disabled" | "unavailable" =
+        vector?.vec && vecHits.length > 0
+          ? "used"
+          : vectorsEnabled(config)
+            ? "unavailable"
+            : "disabled";
       const vecRank = new Map<string, number>();
       vecHits.forEach((h, i) => {
         if (!vecRank.has(h.id)) vecRank.set(h.id, i);
@@ -1948,15 +1963,17 @@ export function recallRecords(
       };
 
       // Candidate metadata for final ordering (createdAt for tie-break).
-      const meta = new Map<string, { createdAt: string }>();
+      // revision/kind come from the same rows: recall items carry the source
+      // record identity (F-I01-01 additions, backward-compatible fields).
+      const meta = new Map<string, { createdAt: string; revision: number; kind: string }>();
       const orderIds = [...new Set<string>([...poolIds, ...graphDist.keys()])];
       if (orderIds.length > 0) {
         try {
           const placeholders = orderIds.map(() => "?").join(",");
           const rows = db
-            .prepare(`SELECT id, createdAt FROM records WHERE id IN (${placeholders})`)
-            .all(...orderIds) as Array<{ id: string; createdAt: string }>;
-          for (const r of rows) meta.set(r.id, { createdAt: r.createdAt });
+            .prepare(`SELECT id, createdAt, revision, kind FROM records WHERE id IN (${placeholders})`)
+            .all(...orderIds) as Array<{ id: string; createdAt: string; revision: number; kind: string }>;
+          for (const r of rows) meta.set(r.id, { createdAt: r.createdAt, revision: r.revision, kind: r.kind });
         } catch {
           throw new Error("read failed");
         }
@@ -1974,10 +1991,21 @@ export function recallRecords(
         })
         .slice(0, p.limit);
 
-      // Bounded projection: snippets only, never raw bodies.
-      let items: Array<{ id: string; snippet: string; truncated: boolean; tags: string[]; createdAt: string }>;
+      // Bounded projection: snippets only, never raw bodies. Items carry the
+      // source record's revision and kind alongside the pinned snippet
+      // (backward-compatible additions; existing keys unchanged).
+      let items: Array<{
+        id: string;
+        snippet: string;
+        truncated: boolean;
+        tags: string[];
+        createdAt: string;
+        revision: number;
+        kind: string;
+      }>;
       try {
         items = ranked.map((id) => {
+          const m = meta.get(id) as { createdAt: string; revision: number; kind: string };
           const row = db
             .prepare(`SELECT body, createdAt FROM records WHERE id = ?`)
             .get(id) as { body: string; createdAt: string };
@@ -1985,13 +2013,13 @@ export function recallRecords(
           const tags = (
             db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
           ).map((r) => r.tag);
-          return { id, snippet, truncated, tags, createdAt: row.createdAt };
+          return { id, snippet, truncated, tags, createdAt: m.createdAt, revision: m.revision, kind: m.kind };
         });
       } catch {
         throw new Error("read failed");
       }
 
-      const probe: ResponseEnvelope = ok({ recallId, items });
+      const probe: ResponseEnvelope = ok({ recallId, items, vector: vectorState });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       const stored = budgeted(probe, config);
       if (!stored.ok) throw new Error("response over budget");
@@ -2989,18 +3017,27 @@ export function searchRecords(
         truncated: boolean;
         tags: string[];
         status: string;
+        revision: number;
         createdAt: string;
       }>;
       try {
         items = ranked.map((id) => {
           const row = db
-            .prepare(`SELECT body, createdAt, status FROM records WHERE id = ?`)
-            .get(id) as { body: string; createdAt: string; status: string };
+            .prepare(`SELECT body, createdAt, status, revision FROM records WHERE id = ?`)
+            .get(id) as { body: string; createdAt: string; status: string; revision: number };
           const { snippet, truncated } = snippetFor(row.body, config.limits.snippetMaxCp);
           const tags = (
             db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
           ).map((r) => r.tag);
-          return { id, snippet, truncated, tags, status: row.status, createdAt: row.createdAt };
+          return {
+            id,
+            snippet,
+            truncated,
+            tags,
+            status: row.status,
+            revision: row.revision,
+            createdAt: row.createdAt,
+          };
         });
       } catch {
         throw new Error("read failed");
