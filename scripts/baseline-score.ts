@@ -351,7 +351,11 @@ export type RecallDataCheck =
  */
 export function validateRecallData(data: unknown): RecallDataCheck {
   if (!isPlainObject(data)) return { ok: false, reason: "bad-data" };
-  if (Object.keys(data).sort().join(",") !== "items,recallId") return { ok: false, reason: "bad-data" };
+  // F-I01-06 additive top-level `vector` availability field is accepted.
+  const dataKeys = Object.keys(data).sort().join(",");
+  if (dataKeys !== "items,recallId" && dataKeys !== "items,recallId,vector") {
+    return { ok: false, reason: "bad-data" };
+  }
   if (!validRecallId(data["recallId"])) return { ok: false, reason: "bad-recallId" };
   if (!Array.isArray(data["items"])) return { ok: false, reason: "bad-items" };
   const items = data["items"] as unknown[];

@@ -300,7 +300,10 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
   const data = parsed["data"];
   if (!isPlainObject(data)) return degraded("STORE_UNAVAILABLE");
   const dataKeys = Object.keys(data).sort().join(",");
-  if (dataKeys !== "items,recallId") return degraded("STORE_UNAVAILABLE");
+  // F-I01-06 additive top-level `vector` availability field is accepted.
+  if (dataKeys !== "items,recallId" && dataKeys !== "items,recallId,vector") {
+    return degraded("STORE_UNAVAILABLE");
+  }
   const recallId = data["recallId"];
   const items = data["items"];
   if (typeof recallId !== "string" || !validId(recallId)) {

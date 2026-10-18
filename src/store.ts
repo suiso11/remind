@@ -62,6 +62,7 @@ import {
   deserializeVec,
   isValidVector,
   serializeVec,
+  vectorsEnabled,
 } from "./vectors.js";
 
 export const RECORD_KINDS = [
@@ -1866,6 +1867,20 @@ export function recallRecords(
       // the rest of this recall is exactly the M1 lexical+graph path (§8).
       const vecTopK = vector?.topK ?? VECTOR_CANDIDATE_MAX;
       const vecHits = vectorHits(db, p.scope, vector?.vec, p.since, p.until, vecTopK, VECTOR_DIM);
+      // F-I01-06: top-level availability report, derived from state the fused
+      // recall already computed (no extra embedding or cosine computation):
+      // "used" — a query vector was computed and vector candidates actually
+      //   participated (vectorHits returned candidates);
+      // "disabled" — the optional vectors section is not enabled;
+      // "unavailable" — enabled but the query vector or in-scope index produced
+      //   no candidates (model/index/query missing or failed): this recall ran
+      //   the lexical+graph fallback.
+      const vectorState: "used" | "disabled" | "unavailable" =
+        vector?.vec && vecHits.length > 0
+          ? "used"
+          : vectorsEnabled(config)
+            ? "unavailable"
+            : "disabled";
       const vecRank = new Map<string, number>();
       vecHits.forEach((h, i) => {
         if (!vecRank.has(h.id)) vecRank.set(h.id, i);
@@ -2004,7 +2019,7 @@ export function recallRecords(
         throw new Error("read failed");
       }
 
-      const probe: ResponseEnvelope = ok({ recallId, items });
+      const probe: ResponseEnvelope = ok({ recallId, items, vector: vectorState });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       const stored = budgeted(probe, config);
       if (!stored.ok) throw new Error("response over budget");
