@@ -23,6 +23,7 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { loadConfig, requirePrivacyEnabled, type AppConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
+import { requestHashFor } from "../src/normalize.js";
 import { correctRecord, ensureM1Schema, eventAppend, getRecord, recallRecords, rememberRecord, searchRecords } from "../src/store.js";
 import { deriveConsolidationPrivacy, parsePrivacyParam } from "../src/privacy.js";
 import { maintainDistill } from "../src/distill.js";
@@ -178,9 +179,10 @@ describe("privacy metadata: schema", () => {
 });
 
 describe("privacy metadata: param validation", () => {
-  it("parsePrivacyParam: strict shape, absent is null, anything else invalid", () => {
+  it("parsePrivacyParam: strict shape, absent is null, explicit null and anything else invalid", () => {
     assert.equal(parsePrivacyParam(undefined), null);
-    assert.equal(parsePrivacyParam(null), null);
+    // P2: explicit JSON null is BAD_REQUEST; only absence means "omitted".
+    assert.equal(parsePrivacyParam(null), "invalid");
     assert.deepEqual(parsePrivacyParam({ sensitivity: "normal", origin: "conversation" }), {
       sensitivity: "normal",
       origin: "conversation",
@@ -582,6 +584,164 @@ describe("privacy metadata: cultivation propagation", () => {
         { sensitivity: "normal", origin: "self_activity" },
         "all-normal sources propagate normal; origin is self_activity",
       );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("privacy metadata: legacy idempotency hashes + explicit null", () => {
+  it("event.append without privacy stores the pre-PR hash (no privacy key) and replays deduplicated", () => {
+    const ctx = setup();
+    try {
+      const params = {
+        eventId: "ev-legacy-hash",
+        sessionId: "s1",
+        turnId: "t1",
+        body: "legacy hash body",
+        provenance: prov("user_input"),
+        scope: "personal/default",
+      };
+      const res = eventAppend(ctx.db, ctx.config, { ...params }, "pm-hash-append", OBS);
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const row = ctx.db
+        .prepare(`SELECT requestHash FROM operations WHERE idempotencyKey = ?`)
+        .get("pm-hash-append") as { requestHash: string };
+      // Pre-PR normalization: params object with NO privacy key at all.
+      const expected = requestHashFor("event.append", {
+        body: params.body,
+        eventId: params.eventId,
+        observedAt: OBS,
+        runId: null,
+        scope: params.scope,
+        sessionId: params.sessionId,
+        source: "user_input",
+        turnId: params.turnId,
+      });
+      assert.equal(row.requestHash, expected, "stored hash omits absent privacy");
+      const replay = eventAppend(ctx.db, ctx.config, { ...params }, "pm-hash-append", OBS);
+      assert.equal(replay.ok, true);
+      assert.equal(replay.deduplicated, true, "replay without privacy is deduplicated, not CONFLICT");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("record.remember without privacy stores the pre-PR hash (no privacy key)", () => {
+    const ctx = setup();
+    try {
+      const res = rememberRecord(
+        ctx.db,
+        ctx.config,
+        { body: "remember legacy hash", kind: "model_inference", provenance: prov(), scope: "personal/default" },
+        "pm-hash-remember",
+        OBS,
+      );
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const row = ctx.db
+        .prepare(`SELECT requestHash FROM operations WHERE idempotencyKey = ?`)
+        .get("pm-hash-remember") as { requestHash: string };
+      const expected = requestHashFor("record.remember", {
+        body: "remember legacy hash",
+        kind: "model_inference",
+        links: [],
+        observedAt: OBS,
+        runId: null,
+        scope: "personal/default",
+        source: "derived:llm",
+        sourceRefs: [],
+        tags: [],
+      });
+      assert.equal(row.requestHash, expected, "stored hash omits absent privacy");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("record.correct without privacy stores the pre-PR hash (no privacy key)", () => {
+    const ctx = setup();
+    try {
+      const a = remember(ctx.db, ctx.config, "record to correct for hash", "pm-hash-correct-base");
+      assert.equal(a.ok, true);
+      const params = {
+        recordId: a.id as string,
+        body: "corrected legacy hash body",
+        kind: "correction" as const,
+        provenance: prov(),
+        scope: "personal/default",
+      };
+      const res = correctRecord(ctx.db, ctx.config, { ...params }, "pm-hash-correct", OBS);
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const row = ctx.db
+        .prepare(`SELECT requestHash FROM operations WHERE idempotencyKey = ?`)
+        .get("pm-hash-correct") as { requestHash: string };
+      const expected = requestHashFor("record.correct", {
+        body: params.body,
+        kind: "correction",
+        links: [],
+        observedAt: OBS,
+        recordId: params.recordId,
+        runId: null,
+        scope: params.scope,
+        source: "derived:llm",
+        sourceRefs: [],
+      });
+      assert.equal(row.requestHash, expected, "stored hash omits absent privacy");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("explicit privacy: null is BAD_REQUEST with no side effects (append/remember/correct)", () => {
+    const ctx = setup();
+    try {
+      // event.append with privacy: null
+      const ea = eventAppend(
+        ctx.db,
+        ctx.config,
+        {
+          eventId: "ev-null-privacy",
+          sessionId: "s1",
+          turnId: "t1",
+          body: "explicit null body",
+          provenance: prov("user_input"),
+          scope: "personal/default",
+          privacy: null,
+        },
+        "pm-null-append",
+      );
+      assert.equal(ea.ok, false);
+      assert.equal(ea.code, "BAD_REQUEST");
+      const rawRow = ctx.db.prepare(`SELECT COUNT(*) AS c FROM raw_events WHERE eventId = ?`).get("ev-null-privacy") as { c: number };
+      assert.equal(rawRow.c, 0, "no raw_events side effect");
+      assert.equal(ctx.db.prepare(`SELECT COUNT(*) AS c FROM operations`).get()?.c, 0, "no op stored");
+
+      // record.remember with privacy: null
+      const rr = rememberRecord(
+        ctx.db,
+        ctx.config,
+        { body: "remember explicit null", kind: "model_inference", provenance: prov(), scope: "personal/default", privacy: null },
+        "pm-null-remember",
+      );
+      assert.equal(rr.ok, false);
+      assert.equal(rr.code, "BAD_REQUEST");
+      const recRow = ctx.db.prepare(`SELECT COUNT(*) AS c FROM records`).get() as { c: number };
+      assert.equal(recRow.c, 0, "no records side effect");
+
+      // record.correct with privacy: null (existing record untouched)
+      const a = remember(ctx.db, ctx.config, "record before null correct", "pm-null-correct-base");
+      assert.equal(a.ok, true);
+      const opsBefore = ctx.db.prepare(`SELECT COUNT(*) AS c FROM operations`).get() as { c: number };
+      const cr = correctRecord(
+        ctx.db,
+        ctx.config,
+        { recordId: a.id, body: "corrected with null", kind: "correction", provenance: prov(), scope: "personal/default", privacy: null },
+        "pm-null-correct",
+      );
+      assert.equal(cr.ok, false);
+      assert.equal(cr.code, "BAD_REQUEST");
+      const opsAfter = ctx.db.prepare(`SELECT COUNT(*) AS c FROM operations`).get() as { c: number };
+      assert.equal(opsAfter.c, opsBefore.c, "no op stored for correct");
     } finally {
       ctx.cleanup();
     }

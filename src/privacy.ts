@@ -25,13 +25,15 @@ export interface PrivacyMetadata {
 
 /**
  * Parse the optional `privacy` request param.
- * undefined/null => null (absent: legacy-compatible). Any other invalid shape
- * => "invalid" (caller maps to BAD_REQUEST).
+ * undefined (absent) => null (legacy-compatible). Explicit JSON null and any
+ * other invalid shape => "invalid" (caller maps to BAD_REQUEST, no side
+ * effects): only absence means "omitted".
  */
 export function parsePrivacyParam(
   privacy: unknown,
 ): PrivacyMetadata | null | "invalid" {
-  if (privacy === undefined || privacy === null) return null;
+  if (privacy === undefined) return null;
+  if (privacy === null) return "invalid";
   if (typeof privacy !== "object" || Array.isArray(privacy)) return "invalid";
   const o = privacy as Record<string, unknown>;
   const keys = Object.keys(o);

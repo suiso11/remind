@@ -1188,17 +1188,34 @@ export function eventAppend(
   if (nPrivacy === "invalid") return budgeted(bad(), config);
   if (requirePrivacyEnabled(config) && nPrivacy === null) return budgeted(bad(), config);
 
-  const reqHash = requestHashFor("event.append", {
-    body: body as string,
-    eventId,
-    observedAt: prov.observedAt,
-    privacy: nPrivacy,
-    runId: nRunId,
-    scope: nScope,
-    sessionId,
-    source: prov.source,
-    turnId,
-  });
+  const reqHash = requestHashFor(
+    "event.append",
+    nPrivacy === null
+      ? // F-I01-05 legacy compatibility: when privacy is absent, the hashed
+        // params must be byte-identical to the pre-privacy normalization
+        // (omit the key entirely; do not include privacy: null).
+        {
+          body: body as string,
+          eventId,
+          observedAt: prov.observedAt,
+          runId: nRunId,
+          scope: nScope,
+          sessionId,
+          source: prov.source,
+          turnId,
+        }
+      : {
+          body: body as string,
+          eventId,
+          observedAt: prov.observedAt,
+          privacy: nPrivacy,
+          runId: nRunId,
+          scope: nScope,
+          sessionId,
+          source: prov.source,
+          turnId,
+        },
+  );
 
   let saved: StoredOp | null = null;
   try {
@@ -1397,18 +1414,34 @@ export function rememberRecord(
   const parsed = parseRememberParams(config, params);
   if (!parsed.ok) return budgeted(parsed.res, config);
   const n = parsed.value;
-  const reqHash = requestHashFor("record.remember", {
-    body: n.body,
-    kind: n.kind,
-    links: n.links,
-    observedAt: n.observedAt,
-    privacy: n.privacy,
-    runId: n.runId,
-    scope: n.scope,
-    source: n.source,
-    sourceRefs: n.sourceRefs,
-    tags: n.tags,
-  });
+  const reqHash = requestHashFor(
+    "record.remember",
+    n.privacy === null
+      ? // Legacy compatibility: omit the key entirely when absent (pre-PR hash).
+        {
+          body: n.body,
+          kind: n.kind,
+          links: n.links,
+          observedAt: n.observedAt,
+          runId: n.runId,
+          scope: n.scope,
+          source: n.source,
+          sourceRefs: n.sourceRefs,
+          tags: n.tags,
+        }
+      : {
+          body: n.body,
+          kind: n.kind,
+          links: n.links,
+          observedAt: n.observedAt,
+          privacy: n.privacy,
+          runId: n.runId,
+          scope: n.scope,
+          source: n.source,
+          sourceRefs: n.sourceRefs,
+          tags: n.tags,
+        },
+  );
 
   let saved: StoredOp | null = null;
   try {
@@ -2380,18 +2413,34 @@ export function correctRecord(
   const nPrivacy = parsePrivacyParam(params["privacy"]);
   if (nPrivacy === "invalid") return budgeted(bad(), config);
 
-  const reqHash = requestHashFor("record.correct", {
-    body: body as string,
-    kind: "correction",
-    links: nLinks,
-    observedAt: prov.observedAt,
-    privacy: nPrivacy,
-    recordId,
-    runId: nRunId,
-    scope: nScope,
-    source: prov.source,
-    sourceRefs: nRefs,
-  });
+  const reqHash = requestHashFor(
+    "record.correct",
+    nPrivacy === null
+      ? // Legacy compatibility: omit the key entirely when absent (pre-PR hash).
+        {
+          body: body as string,
+          kind: "correction",
+          links: nLinks,
+          observedAt: prov.observedAt,
+          recordId,
+          runId: nRunId,
+          scope: nScope,
+          source: prov.source,
+          sourceRefs: nRefs,
+        }
+      : {
+          body: body as string,
+          kind: "correction",
+          links: nLinks,
+          observedAt: prov.observedAt,
+          privacy: nPrivacy,
+          recordId,
+          runId: nRunId,
+          scope: nScope,
+          source: prov.source,
+          sourceRefs: nRefs,
+        },
+  );
 
   let saved: StoredOp | null = null;
   try {
