@@ -90,6 +90,23 @@ describe("baseline consumer validators on parsed data", () => {
     assert.equal(one.ok, true);
   });
 
+  it("additive vector field must be the fixed enum used|disabled|unavailable", () => {
+    const base = { recallId: "recall_1", items: [goodItem("rec_a")] };
+    // Each fixed enum state is accepted.
+    for (const state of ["used", "disabled", "unavailable"]) {
+      const r = validateRecallData({ ...base, vector: state });
+      assert.equal(r.ok, true, state);
+    }
+    // Any other string, non-string, or missing-enum value is invalid.
+    for (const bad of ["Used", "enabled", "bogus", "", 1, null, true, undefined]) {
+      const r = validateRecallData({ ...base, vector: bad });
+      assert.equal(r.ok, false, String(bad));
+      if (!r.ok) assert.equal(r.reason, "bad-vector", String(bad));
+    }
+    // Absent vector key stays valid (older shape).
+    assert.equal(validateRecallData(base).ok, true);
+  });
+
   it("duplicate/over-limit/invariant real IDs remain fail, denoms retained", () => {
     const dup = validateRecallData({ recallId: "recall_1", items: [goodItem("rec_a"), goodItem("rec_a")] });
     assert.equal(dup.ok, true); // shape-valid here; ID-level rules below must fail it

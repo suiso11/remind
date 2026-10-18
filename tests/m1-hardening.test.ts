@@ -811,6 +811,43 @@ describe("fake adapter: recall and degraded fallback", () => {
     }
   });
 
+  it("accepts only fixed vector enum states; other values are malformed", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "m1-adapter-vec-"));
+    try {
+      // Stub CLI (spawned exactly like the real one) emits a fixed OK
+      // envelope whose `vector` state is controlled via env.
+      const stubPath = path.join(dir, "stub-cli.js");
+      fs.writeFileSync(
+        stubPath,
+        [
+          `const item = { id: "rec_stub_1", snippet: "stub snippet", truncated: false, tags: [], createdAt: "2026-09-01T00:00:00.000Z" };`,
+          `const env = { v: 1, ok: true, code: "OK", message: "ok", deduplicated: false,`,
+          `  data: { recallId: "recall_stub", items: [item], vector: process.env.ADAPTER_STUB_VECTOR } };`,
+          `process.stdout.write(JSON.stringify(env) + "\\n");`,
+          ``,
+        ].join("\n"),
+        "utf8",
+      );
+      const opts = { cliPath: stubPath, configPath: path.join(dir, "unused.config.json"), scope: "personal/default", query: "stub query" };
+      // Fixed enum states are accepted.
+      for (const state of ["used", "disabled", "unavailable"]) {
+        process.env["ADAPTER_STUB_VECTOR"] = state;
+        const res = queryMemory(opts);
+        assert.equal(res.degraded, false, state);
+      }
+      // Any other value is a malformed response (degraded), never passed through.
+      for (const bad of ["Used", "enabled", "bogus", ""]) {
+        process.env["ADAPTER_STUB_VECTOR"] = bad;
+        const res = queryMemory(opts);
+        assert.equal(res.degraded, true, bad);
+        if (res.degraded) assert.equal(res.code, "STORE_UNAVAILABLE", bad);
+      }
+      delete process.env["ADAPTER_STUB_VECTOR"];
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("degrades memoryless with fixed text on every failure mode", () => {
     const a = adapterSetup();
     try {

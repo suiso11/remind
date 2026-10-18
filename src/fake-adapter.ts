@@ -300,9 +300,17 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
   const data = parsed["data"];
   if (!isPlainObject(data)) return degraded("STORE_UNAVAILABLE");
   const dataKeys = Object.keys(data).sort().join(",");
-  // F-I01-06 additive top-level `vector` availability field is accepted.
+  // F-I01-06 additive top-level `vector` availability field is accepted, but
+  // only with a fixed enum state: used|disabled|unavailable. Any other value
+  // is a malformed response (degraded), never passed through as data.
   if (dataKeys !== "items,recallId" && dataKeys !== "items,recallId,vector") {
     return degraded("STORE_UNAVAILABLE");
+  }
+  if (dataKeys === "items,recallId,vector") {
+    const v = data["vector"];
+    if (v !== "used" && v !== "disabled" && v !== "unavailable") {
+      return degraded("STORE_UNAVAILABLE");
+    }
   }
   const recallId = data["recallId"];
   const items = data["items"];
