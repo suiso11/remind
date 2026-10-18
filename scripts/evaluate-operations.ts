@@ -229,6 +229,19 @@ function heatOf(db: DatabaseSync, id: string): number {
   }
 }
 
+/** heatOf via a short-lived read-only connection to the eval DB path. */
+function heatViaPath(dbPath: string, id: string): number {
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    return heatOf(db, id);
+  } catch {
+    return -1;
+  } finally {
+    try { (db as DatabaseSync | null)?.close(); } catch { /* ignore */ }
+  }
+}
+
 function openReviewCount(db: DatabaseSync): number {
   try {
     const row = db.prepare(`SELECT COUNT(*) AS n FROM cultivation_queue WHERE status IN ('pending','leased')`).get() as { n?: number } | undefined;
@@ -437,7 +450,12 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           params: { id: retireId, scope: OPS_SCOPE, reasonCode: "OUTDATED" },
         }));
         const afterRetire = recallIds(query);
+        // record.search must create no exposure: snapshot the retired
+        // record's heat immediately before and after the search call.
+        const heatBeforeSearch = heatViaPath(dbPath, retireId);
         const seaRes = call({ v: 1, op: "record.search", params: { query, scope: OPS_SCOPE, limit: OPS_K } });
+        const heatAfterSearch = heatViaPath(dbPath, retireId);
+        const searchHeatUnchanged = heatBeforeSearch >= 0 && heatBeforeSearch === heatAfterSearch;
         // record.search returns data {searchId, items} with a 6-field item
         // shape (recall's 5 fields plus status); it creates no exposure, so
         // the recall validators do not apply. Validate ids directly.
@@ -474,9 +492,10 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           recallBeforeIncludes: before.ids.includes(retireId),
           recallExcludesRetired: !afterRetire.ids.includes(retireId),
           searchRecoversRetired: searchOk && searchIds.includes(retireId) && searchStatus === "retired",
+          searchHeatUnchanged,
           reactivationRestoresRecall: afterReactivate.ids.includes(retireId),
         };
-        if (!retEnv || !reaEnv || afterRetire.ids.includes(retireId) || !(searchOk && searchIds.includes(retireId) && searchStatus === "retired") || !afterReactivate.ids.includes(retireId)) {
+        if (!retEnv || !reaEnv || afterRetire.ids.includes(retireId) || !(searchOk && searchIds.includes(retireId) && searchStatus === "retired") || !afterReactivate.ids.includes(retireId) || !searchHeatUnchanged) {
           failed = true;
           invariants.push(`s${scale} retirement lifecycle violated: ${JSON.stringify(retirement)}`);
         }
