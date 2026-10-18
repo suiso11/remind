@@ -2989,18 +2989,27 @@ export function searchRecords(
         truncated: boolean;
         tags: string[];
         status: string;
+        revision: number;
         createdAt: string;
       }>;
       try {
         items = ranked.map((id) => {
           const row = db
-            .prepare(`SELECT body, createdAt, status FROM records WHERE id = ?`)
-            .get(id) as { body: string; createdAt: string; status: string };
+            .prepare(`SELECT body, createdAt, status, revision FROM records WHERE id = ?`)
+            .get(id) as { body: string; createdAt: string; status: string; revision: number };
           const { snippet, truncated } = snippetFor(row.body, config.limits.snippetMaxCp);
           const tags = (
             db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
           ).map((r) => r.tag);
-          return { id, snippet, truncated, tags, status: row.status, createdAt: row.createdAt };
+          return {
+            id,
+            snippet,
+            truncated,
+            tags,
+            status: row.status,
+            revision: row.revision,
+            createdAt: row.createdAt,
+          };
         });
       } catch {
         throw new Error("read failed");
