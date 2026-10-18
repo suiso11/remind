@@ -140,6 +140,16 @@ function get(db: DatabaseSync, config: AppConfig, id: string): Record<string, un
   return (res.data as { record: Record<string, unknown> }).record;
 }
 
+/** Recall items must carry revision/kind from the source record (F-I01-01). */
+function assert_equal_record_view(
+  item: { revision: number; kind: string },
+  record: Record<string, unknown>,
+): void {
+  assert.ok(typeof item.revision === "number");
+  assert.equal(item.revision, record.revision);
+  assert.equal(item.kind, record.kind);
+}
+
 function list(db: DatabaseSync, config: AppConfig): string[] {
   const res = listRecords(db, config, { scope: "personal/default", limit: 25 });
   assert.equal(res.ok, true, JSON.stringify(res));
@@ -567,9 +577,28 @@ describe("correction atomicity and idempotency", () => {
         return item.id;
       }).sort();
       assert.deepEqual(activeIds, [leftLink, rightLink, newId].sort());
-      const recalled = recallIds(ctx.db, ctx.config, "shared correction race");
+      const recalledRes = recallRecords(ctx.db, ctx.config, {
+        query: "shared correction race",
+        scope: "personal/default",
+        limit: 10,
+      });
+      assert.equal(recalledRes.ok, true, JSON.stringify(recalledRes));
+      const recalledItems = (recalledRes.data as { items: Array<{ id: string; revision: number; kind: string }> }).items;
+      const recalled = recalledItems.map((i) => i.id);
       assert.ok(recalled.includes(newId));
       assert.ok(!recalled.includes(original));
+      // Recall items expose the source record identity (F-I01-01 additions):
+      // revision and kind match record.get exactly, and the corrected record's
+      // recall item is the successor revision 2 (citation pinned to the used
+      // revision; model_inference entries are distinguishable from user_fact).
+      const winnerRecalled = recalledItems.find((i) => i.id === newId);
+      assert.ok(winnerRecalled, "corrected successor must appear in recall");
+      assert_equal_record_view(winnerRecalled, newRecord);
+      const leftRecalled = recalledItems.find((i) => i.id === leftLink);
+      assert.ok(leftRecalled, "uncorrected record must appear in recall");
+      const leftView = getRecord(ctx.db, ctx.config, { id: leftLink, scope: "personal/default" });
+      assert.equal(leftView.ok, true, JSON.stringify(leftView));
+      assert_equal_record_view(leftRecalled, leftView.data?.record as Record<string, unknown>);
 
       const count = (sql: string, ...args: string[]): number => {
         const row = ctx.db.prepare(sql).get(...args);
@@ -836,7 +865,17 @@ describe("canonical bodyNorm fallback without derived indexes", () => {
         items: Array<{ id: string; snippet: string; truncated: boolean; tags: string[]; createdAt: string }>;
       }).items;
       for (const it of items) {
-        assert.deepEqual(Object.keys(it).sort(), ["createdAt", "id", "snippet", "tags", "truncated"]);
+        // F-I01-01 additive record-identity fields join the adopted snippet
+        // contract; no body/raw-text keys appear.
+        assert.deepEqual(Object.keys(it).sort(), [
+          "createdAt",
+          "id",
+          "kind",
+          "revision",
+          "snippet",
+          "tags",
+          "truncated",
+        ]);
         assert.equal(typeof it.snippet, "string");
         assert.ok([...it.snippet].length <= ctx.config.limits.snippetMaxCp);
       }

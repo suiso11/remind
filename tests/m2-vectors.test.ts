@@ -30,11 +30,15 @@ import {
   eventAppend,
 } from "../src/store.js";
 import { VECTOR_DIM } from "../src/vectors.js";
+import { runStoreOpWithDeadline } from "../src/deadline.js";
 
 const OBS = "2026-09-01T00:00:00.000Z";
 const SCOPE = "personal/default";
 
-function setup(extraScopes: string[] = []): {
+function setup(
+  extraScopes: string[] = [],
+  vectors?: NonNullable<AppConfig["vectors"]>,
+): {
   config: AppConfig;
   db: DatabaseSync;
   cleanup: () => void;
@@ -58,6 +62,7 @@ function setup(extraScopes: string[] = []): {
     timeouts: { cliMs: 5000, busyMs: 2000 },
     dbMaxBytes: 104857600,
   };
+  if (vectors) config.vectors = vectors;
   const { db } = initDb(config, path.join(dir, "memory.config.json"));
   return {
     config,
@@ -209,6 +214,92 @@ describe("M2 vector fusion fallback and promotion", () => {
       assert.equal(res.ok, true);
       const wids = ((res.data as { items: Array<{ id: string }> }).items).map((i) => i.id);
       assert.ok(!wids.includes(old), JSON.stringify(wids));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("M2 recall vector availability report (F-I01-06)", () => {
+  const vectorConfig: NonNullable<AppConfig["vectors"]> = {
+    modelDir: "./models/paraphrase-multilingual-MiniLM-L12-v2",
+    topK: 20,
+    timeoutMs: 15000,
+    enabled: true,
+  };
+  it("reports disabled when the vectors section is absent", () => {
+    const ctx = setup();
+    try {
+      remember(ctx.db, ctx.config, "harbor lantern evening signal", "m2-v-disabled");
+      const res = recallRecords(ctx.db, ctx.config, { query: "harbor lantern", scope: SCOPE, limit: 10 });
+      assert.equal(res.ok, true, JSON.stringify(res));
+      assert.equal((res.data as { vector?: string }).vector, "disabled");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("reports unavailable when enabled but the query vector or index yields no candidates", () => {
+    const ctx = setup([], vectorConfig);
+    try {
+      const id = remember(ctx.db, ctx.config, "harbor lantern evening signal", "m2-v-unavail");
+      // Enabled but the query-embedding failed (simulates the worker's
+      // recallVectorFor returning undefined): lexical+graph fallback.
+      const failed = recallRecords(ctx.db, ctx.config, { query: "harbor lantern", scope: SCOPE, limit: 10 });
+      assert.equal(failed.ok, true, JSON.stringify(failed));
+      assert.equal((failed.data as { vector?: string }).vector, "unavailable");
+      assert.ok(
+        (failed.data as { items: Array<{ id: string }> }).items.length > 0,
+        "fallback recall still returns lexical items",
+      );
+      // Enabled with a computed query vector but an empty derived index:
+      // no vector candidates participate -> unavailable.
+      const res = recallRecords(
+        ctx.db, ctx.config, { query: "harbor lantern", scope: SCOPE, limit: 10 },
+        undefined, { vec: unitAt(9), topK: 20 },
+      );
+      assert.equal(res.ok, true, JSON.stringify(res));
+      assert.equal((res.data as { vector?: string }).vector, "unavailable");
+      // Index populated and the query vector matches: used.
+      assert.equal(
+        upsertRecordVector(ctx.db, id, unitAt(9), bodyHashFor(normalizeBody("harbor lantern evening signal")), new Date().toISOString()),
+        true,
+      );
+      const used = recallRecords(
+        ctx.db, ctx.config, { query: "harbor lantern", scope: SCOPE, limit: 10 },
+        undefined, { vec: unitAt(9), topK: 20 },
+      );
+      assert.equal(used.ok, true, JSON.stringify(used));
+      assert.equal((used.data as { vector?: string }).vector, "used");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("reports unavailable through the real worker path with a missing model directory", async () => {
+    const ctx = setup([], { ...vectorConfig, modelDir: "./models/no-such-vector-model" });
+    try {
+      remember(ctx.db, ctx.config, "harbor lantern evening signal", "m2-v-missing-model");
+      const okRes = recallRecords(ctx.db, ctx.config, { query: "seed lexical", scope: SCOPE, limit: 10 });
+      assert.equal(okRes.ok, true, JSON.stringify(okRes));
+      ctx.db.close();
+      const out = await runStoreOpWithDeadline(
+        {
+          dbFile: ctx.config.dbPath,
+          config: ctx.config,
+          configPath: path.join(ctx.config.dbPath, ".."),
+          op: "record.recall",
+          params: { query: "harbor lantern", scope: SCOPE, limit: 10 },
+          effectiveBusyMs: 1000,
+          remainingMs: 20000,
+        },
+        20000,
+      );
+      assert.equal(out.timedOut, false);
+      if (!out.timedOut) {
+        assert.equal(out.res.ok, true, JSON.stringify(out.res));
+        assert.equal((out.res.data as { vector?: string }).vector, "unavailable");
+      }
     } finally {
       ctx.cleanup();
     }

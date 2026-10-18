@@ -151,6 +151,38 @@ describe("budgets: response, input, and field limits", () => {
   });
 });
 
+describe("protocol version mismatch is detectable (F-I01-07)", () => {
+  it("numeric v != 1 is BAD_REQUEST with the fixed unsupported message", () => {
+    // Downgrade/upgrade mismatch must be distinguishable so the caller can
+    // disable the integration; envelope stays v:1 and no new code appears.
+    for (const v of [0, 2, -1, 1.5, Number.MAX_SAFE_INTEGER]) {
+      const r = validateRequest({ v, op: "record.get", params: { id: "rec_x", scope: "personal/default" } });
+      assert.equal(r.ok, false, `v=${String(v)}`);
+      if (!r.ok) {
+        assert.equal(r.res.code, "BAD_REQUEST");
+        assert.equal(r.res.message, "unsupported protocol version");
+        assert.equal(r.res.v, 1);
+      }
+    }
+    const parsedShape = validateRequest({ v: 2, op: "record.get", params: {} });
+    assert.equal(parsedShape.ok, false);
+    if (!parsedShape.ok) assert.equal(parsedShape.res.message, "unsupported protocol version");
+  });
+
+  it("missing or non-numeric v keeps the plain bad-request behavior", () => {
+    for (const v of [undefined, "1", null, "2", true]) {
+      const req: Record<string, unknown> = { op: "record.get", params: {} };
+      if (v !== undefined) req["v"] = v;
+      const r = validateRequest(req);
+      assert.equal(r.ok, false, `v=${String(v)}`);
+      if (!r.ok) {
+        assert.equal(r.res.code, "BAD_REQUEST");
+        assert.equal(r.res.message, "bad request");
+      }
+    }
+  });
+});
+
 describe("lone surrogates rejected; valid astral text passes", () => {
   it("unpaired halves are BAD_REQUEST at envelope and domain levels", () => {
     const ctx = setup("surr");
