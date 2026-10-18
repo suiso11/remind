@@ -23,7 +23,7 @@ export interface InvalidIds {
   reason: string;
 }
 
-import { MESSAGES, type ErrorCode } from "../src/protocol.js";
+import { MESSAGES, UNSUPPORTED_PROTOCOL_VERSION, type ErrorCode } from "../src/protocol.js";
 
 /** Intersection size of ordered-unique returned vs gold (both actual IDs). */
 export function scorePositive(
@@ -324,7 +324,14 @@ export function validateEnvelopeValues(parsed: Record<string, unknown>): Envelop
   const code = parsed["code"];
   if (typeof code !== "string" || !ALLOWED_CODES.has(code)) return { ok: false, reason: "bad-code" };
   if (typeof parsed["message"] !== "string") return { ok: false, reason: "bad-message" };
-  if (parsed["message"] !== (MESSAGES as Record<string, string>)[code]) {
+  // F-I01-07: BAD_REQUEST may carry the fixed protocol-version-mismatch
+  // message instead of the plain table message (shared constant with the
+  // emitter); every other code must match its table entry exactly.
+  const expectedMessages =
+    code === "BAD_REQUEST"
+      ? [(MESSAGES as Record<string, string>).BAD_REQUEST, UNSUPPORTED_PROTOCOL_VERSION]
+      : [(MESSAGES as Record<string, string>)[code]];
+  if (!expectedMessages.includes(parsed["message"] as string)) {
     return { ok: false, reason: "bad-message" };
   }
   const success = parsed["ok"] === true;
@@ -338,6 +345,9 @@ export function validateEnvelopeValues(parsed: Record<string, unknown>): Envelop
   return { ok: true, v: 1, success, code: code as ErrorCode };
 }
 
+/** F-I01-06 fixed availability states the recall `vector` field may take. */
+const VECTOR_STATES = new Set(["used", "disabled", "unavailable"]);
+
 export type RecallDataCheck =
   | { ok: true; recallId: string; items: RecallItem[] }
   | { ok: false; reason: string };
@@ -347,7 +357,9 @@ export type RecallDataCheck =
  * (exactly, per adopted adapter contract), recallId a real id string,
  * items a real array, every item the real 5-field shape. Missing/null
  * data or items is INVALID (never a fake valid empty); null items inside
- * the array are invalid, not mappable.
+ * the array are invalid, not mappable. When the additive F-I01-06 `vector`
+ * availability key is present it must be one of the fixed enum states
+ * used|disabled|unavailable; any other value is invalid, not mappable.
  */
 export function validateRecallData(data: unknown): RecallDataCheck {
   if (!isPlainObject(data)) return { ok: false, reason: "bad-data" };
@@ -355,6 +367,12 @@ export function validateRecallData(data: unknown): RecallDataCheck {
   const dataKeys = Object.keys(data).sort().join(",");
   if (dataKeys !== "items,recallId" && dataKeys !== "items,recallId,vector") {
     return { ok: false, reason: "bad-data" };
+  }
+  if (dataKeys === "items,recallId,vector") {
+    const v = data["vector"];
+    if (typeof v !== "string" || !VECTOR_STATES.has(v)) {
+      return { ok: false, reason: "bad-vector" };
+    }
   }
   if (!validRecallId(data["recallId"])) return { ok: false, reason: "bad-recallId" };
   if (!Array.isArray(data["items"])) return { ok: false, reason: "bad-items" };

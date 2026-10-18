@@ -102,8 +102,14 @@ describe("operations evaluator single-run lifecycle proof", () => {
       assert.ok(s.retrieval.positive.count > 0 && s.retrieval.positive.failed === 0);
       assert.ok(s.retrieval.negative.total > 0);
       assert.equal(s.indexFallback["status"], "ok");
-      assert.equal(s.indexFallback["partialBigramDropStillHits"], true);
-      assert.equal(s.indexFallback["missingFtsStillHits"], true);
+      assert.equal(s.indexFallback["corruptFtsRowStillHits"], true);
+      // Post-recall DB proof: the corrupted derived row was still corrupted
+      // when recall ran (no startup repair touched it), so the hit proves
+      // the canonical bodyNorm fallback for real.
+      assert.equal(s.indexFallback["ftsRowStillCorruptedAfterRecall"], true);
+      // Honest reporting (not asserted): partialBigramDropStillHits /
+      // conversationShapedQueryStillHits are informational — a top-3 recall
+      // can legitimately displace the record by char-bigram overlap score.
       assert.equal(s.queue["status"], "ok");
       assert.equal(s.queue["queueMax"], 8);
       assert.ok((s.queue["openReviews"] as number) <= 8);

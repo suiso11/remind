@@ -8,8 +8,11 @@
  *   feedback raises heat only for validated selected citations (invalid
  *   outside-exposure feedback rejected with heat unchanged).
  * - Derived-index fallback per size: partial (one record's bigrams dropped)
- *   and full-missing (fts_notes dropped) recalls still hit via the canonical
- *   bodyNorm fallback. Derived rows only; canonical rows never touched.
+ *   and per-row FTS-body corruption (damage the count-based startup repair
+ *   does not detect; row count preserved) recalls still hit via the canonical
+ *   bodyNorm fallback, with post-recall DB proof the damage was still present.
+ *   A fully empty FTS table is startup-repaired and claims nothing. Derived
+ *   rows only; canonical rows never touched.
  * - Queue cap per size: cultivation queueMax=8 configured; open reviews stay
  *   bounded while every canonical write still commits.
  * - No quality thresholds; low lexical scores alone exit 0. Lexical results
@@ -229,6 +232,19 @@ function heatOf(db: DatabaseSync, id: string): number {
   }
 }
 
+/** heatOf via a short-lived read-only connection to the eval DB path. */
+function heatViaPath(dbPath: string, id: string): number {
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    return heatOf(db, id);
+  } catch {
+    return -1;
+  } finally {
+    try { (db as DatabaseSync | null)?.close(); } catch { /* ignore */ }
+  }
+}
+
 function openReviewCount(db: DatabaseSync): number {
   try {
     const row = db.prepare(`SELECT COUNT(*) AS n FROM cultivation_queue WHERE status IN ('pending','leased')`).get() as { n?: number } | undefined;
@@ -290,8 +306,9 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
 
   const recallIds = (
     query: string,
+    limit: number = OPS_K,
   ): { ids: string[]; recallId: string | null; ok: boolean; code: string } => {
-    const res = call({ v: 1, op: "record.recall", params: { query, scope: OPS_SCOPE, limit: OPS_K, runId: OPS_RUN } });
+    const res = call({ v: 1, op: "record.recall", params: { query, scope: OPS_SCOPE, limit, runId: OPS_RUN } });
     if (!res.envelopeValid || res.status !== 0) {
       return { ids: [], recallId: null, ok: false, code: res.invalidReason ?? "INVALID" };
     }
@@ -303,7 +320,7 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
       failed = true;
       return { ids: [], recallId: null, ok: false, code: "INVALID" };
     }
-    const v = validateReturnedIds(checked.items.map((i) => i.id), OPS_K);
+    const v = validateReturnedIds(checked.items.map((i) => i.id), limit);
     if (!v.ok) {
       invariants.push(`s${scale} recall id contract: ${v.reason}`);
       failed = true;
@@ -396,7 +413,7 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           recallNewHitsLatest: usesLatest,
           recallExcludesSuperseded: excludesSuperseded,
         };
-        if (oldStatus !== "superseded" || newRec?.status !== "active" || (newRec?.supersedes ?? null) !== oldId || !excludesSuperseded) {
+        if (oldStatus !== "superseded" || newRec?.status !== "active" || (newRec?.supersedes ?? null) !== oldId || !excludesSuperseded || !usesLatest) {
           failed = true;
           invariants.push(`s${scale} correction lifecycle violated: ${JSON.stringify(correction)}`);
         }
@@ -437,7 +454,12 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           params: { id: retireId, scope: OPS_SCOPE, reasonCode: "OUTDATED" },
         }));
         const afterRetire = recallIds(query);
+        // record.search must create no exposure: snapshot the retired
+        // record's heat immediately before and after the search call.
+        const heatBeforeSearch = heatViaPath(dbPath, retireId);
         const seaRes = call({ v: 1, op: "record.search", params: { query, scope: OPS_SCOPE, limit: OPS_K } });
+        const heatAfterSearch = heatViaPath(dbPath, retireId);
+        const searchHeatUnchanged = heatBeforeSearch >= 0 && heatBeforeSearch === heatAfterSearch;
         // record.search returns data {searchId, items} with a 6-field item
         // shape (recall's 5 fields plus status); it creates no exposure, so
         // the recall validators do not apply. Validate ids directly.
@@ -474,9 +496,10 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           recallBeforeIncludes: before.ids.includes(retireId),
           recallExcludesRetired: !afterRetire.ids.includes(retireId),
           searchRecoversRetired: searchOk && searchIds.includes(retireId) && searchStatus === "retired",
+          searchHeatUnchanged,
           reactivationRestoresRecall: afterReactivate.ids.includes(retireId),
         };
-        if (!retEnv || !reaEnv || afterRetire.ids.includes(retireId) || !(searchOk && searchIds.includes(retireId) && searchStatus === "retired") || !afterReactivate.ids.includes(retireId)) {
+        if (!retEnv || !reaEnv || afterRetire.ids.includes(retireId) || !(searchOk && searchIds.includes(retireId) && searchStatus === "retired") || !afterReactivate.ids.includes(retireId) || !searchHeatUnchanged) {
           failed = true;
           invariants.push(`s${scale} retirement lifecycle violated: ${JSON.stringify(retirement)}`);
         }
@@ -617,27 +640,56 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
     }
 
     // --- Derived-index fallback (canonical bodyNorm covers derived loss).
+    //
+    // Honest scope (PR15 review finding 6): a fully EMPTY fts_notes/fts_raw
+    // table is repaired by the CLI startup hook (maybeRebuildDerivedIndexes
+    // rebuilds when counts are 0 or below the canonical row count), so an
+    // empty-table recall cannot prove the bodyNorm fallback. Instead this
+    // probe damages the target record's fts_notes row BODY while PRESERVING
+    // the row count — damage the count-based startup repair does not detect —
+    // and verifies via the DB after recall that the row was still corrupted
+    // when recall ran (recall never repairs derived rows). A recall hit on
+    // the target then proves the canonical bodyNorm fallback for real.
     let indexFallback: Record<string, unknown> = { status: "not-run" };
     if (seedWritesOk && fillerIds.length > 0) {
       const target = fillerIds[0] as string;
       const q = fillerQuery(scale, 0);
+      // Single anchor-term recall at a wider limit: the target is the ONLY
+      // record whose bodyNorm contains the whole anchor query, so any hit
+      // proves the canonical bodyNorm fallback (a top-3-limited recall can
+      // legitimately displace it via generic char-bigram overlap scores —
+      // a fused-ranking bound, reported honestly below, not index loss).
+      const qAnchor = `anchortoken${scale}x0`;
       let db: DatabaseSync | null = null;
       try {
         db = new DatabaseSync(dbPath);
         try { db.exec(`DELETE FROM char_bigrams WHERE kind = 'note' AND id = '${target.replace(/'/g, "''")}'`); } catch { /* ignore */ }
+        try { db.prepare(`UPDATE fts_notes SET body = 'ops corrupted derived row' WHERE recordId = ?`).run(target); } catch { /* ignore */ }
         db.close(); db = null;
         const partial = recallIds(q);
-        db = new DatabaseSync(dbPath);
-        try { db.exec(`DELETE FROM fts_notes`); } catch { /* ignore */ }
-        try { db.exec(`DELETE FROM fts_raw`); } catch { /* ignore */ }
-        db.close(); db = null;
-        const missing = recallIds(q);
+        const fallbackHit = recallIds(qAnchor, 10);
+        // Post-recall DB verification: the corrupted derived row must still
+        // be corrupted (no startup repair and no recall-side healing), so
+        // the FTS leg genuinely missed the target when recall ran.
+        let stillCorrupted = false;
+        let ftsRowCount = -1;
+        try {
+          db = new DatabaseSync(dbPath);
+          const row = db.prepare(`SELECT body FROM fts_notes WHERE recordId = ?`).get(target) as { body?: unknown } | undefined;
+          stillCorrupted = typeof row?.body === "string" && row.body === "ops corrupted derived row";
+          const cnt = db.prepare(`SELECT COUNT(*) AS n FROM fts_notes`).get() as { n?: number } | undefined;
+          ftsRowCount = typeof cnt?.n === "number" ? cnt.n : -1;
+        } catch { /* keep defaults */ }
         indexFallback = {
           status: "ok",
           partialBigramDropStillHits: partial.ids.includes(target),
-          missingFtsStillHits: missing.ids.includes(target),
+          corruptFtsRowStillHits: fallbackHit.ids.includes(target),
+          ftsRowStillCorruptedAfterRecall: stillCorrupted,
+          ftsRowCount,
+          note: "full-empty FTS tables are startup-repaired (maybeRebuildDerivedIndexes); the proven fallback is per-row derived damage the count-based repair does not detect, verified via the DB after recall. The asserted probe recalls the unique anchor query at limit 10: the record is the only whole-query bodyNorm match, so any hit proves the canonical fallback (top-3 recall can legitimately displace it by char-bigram overlap; conversation-shaped-query result reported informationally)",
+          conversationShapedQueryStillHits: partial.ids.includes(target),
         };
-        if (!partial.ids.includes(target) || !missing.ids.includes(target)) {
+        if (!fallbackHit.ids.includes(target) || !stillCorrupted) {
           failed = true;
           invariants.push(`s${scale} index fallback missed: ${JSON.stringify(indexFallback)}`);
         }

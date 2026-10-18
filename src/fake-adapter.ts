@@ -300,9 +300,17 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
   const data = parsed["data"];
   if (!isPlainObject(data)) return degraded("STORE_UNAVAILABLE");
   const dataKeys = Object.keys(data).sort().join(",");
-  // F-I01-06 additive top-level `vector` availability field is accepted.
+  // F-I01-06 additive top-level `vector` availability field is accepted, but
+  // only with a fixed enum state: used|disabled|unavailable. Any other value
+  // is a malformed response (degraded), never passed through as data.
   if (dataKeys !== "items,recallId" && dataKeys !== "items,recallId,vector") {
     return degraded("STORE_UNAVAILABLE");
+  }
+  if (dataKeys === "items,recallId,vector") {
+    const v = data["vector"];
+    if (v !== "used" && v !== "disabled" && v !== "unavailable") {
+      return degraded("STORE_UNAVAILABLE");
+    }
   }
   const recallId = data["recallId"];
   const items = data["items"];
@@ -323,14 +331,20 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
     accBytes += Buffer.byteLength(h.snippet, "utf8") + Buffer.byteLength(h.id, "utf8");
     if (accBytes > maxOutput) return degraded("LIMIT_EXCEEDED");
     // Bounded projection: keep the CLI snippet as-is (already bounded by
-    // snippetMaxCp + response budget); copy only the fixed fields.
-    hits.push({
+    // snippetMaxCp + response budget); copy the fixed fields plus the
+    // additive F-I01-01 record-identity fields (revision, kind) when the
+    // validated item carried them, so consumers see the same contract the
+    // CLI emitted instead of silently dropping identity.
+    const hit: FakeMemoryHit = {
       id: h.id,
       snippet: h.snippet,
       truncated: h.truncated,
       tags: [...h.tags],
       createdAt: h.createdAt,
-    });
+    };
+    if (h.revision !== undefined) hit.revision = h.revision;
+    if (h.kind !== undefined) hit.kind = h.kind;
+    hits.push(hit);
   }
   // The adapter only exposes the scope it actually requested: no cross-scope
   // promotion happens here (the CLI already enforces the authorized scope).
