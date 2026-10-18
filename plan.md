@@ -198,7 +198,7 @@ raw 現物は event.append で不変保持。record 本文に raw 複写なし�
 - **U1 Companion 連携契約:** 連携の可否・時期・手段（MCP・ローカル API 等を含む）。連携までは Companion 側への記憶書き込みを行わない。
 - **U2 保持・エクスポート・削除方針:** 保持期間・削除可否・エクスポート要否。`archive` は除外であり削除ではない。消去保証は主張しない。容量枯渇時の回復は上限引上げか本方針の解決による。**合意済み育成方針として、自動忘却は可逆引退（通常想起の対象外・明示的検索で取戻し可・行保持）に留め、物理削除・固定 TTL・経過時間則は持たない。終端 `archived` は可逆引退ではなく、履歴 `superseded`・実験の元観察は保持し最新訂正を通常利用する（詳細は §7・`docs/retention.md`）。`archived` の明示的検索範囲は未決定（§12 U5）。**
 - **U3 ベクトル索引:** モデル選定・pin・ライセンス・チャンク方針（M2 で柔軟に判断。意味検索能力自体は計画完成に必須。欠落時は語彙＋グラフ縮退）。
-- **U4 残件:** 高度なスケジューリング（起動条件・バッチ幅・熱重み調整、MVP・完成の必須外）・評価（データセット・指標・閾値）・有界定数の最終値（§8 既定値は暫定、実測で見直し）。
+- **U4 残件:** 高度なスケジューリング（起動条件・バッチ幅・熱重み調整、MVP・完成の必須外）・評価（データセット・指標・閾値）・有界定数の最終値（§8 既定値は暫定、実測で見直し）。運用ライフサイクル＋規模の実測 harness（`scripts/evaluate-operations.ts`・`npm run eval:operations`、訂正/引退・再活性化・feedback heat・索引 fallback・キュー有界を 10/30/60 件で実 CLI 実証、閾値なし）は到達したが、評価閾値・資源 bounds 最終値の決定は本 U4 に残る。
  - **U5 育成の技術詳細（M3 の実装選択で確定・残件は任意のみ）:** `retired` を第 4 `status` 値とする状態・スキーマ表現（savepoint 再構築移行、`user_version` 不変）、明示的検索 API（`record.search`・active+retired・heat/再活性化なし）、`retire/reactivate` の固定理由コード、有界キュー・単一 flight リース・per-action 保守適用・safeguard（不確実・失敗・欠落時は不変、削除禁止、provision 以外の外的送信禁止）は M3 で確定済み（`docs/retention.md`）。モデル・ランタイム（`onnx-community/Qwen2.5-1.5B-Instruct` @ `d54957e3`、apache-2.0、`@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`、量子化 `onnx/model_q4.onnx`、完全オフライン・greedy 決定論）、二段階判定（保持ゲート＋位置指定統合＋共有事実確認、モデルは ID を複写しない）も確定。残件は高度なスケジューリング・評価閾値・資源 bounds の最終値のみであり、固定 TTL・`archived` の可逆扱い・外的送信は主張しない。
 
 ---
