@@ -33,3 +33,49 @@ jobs:
           if (Get-Command chmod -ErrorAction SilentlyContinue) { throw 'chmod still resolvable after PATH filter' }
           if (Get-Command chmod.exe -ErrorAction SilentlyContinue) { throw 'chmod.exe still resolvable after PATH filter' }
           npm test
+  node26-trial:
+    continue-on-error: true
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - if: matrix.os == 'ubuntu-latest'
+        run: npm test
+      - if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $kept = @()
+          foreach ($d in ($env:PATH -split ';')) {
+            if ([string]::IsNullOrWhiteSpace($d)) { continue }
+            try {
+              if (Test-Path (Join-Path $d 'chmod.exe')) { continue }
+            } catch { }
+            $kept += $d
+          }
+          $env:PATH = $kept -join ';'
+          if (Get-Command chmod -ErrorAction SilentlyContinue) { throw 'chmod still resolvable after PATH filter' }
+          if (Get-Command chmod.exe -ErrorAction SilentlyContinue) { throw 'chmod.exe still resolvable after PATH filter' }
+          npm test
+      - if: matrix.os == 'ubuntu-latest'
+        run: npm run eval:operations
+      - if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $kept = @()
+          foreach ($d in ($env:PATH -split ';')) {
+            if ([string]::IsNullOrWhiteSpace($d)) { continue }
+            try {
+              if (Test-Path (Join-Path $d 'chmod.exe')) { continue }
+            } catch { }
+            $kept += $d
+          }
+          $env:PATH = $kept -join ';'
+          npm run eval:operations
