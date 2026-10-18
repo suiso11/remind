@@ -8,6 +8,8 @@ const evaluator = path.join(repoRoot, "dist", "scripts", "evaluate-operations.js
 
 let cachedStatus: number | null | undefined;
 let cachedReport: Record<string, unknown> | null = null;
+let cachedStderr = "";
+let cachedStdoutHead = "";
 
 before(() => {
   const r = spawnSync(process.execPath, [evaluator], {
@@ -25,10 +27,35 @@ before(() => {
   } catch {
     cachedReport = null;
   }
+  // Diagnostics on failure only (never on green runs): the evaluator's report
+  // JSON and fixed stderr lines are the only way to attribute a platform-only
+  // harness failure from CI logs. Bounded so a broken child cannot flood logs.
+  cachedStdoutHead = out.subarray(0, 4096).toString("utf8");
+  cachedStderr = (Buffer.isBuffer(r.stderr) ? r.stderr : Buffer.from(String(r.stderr ?? "")))
+    .subarray(0, 2048).toString("utf8");
+  if (cachedStatus !== 0 || cachedReport === null) {
+    process.stderr.write(
+      `[operations-eval] evaluator exit=${String(cachedStatus)} ` +
+      `error=${r.error ? String((r.error as Error).name) : "none"}\n` +
+      `[operations-eval] stdout(first 4096 bytes): ${cachedStdoutHead}\n` +
+      `[operations-eval] stderr(first 2048 bytes): ${cachedStderr}\n`,
+    );
+  }
 });
 
+/** Assertion-message diagnostics: status, invariant failures, stderr excerpt. */
+function diag(): string {
+  const failures = (cachedReport?.["invariants"] as { failures?: unknown[] } | null)?.failures;
+  const parts = [
+    `evaluator exit=${String(cachedStatus)}`,
+    `invariantFailures=${JSON.stringify(failures ?? "no-report")}`,
+    `stderr=${JSON.stringify(cachedStderr.slice(0, 1024))}`,
+  ];
+  return parts.join(" ");
+}
+
 function report(): Record<string, unknown> {
-  assert.ok(cachedReport !== null, `evaluator must emit JSON report (status=${String(cachedStatus)})`);
+  assert.ok(cachedReport !== null, `evaluator must emit JSON report (${diag()})`);
   return cachedReport as Record<string, unknown>;
 }
 
@@ -64,15 +91,15 @@ function scales(): ScaleReport[] {
 
 describe("operations evaluator single-run lifecycle proof", () => {
   it("actual process exits 0 with ok setup and no invariant failures", () => {
-    assert.equal(cachedStatus, 0);
+    assert.equal(cachedStatus, 0, diag());
     const rep = report();
-    assert.equal((rep["setup"] as { status?: string })?.status, "ok");
+    assert.equal((rep["setup"] as { status?: string })?.status, "ok", diag());
     assert.deepEqual((rep["invariants"] as { failures?: unknown })?.failures, []);
   });
 
   it("correction excludes superseded and retirement round-trips at every scale", () => {
     for (const s of scales()) {
-      assert.equal(s.seedWritesOk, true);
+      assert.equal(s.seedWritesOk, true, `scale ${s.scale} seedWritesOk: ${diag()}`);
       const c = s.lifecycle.correction;
       assert.equal(c["status"], "ok");
       assert.equal(c["oldStatus"], "superseded");
