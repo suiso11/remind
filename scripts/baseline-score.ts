@@ -23,7 +23,7 @@ export interface InvalidIds {
   reason: string;
 }
 
-import { MESSAGES, type ErrorCode } from "../src/protocol.js";
+import { MESSAGES, UNSUPPORTED_PROTOCOL_VERSION, type ErrorCode } from "../src/protocol.js";
 
 /** Intersection size of ordered-unique returned vs gold (both actual IDs). */
 export function scorePositive(
@@ -324,7 +324,14 @@ export function validateEnvelopeValues(parsed: Record<string, unknown>): Envelop
   const code = parsed["code"];
   if (typeof code !== "string" || !ALLOWED_CODES.has(code)) return { ok: false, reason: "bad-code" };
   if (typeof parsed["message"] !== "string") return { ok: false, reason: "bad-message" };
-  if (parsed["message"] !== (MESSAGES as Record<string, string>)[code]) {
+  // F-I01-07: BAD_REQUEST may carry the fixed protocol-version-mismatch
+  // message instead of the plain table message (shared constant with the
+  // emitter); every other code must match its table entry exactly.
+  const expectedMessages =
+    code === "BAD_REQUEST"
+      ? [(MESSAGES as Record<string, string>).BAD_REQUEST, UNSUPPORTED_PROTOCOL_VERSION]
+      : [(MESSAGES as Record<string, string>)[code]];
+  if (!expectedMessages.includes(parsed["message"] as string)) {
     return { ok: false, reason: "bad-message" };
   }
   const success = parsed["ok"] === true;

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { MESSAGES } from "../src/protocol.js";
+import { MESSAGES, UNSUPPORTED_PROTOCOL_VERSION } from "../src/protocol.js";
 import {
   aggregatePositive,
   findInvariantViolations,
@@ -70,6 +70,29 @@ describe("baseline consumer validators on parsed data", () => {
     // Valid error envelope accepted.
     const err = validateEnvelopeValues({ v: 1, ok: false, code: "STORE_UNAVAILABLE", message: MESSAGES.STORE_UNAVAILABLE, data: null, deduplicated: false });
     assert.equal(err.ok, true);
+  });
+
+  it("BAD_REQUEST accepts the fixed unsupported-protocol-version message (F-I01-07)", () => {
+    // The fixed version-mismatch message is accepted for BAD_REQUEST.
+    const mismatch = validateEnvelopeValues({
+      v: 1, ok: false, code: "BAD_REQUEST", message: UNSUPPORTED_PROTOCOL_VERSION, data: null, deduplicated: false,
+    });
+    assert.equal(mismatch.ok, true);
+    // The plain table message stays accepted too.
+    const plain = validateEnvelopeValues({
+      v: 1, ok: false, code: "BAD_REQUEST", message: MESSAGES.BAD_REQUEST, data: null, deduplicated: false,
+    });
+    assert.equal(plain.ok, true);
+    // Any other message for BAD_REQUEST is still rejected.
+    const wrong = validateEnvelopeValues({
+      v: 1, ok: false, code: "BAD_REQUEST", message: "unsupported protocol version 2", data: null, deduplicated: false,
+    });
+    assert.equal(wrong.ok, false);
+    // The mismatch message is NOT accepted for other codes.
+    const crossCode = validateEnvelopeValues({
+      v: 1, ok: false, code: "STORE_UNAVAILABLE", message: UNSUPPORTED_PROTOCOL_VERSION, data: null, deduplicated: false,
+    });
+    assert.equal(crossCode.ok, false);
   });
 
   it("recall data requires actual recallId/items array/item shapes, never fake empty", () => {
