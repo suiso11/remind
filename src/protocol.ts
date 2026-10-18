@@ -43,6 +43,9 @@ export const MESSAGES: Record<ErrorCode, string> = {
   TIMEOUT: "timeout",
 };
 
+/** Fixed protocol-version mismatch message (no version echo). */
+export const UNSUPPORTED_PROTOCOL_VERSION = "unsupported protocol version";
+
 export function ok(
   data: Record<string, unknown> | null = null,
 ): ResponseEnvelope {
@@ -100,6 +103,18 @@ export function validateRequest(
   parsed: unknown,
 ): { ok: true; req: ValidRequest } | { ok: false; res: ResponseEnvelope } {
   if (!isPlainObject(parsed)) return { ok: false, res: fail("BAD_REQUEST") };
+  // F-I01-07: a numeric version this integration does not speak must be
+  // distinguishable from an ordinary malformed request so a caller can detect
+  // the mismatch (e.g. downgrade) and disable the integration. Fixed message
+  // only; the envelope stays v:1 and no new error code is introduced.
+  // Missing or non-numeric versions keep the plain BAD_REQUEST behavior below.
+  const reqVersion = parsed["v"];
+  if (typeof reqVersion === "number" && reqVersion !== 1) {
+    return {
+      ok: false,
+      res: { ...fail("BAD_REQUEST"), message: UNSUPPORTED_PROTOCOL_VERSION },
+    };
+  }
   const keys = Object.keys(parsed);
   const allowed = new Set(["v", "op", "idempotencyKey", "params"]);
   for (const k of keys) {
