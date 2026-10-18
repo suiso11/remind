@@ -43,6 +43,7 @@ import {
   requestHashFor,
 } from "./normalize.js";
 import { enqueueProjection } from "./projection.js";
+import { deriveConsolidationPrivacy } from "./privacy.js";
 import {
   applyResponseBudget,
   fail,
@@ -934,11 +935,11 @@ export function applyCultivationBatch(
           skip("BAD_REQUEST");
           continue;
         }
-        let target: { scope: string; status: string; revision: number } | undefined;
+        let target: { scope: string; status: string; revision: number; privacySensitivity: string | null } | undefined;
         try {
           target = db
-            .prepare(`SELECT scope, status, revision FROM records WHERE id = ?`)
-            .get(recordId) as { scope: string; status: string; revision: number } | undefined;
+            .prepare(`SELECT scope, status, revision, privacySensitivity FROM records WHERE id = ?`)
+            .get(recordId) as { scope: string; status: string; revision: number; privacySensitivity: string | null } | undefined;
         } catch {
           throw new Error("read failed");
         }
@@ -1040,6 +1041,10 @@ export function applyCultivationBatch(
         // corrected/retired/archived after inference is stale: conservative
         // CONFLICT no-change, never a summary from the stale body. Links are
         // additionally required to resolve to existing same-scope rows below.
+        // F-I01-05: the peer's privacy sensitivity is captured here too and
+        // propagated to the summary via the single deriveConsolidationPrivacy
+        // helper (sensitive wins, all-known => normal, unknown => null).
+        let peerPrivacySensitivity: string | null = null;
         if (isPlainObject(a.peer as unknown as Record<string, unknown>)) {
           const peer = a.peer as NonNullable<CultivationAction["peer"]>;
           if (
@@ -1052,11 +1057,11 @@ export function applyCultivationBatch(
             skip("BAD_REQUEST");
             continue;
           }
-          let peerRow: { scope: string; status: string; revision: number } | undefined;
+          let peerRow: { scope: string; status: string; revision: number; privacySensitivity: string | null } | undefined;
           try {
             peerRow = db
-              .prepare(`SELECT scope, status, revision FROM records WHERE id = ?`)
-              .get(peer.recordId) as { scope: string; status: string; revision: number } | undefined;
+              .prepare(`SELECT scope, status, revision, privacySensitivity FROM records WHERE id = ?`)
+              .get(peer.recordId) as { scope: string; status: string; revision: number; privacySensitivity: string | null } | undefined;
           } catch {
             throw new Error("read failed");
           }
@@ -1072,6 +1077,7 @@ export function applyCultivationBatch(
             skip("CONFLICT"); // peer went stale after inference: no summary
             continue;
           }
+          peerPrivacySensitivity = peerRow.privacySensitivity;
         }
         if (!isPlainObject(summary as unknown as Record<string, unknown>)) {
           skip("BAD_REQUEST");
@@ -1223,10 +1229,14 @@ export function applyCultivationBatch(
         const summaryId = genId("rec");
         const probe: ResponseEnvelope = ok({ cultivation: { summaryId } });
         if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
+        // F-I01-05: derived summaries always carry origin "self_activity";
+        // sensitivity follows the propagation helper over the merge sources.
+        const summaryPrivacy = deriveConsolidationPrivacy([target.privacySensitivity, peerPrivacySensitivity]);
         db.prepare(
-          `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
-           VALUES (?, ?, ?, ?, 'summary', ?, ?, ?, 'active', NULL, 1, ?)`,
-        ).run(summaryId, s.body, nBody, bodyHashFor(nBody), prov.source, prov.observedAt, nScope, now);
+          `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt, privacySensitivity, privacyOrigin)
+           VALUES (?, ?, ?, ?, 'summary', ?, ?, ?, 'active', NULL, 1, ?, ?, ?)`,
+        ).run(summaryId, s.body, nBody, bodyHashFor(nBody), prov.source, prov.observedAt, nScope, now,
+          summaryPrivacy === null ? null : summaryPrivacy.sensitivity, summaryPrivacy === null ? null : summaryPrivacy.origin);
         for (const t of nTags) db.prepare(`INSERT INTO record_tags(recordId, tag) VALUES (?, ?)`).run(summaryId, t);
         for (const l of nLinks) db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(summaryId, l);
         for (const r of nRefs) db.prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES (?, ?)`).run(summaryId, r);
