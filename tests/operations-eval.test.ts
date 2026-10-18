@@ -134,9 +134,10 @@ describe("operations evaluator single-run lifecycle proof", () => {
       // when recall ran (no startup repair touched it), so the hit proves
       // the canonical bodyNorm fallback for real.
       assert.equal(s.indexFallback["ftsRowStillCorruptedAfterRecall"], true);
-      // Honest reporting (not asserted): partialBigramDropStillHits /
-      // conversationShapedQueryStillHits are informational — a top-3 recall
-      // can legitimately displace the record by char-bigram overlap score.
+      // With the canonical substitute-rank fix, the damaged canonical hit
+      // receives the lexical signal a healthy index would have given it, so
+      // the conversation-shaped query at small top-k (limit 3) is asserted.
+      assert.equal(s.indexFallback["conversationShapedQueryStillHits"], true);
       assert.equal(s.queue["status"], "ok");
       assert.equal(s.queue["queueMax"], 8);
       assert.ok((s.queue["openReviews"] as number) <= 8);
