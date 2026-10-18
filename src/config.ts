@@ -71,6 +71,12 @@ export interface AppConfig {
   llm?: LlmConfig;
   /** M3 maintenance deadline (optional; absent uses the default long budget). */
   maintenance?: MaintenanceConfig;
+  /**
+   * F-I01-05 (optional boolean, default false): when true, event.append and
+   * record.remember without a `privacy` object are BAD_REQUEST (no side
+   * effects). Backward-compatible: absent preserves current behavior.
+   */
+  requirePrivacy?: boolean;
 }
 
 const TOP_KEYS = [
@@ -84,6 +90,7 @@ const TOP_KEYS = [
   "cultivation",
   "llm",
   "maintenance",
+  "requirePrivacy",
 ] as const;
 const LIMIT_KEYS = [
   "bodyMaxCp",
@@ -339,6 +346,13 @@ export function loadConfig(configPath: string): AppConfig {
     maintenance = { timeoutMs: timeoutMs as number };
   }
 
+  let requirePrivacy: boolean | undefined;
+  if ("requirePrivacy" in parsed && (parsed as Record<string, unknown>)["requirePrivacy"] !== undefined) {
+    const rp = (parsed as Record<string, unknown>)["requirePrivacy"];
+    if (typeof rp !== "boolean") throw new Error("requirePrivacy must be a boolean");
+    requirePrivacy = rp;
+  }
+
   return {
     dbPath: dbPath as string,
     vaultPath: vaultPath as string,
@@ -363,6 +377,7 @@ export function loadConfig(configPath: string): AppConfig {
     ...(cultivation ? { cultivation } : {}),
     ...(llm ? { llm } : {}),
     ...(maintenance ? { maintenance } : {}),
+    ...(requirePrivacy !== undefined ? { requirePrivacy } : {}),
   };
 }
 
@@ -402,6 +417,14 @@ export function cultivationBounds(config: AppConfig): Required<CultivationConfig
     reviewMaxAttempts:
       config.cultivation?.reviewMaxAttempts ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS,
   };
+}
+
+/**
+ * F-I01-05 gate (default false): true only when the config explicitly sets
+ * requirePrivacy to a boolean true.
+ */
+export function requirePrivacyEnabled(config: AppConfig): boolean {
+  return config.requirePrivacy === true;
 }
 
 /** Resolve a config-relative path against the config file directory. */

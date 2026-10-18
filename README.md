@@ -24,8 +24,9 @@ Copy-Item memory.config.example.json memory.config.json
 - `limits`: `bodyMaxCp / queryMaxCp / tagsMax / linksMax / sourceRefsMax / limitDefault / limitMax / snippetMaxCp / responseMaxBytes`
 - `timeouts`: `cliMs` (全体期限)、`busyMs` (SQLite 待機)
 - `dbMaxBytes`: 上限超過の書き込みは `STORE_UNAVAILABLE` で巻き戻し。読み取りは継続する
+- `requirePrivacy` (任意・既定 false): `true` のとき `privacy` を欠く `event.append / record.remember` は `BAD_REQUEST` で拒否する (下記「privacy metadata (F-I01-05)」)
 
-`memory.config.json` は git 管理対象外。コミットしないこと。
+`memory.config.json` は git 管理対象外。コミットしないこと。`requirePrivacy` は boolean 以外で起動失敗する。
 
 ## 書き込み: event.append -> record.remember -> recall
 
@@ -134,7 +135,7 @@ R09 (M2/M3 承認ゲート用) 公式候補提案記録 (metadata のみ、未�
 ## 未実装の明示
 
 - Companion 連携、削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みはない。`archive` は検索除外であり削除ではなく、可逆引退ではない。`archived` の明示的検索範囲は未決定。高度なスケジューリング (起動条件・熱重み調整) は任意の将来課題。`usedCount` は `record.feedback` の引用計数の累積のみ。
-- Companion 連携の契約部分は I01 決定 (2026-10-18、F-I01-01..08) で採択済み (詳細は下記「I01/I04 契約決定の記録」)。削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みは引き続き未実装であり、privacy metadata (F-I01-05) は使用するフィールドが未決定のため未実装。
+- Companion 連携の契約部分は I01 決定 (2026-10-18、F-I01-01..08) で採択済み (詳細は下記「I01/I04 契約決定の記録」)。削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みは引き続き未実装であり、privacy metadata (F-I01-05) は同日の決定に基づき実装済み (詳細は下記「privacy metadata (F-I01-05・実装済み・追加のみ)」)。
 
 ## I01/I04 契約決定の記録 (2026-10-18・実装済み・追加のみ)
 
@@ -146,3 +147,13 @@ I01 (Companion 連携契約) と I04 (retrieval 契約) の決定 F-I01-01..08�
 - 数値 `v` が 1 以外の JSON は `BAD_REQUEST` で固定メッセージ `unsupported protocol version` を返す (envelope は `v:1` のまま、新 error code なし)。`v` 欠落・非数値は従来どおり `bad request`。
 
 これらは後方互換の付加フィールドであり、未知招来キーを検証する呼出側 (`src/fake-adapter.ts`・`scripts/baseline-score.ts`) は付加 superset を受け入れる。
+
+## privacy metadata (F-I01-05・実装済み・追加のみ)
+
+2026-10-18 の F-I01-05/F-I04-07 決定 (decider haruka、§12 U1 の決定記録バレット参照) を受けて、既存 3 書込 op への任意オプトインフィールド `privacy` のみを追加した (新規 op・新規 error code なし、既存の順序・上限・heat・露出・想起了動作の不変):
+
+- `event.append / record.remember / record.correct` は任意の `privacy` `{sensitivity, origin}` を受け付ける。値は厳密にキー 2 つ `{sensitivity: "normal" | "sensitive", origin: "conversation" | "self_activity"}` で、余分な鍵・鍵欠落・列挙外・非オブジェクトは `BAD_REQUEST` (副作用なし)。
+- `record.correct` で `privacy` を省略したときは訂正対象 (supersede 対象) の旧版の privacy を継承し、明示指定時は上書きする。
+- 設定 `requirePrivacy` (既定 false): `true` のとき `privacy` を欠く `event.append / record.remember` は `BAD_REQUEST` で拒否する。
+- `privacy` は `record.get` および `record.search` の各 item で返す。privacy を持たない旧世代の行は `privacy: null` と読み戻る。`record.recall` の出力・順位には影響しない (P4a: 保存と返却のみ)。
+- 蒸留 (`maintain.distill`) が生成する記憶 (summary/consolidation) は origin を `self_activity` に固定し、sensitivity は伝播則に従う: source のいずれか 1 件でも `sensitive` なら `sensitive`、全 source が privacy 既知なら `normal`、それ以外 (privacy 不明の source を含む) は `null`。

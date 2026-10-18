@@ -39,5 +39,6 @@
   },
   "maintenance": {
     "timeoutMs": 120000
-  }
+  },
+  "requirePrivacy": false
 }

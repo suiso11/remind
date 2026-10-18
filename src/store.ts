@@ -28,6 +28,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
+import { requirePrivacyEnabled } from "./config.js";
 import {
   bodyHashFor,
   canonicalStringify,
@@ -44,6 +45,11 @@ import {
   sha256HexUtf8,
 } from "./normalize.js";
 import { enqueueProjection } from "./projection.js";
+import {
+  parsePrivacyParam,
+  privacyFromColumns,
+  type PrivacyMetadata,
+} from "./privacy.js";
 import {
   REACTIVATE_REASONS,
   RETIRE_REASONS,
@@ -155,6 +161,62 @@ function migrateRecordsStatusForRetired(db: DatabaseSync): void {
   }
 }
 
+/**
+ * F-I01-05 additive migration: nullable privacy columns (privacySensitivity,
+ * privacyOrigin) on raw_events and records for databases created before this
+ * slice. ALTER TABLE ADD COLUMN only — no rebuild, no row rewrite; existing
+ * rows read back as NULL (legacy/unknown privacy). Idempotent (PRAGMA
+ * table_info guard), savepoint-based so it composes with initDb's outer
+ * transaction and with standalone calls. Both columns of a table are added
+ * together (one savepoint).
+ */
+function ensurePrivacyColumns(db: DatabaseSync): void {
+  const tableHasColumn = (table: string, col: string): boolean => {
+    try {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      return cols.some((c) => c.name === col);
+    } catch {
+      return false; // unreadable catalog: CREATE below / callers handle it
+    }
+  };
+  const targets: Array<{ table: string; ddl: string[] }> = [
+    {
+      table: "raw_events",
+      ddl: [
+        `ALTER TABLE raw_events ADD COLUMN privacySensitivity TEXT NULL CHECK(privacySensitivity IN ('normal','sensitive'))`,
+        `ALTER TABLE raw_events ADD COLUMN privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity'))`,
+      ],
+    },
+    {
+      table: "records",
+      ddl: [
+        `ALTER TABLE records ADD COLUMN privacySensitivity TEXT NULL CHECK(privacySensitivity IN ('normal','sensitive'))`,
+        `ALTER TABLE records ADD COLUMN privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity'))`,
+      ],
+    },
+  ];
+  for (const t of targets) {
+    if (tableHasColumn(t.table, "privacySensitivity")) continue; // already migrated (or fresh CREATE carried it)
+    db.exec(`SAVEPOINT ensure_privacy_columns_${t.table}`);
+    try {
+      for (const ddl of t.ddl) db.exec(ddl);
+      db.exec(`RELEASE SAVEPOINT ensure_privacy_columns_${t.table}`);
+    } catch (e) {
+      try {
+        db.exec(`ROLLBACK TO SAVEPOINT ensure_privacy_columns_${t.table}`);
+      } catch {
+        /* preserve the migration error */
+      }
+      try {
+        db.exec(`RELEASE SAVEPOINT ensure_privacy_columns_${t.table}`);
+      } catch {
+        /* preserve the migration error */
+      }
+      throw e;
+    }
+  }
+}
+
 export function ensureM1Schema(db: DatabaseSync): void {
   // M3 additive migration first: pre-M3 files keep every canonical row.
   migrateRecordsStatusForRetired(db);
@@ -162,13 +224,20 @@ export function ensureM1Schema(db: DatabaseSync): void {
     eventId TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT NOT NULL,
     body TEXT NOT NULL, bodyNorm TEXT NOT NULL,
     source TEXT NOT NULL, observedAt TEXT NOT NULL,
-    scope TEXT NOT NULL, runId TEXT NULL, createdAt TEXT NOT NULL)`);
+    scope TEXT NOT NULL, runId TEXT NULL, createdAt TEXT NOT NULL,
+    privacySensitivity TEXT NULL CHECK(privacySensitivity IN ('normal','sensitive')),
+    privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity')))`);
   db.exec(`CREATE TABLE IF NOT EXISTS records(
     id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyNorm TEXT NOT NULL, bodyHash TEXT NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','summary','correction')),
     source TEXT NOT NULL, observedAt TEXT NOT NULL, scope TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('active','superseded','archived','retired')),
-    supersedes TEXT NULL, revision INTEGER NOT NULL, createdAt TEXT NOT NULL)`);
+    supersedes TEXT NULL, revision INTEGER NOT NULL, createdAt TEXT NOT NULL,
+    privacySensitivity TEXT NULL CHECK(privacySensitivity IN ('normal','sensitive')),
+    privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity')))`);
+  // F-I01-05 additive privacy columns for databases created before the
+  // columns existed (nullable; old rows stay NULL = legacy/unknown privacy).
+  ensurePrivacyColumns(db);
   db.exec(`CREATE TABLE IF NOT EXISTS record_tags(recordId TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(recordId, tag))`);
   db.exec(`CREATE TABLE IF NOT EXISTS record_links(fromId TEXT NOT NULL, toRef TEXT NOT NULL, PRIMARY KEY(fromId, toRef))`);
   db.exec(`CREATE TABLE IF NOT EXISTS record_source_refs(recordId TEXT NOT NULL, eventId TEXT NOT NULL, PRIMARY KEY(recordId, eventId))`);
@@ -1093,7 +1162,7 @@ export function eventAppend(
   nowOverride?: string,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
-  const allowed = new Set(["eventId", "sessionId", "turnId", "body", "provenance", "scope", "runId"]);
+  const allowed = new Set(["eventId", "sessionId", "turnId", "body", "provenance", "scope", "runId", "privacy"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return budgeted(bad(), config);
   }
@@ -1114,17 +1183,39 @@ export function eventAppend(
   if (!nScope) return budgeted(bad(), config);
   const nRunId = parseRunId(runId);
   if (nRunId === "invalid") return budgeted(bad(), config);
+  // F-I01-05 optional privacy: strict shape; requirePrivacy rejects absence.
+  const nPrivacy = parsePrivacyParam(params["privacy"]);
+  if (nPrivacy === "invalid") return budgeted(bad(), config);
+  if (requirePrivacyEnabled(config) && nPrivacy === null) return budgeted(bad(), config);
 
-  const reqHash = requestHashFor("event.append", {
-    body: body as string,
-    eventId,
-    observedAt: prov.observedAt,
-    runId: nRunId,
-    scope: nScope,
-    sessionId,
-    source: prov.source,
-    turnId,
-  });
+  const reqHash = requestHashFor(
+    "event.append",
+    nPrivacy === null
+      ? // F-I01-05 legacy compatibility: when privacy is absent, the hashed
+        // params must be byte-identical to the pre-privacy normalization
+        // (omit the key entirely; do not include privacy: null).
+        {
+          body: body as string,
+          eventId,
+          observedAt: prov.observedAt,
+          runId: nRunId,
+          scope: nScope,
+          sessionId,
+          source: prov.source,
+          turnId,
+        }
+      : {
+          body: body as string,
+          eventId,
+          observedAt: prov.observedAt,
+          privacy: nPrivacy,
+          runId: nRunId,
+          scope: nScope,
+          sessionId,
+          source: prov.source,
+          turnId,
+        },
+  );
 
   let saved: StoredOp | null = null;
   try {
@@ -1153,9 +1244,10 @@ export function eventAppend(
       const probe: ResponseEnvelope = ok({ event: { eventId } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
-        `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(eventId as string, sessionId as string, turnId as string, rawBody, nBody, prov.source, prov.observedAt, nScope, nRunId, now);
+        `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt, privacySensitivity, privacyOrigin)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(eventId as string, sessionId as string, turnId as string, rawBody, nBody, prov.source, prov.observedAt, nScope, nRunId, now,
+        nPrivacy === null ? null : nPrivacy.sensitivity, nPrivacy === null ? null : nPrivacy.origin);
       const stored = budgeted(probe, config);
       db.prepare(
         `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
@@ -1217,6 +1309,8 @@ interface NormalizedRemember {
   links: string[];
   sourceRefs: string[];
   runId: string | null;
+  /** F-I01-05: validated optional privacy (null = absent / legacy-compatible). */
+  privacy: PrivacyMetadata | null;
 }
 
 /**
@@ -1234,7 +1328,7 @@ function parseRememberParams(
   params: Record<string, unknown>,
 ): { ok: true; value: NormalizedRemember } | { ok: false; res: ResponseEnvelope } {
   if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
-  const allowed = new Set(["body", "kind", "provenance", "scope", "tags", "links", "sourceRefs", "runId"]);
+  const allowed = new Set(["body", "kind", "provenance", "scope", "tags", "links", "sourceRefs", "runId", "privacy"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return { ok: false, res: bad() };
   }
@@ -1265,6 +1359,11 @@ function parseRememberParams(
   }
   const nRunId = parseRunId(runId);
   if (nRunId === "invalid") return { ok: false, res: bad() };
+  // F-I01-05 optional privacy: strict shape; requirePrivacy rejects absence
+  // (BAD_REQUEST, no side effects — validated before any DB access).
+  const nPrivacy = parsePrivacyParam(params["privacy"]);
+  if (nPrivacy === "invalid") return { ok: false, res: bad() };
+  if (requirePrivacyEnabled(config) && nPrivacy === null) return { ok: false, res: bad() };
   return {
     ok: true,
     value: {
@@ -1278,6 +1377,7 @@ function parseRememberParams(
       links: nLinks,
       sourceRefs: nRefs,
       runId: nRunId,
+      privacy: nPrivacy,
     },
   };
 }
@@ -1314,17 +1414,34 @@ export function rememberRecord(
   const parsed = parseRememberParams(config, params);
   if (!parsed.ok) return budgeted(parsed.res, config);
   const n = parsed.value;
-  const reqHash = requestHashFor("record.remember", {
-    body: n.body,
-    kind: n.kind,
-    links: n.links,
-    observedAt: n.observedAt,
-    runId: n.runId,
-    scope: n.scope,
-    source: n.source,
-    sourceRefs: n.sourceRefs,
-    tags: n.tags,
-  });
+  const reqHash = requestHashFor(
+    "record.remember",
+    n.privacy === null
+      ? // Legacy compatibility: omit the key entirely when absent (pre-PR hash).
+        {
+          body: n.body,
+          kind: n.kind,
+          links: n.links,
+          observedAt: n.observedAt,
+          runId: n.runId,
+          scope: n.scope,
+          source: n.source,
+          sourceRefs: n.sourceRefs,
+          tags: n.tags,
+        }
+      : {
+          body: n.body,
+          kind: n.kind,
+          links: n.links,
+          observedAt: n.observedAt,
+          privacy: n.privacy,
+          runId: n.runId,
+          scope: n.scope,
+          source: n.source,
+          sourceRefs: n.sourceRefs,
+          tags: n.tags,
+        },
+  );
 
   let saved: StoredOp | null = null;
   try {
@@ -1373,9 +1490,10 @@ export function rememberRecord(
       const probe: ResponseEnvelope = ok({ record: { id } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
-        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1, ?)`,
-      ).run(id, n.body, n.bodyNorm, bodyHashFor(n.bodyNorm), n.kind, n.source, n.observedAt, n.scope, now);
+        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt, privacySensitivity, privacyOrigin)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1, ?, ?, ?)`,
+      ).run(id, n.body, n.bodyNorm, bodyHashFor(n.bodyNorm), n.kind, n.source, n.observedAt, n.scope, now,
+        n.privacy === null ? null : n.privacy.sensitivity, n.privacy === null ? null : n.privacy.origin);
       for (const t of n.tags) {
         db.prepare(`INSERT INTO record_tags(recordId, tag) VALUES (?, ?)`).run(id, t);
       }
@@ -1463,12 +1581,14 @@ export interface RecordView {
   tags: string[];
   links: string[];
   sourceRefs: string[];
+  /** F-I01-05: stored privacy metadata; null for legacy rows (absent privacy). */
+  privacy: PrivacyMetadata | null;
 }
 
 function readRecordView(db: DatabaseSync, id: string): RecordView | null {
   const row = db
     .prepare(
-      `SELECT id, body, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt
+      `SELECT id, body, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt, privacySensitivity, privacyOrigin
        FROM records WHERE id = ?`,
     )
     .get(id) as
@@ -1484,6 +1604,8 @@ function readRecordView(db: DatabaseSync, id: string): RecordView | null {
         supersedes: string | null;
         revision: number;
         createdAt: string;
+        privacySensitivity: string | null;
+        privacyOrigin: string | null;
       }
     | undefined;
   if (!row) return null;
@@ -1496,7 +1618,23 @@ function readRecordView(db: DatabaseSync, id: string): RecordView | null {
   const sourceRefs = (
     db.prepare(`SELECT eventId FROM record_source_refs WHERE recordId = ? ORDER BY eventId ASC`).all(id) as Array<{ eventId: string }>
   ).map((r) => r.eventId);
-  return { ...row, tags, links, sourceRefs };
+  return {
+    id: row.id,
+    body: row.body,
+    bodyHash: row.bodyHash,
+    kind: row.kind,
+    source: row.source,
+    observedAt: row.observedAt,
+    scope: row.scope,
+    status: row.status,
+    supersedes: row.supersedes,
+    revision: row.revision,
+    createdAt: row.createdAt,
+    privacy: privacyFromColumns(row.privacySensitivity, row.privacyOrigin),
+    tags,
+    links,
+    sourceRefs,
+  };
 }
 
 export function getRecord(
@@ -2243,7 +2381,7 @@ export function correctRecord(
   nowOverride?: string,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
-  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId"]);
+  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId", "privacy"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return budgeted(bad(), config);
   }
@@ -2269,18 +2407,40 @@ export function correctRecord(
   if (nRefs === "over") return budgeted(limitExceeded(), config);
   const nRunId = parseRunId(runId);
   if (nRunId === "invalid") return budgeted(bad(), config);
+  // F-I01-05 optional privacy on corrections: when absent the new revision
+  // inherits the superseded record's privacy (including null); when present
+  // it overrides. Strict shape either way.
+  const nPrivacy = parsePrivacyParam(params["privacy"]);
+  if (nPrivacy === "invalid") return budgeted(bad(), config);
 
-  const reqHash = requestHashFor("record.correct", {
-    body: body as string,
-    kind: "correction",
-    links: nLinks,
-    observedAt: prov.observedAt,
-    recordId,
-    runId: nRunId,
-    scope: nScope,
-    source: prov.source,
-    sourceRefs: nRefs,
-  });
+  const reqHash = requestHashFor(
+    "record.correct",
+    nPrivacy === null
+      ? // Legacy compatibility: omit the key entirely when absent (pre-PR hash).
+        {
+          body: body as string,
+          kind: "correction",
+          links: nLinks,
+          observedAt: prov.observedAt,
+          recordId,
+          runId: nRunId,
+          scope: nScope,
+          source: prov.source,
+          sourceRefs: nRefs,
+        }
+      : {
+          body: body as string,
+          kind: "correction",
+          links: nLinks,
+          observedAt: prov.observedAt,
+          privacy: nPrivacy,
+          recordId,
+          runId: nRunId,
+          scope: nScope,
+          source: prov.source,
+          sourceRefs: nRefs,
+        },
+  );
 
   let saved: StoredOp | null = null;
   try {
@@ -2319,17 +2479,21 @@ export function correctRecord(
   let committed: ResponseEnvelope;
   try {
     committed = withTransaction(db, (): ResponseEnvelope => {
-      let target: { scope: string; status: string; revision: number } | undefined;
+      let target: { scope: string; status: string; revision: number; privacySensitivity: string | null; privacyOrigin: string | null } | undefined;
       try {
         target = db
-          .prepare(`SELECT scope, status, revision FROM records WHERE id = ?`)
-          .get(recordId) as { scope: string; status: string; revision: number } | undefined;
+          .prepare(`SELECT scope, status, revision, privacySensitivity, privacyOrigin FROM records WHERE id = ?`)
+          .get(recordId) as { scope: string; status: string; revision: number; privacySensitivity: string | null; privacyOrigin: string | null } | undefined;
       } catch {
         throw new Error("read failed");
       }
       if (!target) throw new Error("missing");
       if (target.scope !== nScope) throw new Error("scope mismatch");
       if (target.status !== "active") throw new Error("not active");
+      // F-I01-05: explicit privacy overrides; absence inherits the superseded
+      // record's privacy (including null for legacy rows).
+      const effPrivacy: PrivacyMetadata | null =
+        nPrivacy ?? privacyFromColumns(target.privacySensitivity, target.privacyOrigin);
       for (const r of nRefs) {
         const row = db.prepare(`SELECT scope FROM raw_events WHERE eventId = ?`).get(r) as
           | { scope: string }
@@ -2350,9 +2514,10 @@ export function correctRecord(
       }
       if (changedRows(moved) !== 1) throw new Error("not active");
       db.prepare(
-        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
-         VALUES (?, ?, ?, ?, 'correction', ?, ?, ?, 'active', ?, ?, ?)`,
-      ).run(newId, rawBody, nBody, bodyHashFor(nBody), prov.source, prov.observedAt, nScope, recordId, target.revision + 1, now);
+        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt, privacySensitivity, privacyOrigin)
+         VALUES (?, ?, ?, ?, 'correction', ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+      ).run(newId, rawBody, nBody, bodyHashFor(nBody), prov.source, prov.observedAt, nScope, recordId, target.revision + 1, now,
+        effPrivacy === null ? null : effPrivacy.sensitivity, effPrivacy === null ? null : effPrivacy.origin);
       for (const l of nLinks) {
         db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(newId, l);
       }
@@ -3019,12 +3184,13 @@ export function searchRecords(
         status: string;
         revision: number;
         createdAt: string;
+        privacy: PrivacyMetadata | null;
       }>;
       try {
         items = ranked.map((id) => {
           const row = db
-            .prepare(`SELECT body, createdAt, status, revision FROM records WHERE id = ?`)
-            .get(id) as { body: string; createdAt: string; status: string; revision: number };
+            .prepare(`SELECT body, createdAt, status, revision, privacySensitivity, privacyOrigin FROM records WHERE id = ?`)
+            .get(id) as { body: string; createdAt: string; status: string; revision: number; privacySensitivity: string | null; privacyOrigin: string | null };
           const { snippet, truncated } = snippetFor(row.body, config.limits.snippetMaxCp);
           const tags = (
             db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
@@ -3037,6 +3203,7 @@ export function searchRecords(
             status: row.status,
             revision: row.revision,
             createdAt: row.createdAt,
+            privacy: privacyFromColumns(row.privacySensitivity, row.privacyOrigin),
           };
         });
       } catch {
