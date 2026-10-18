@@ -1024,6 +1024,8 @@ function rawDescentHits(
  * Guarantees committed memory stays findable when derived indexes are
  * absent or stale. Whole-query instr first, then per-term OR when the
  * query has multiple tokens. Deterministic, scope/status/window bounded.
+ * Returns the canonical bodyNorm alongside the id so recall can compute a
+ * substitute lexical rank for damaged derived entries without extra reads.
  */
 function canonicalBodyNormHits(
   db: DatabaseSync,
@@ -1032,7 +1034,7 @@ function canonicalBodyNormHits(
   since: string | null,
   until: string | null,
   cap: number,
-): Array<{ id: string }> {
+): Array<{ id: string; bodyNorm: string }> {
   const terms = normalizedQuery.split(" ").map((t) => t.trim()).filter((t) => t.length > 0).slice(0, 8);
   if (terms.length === 0) return [];
   try {
@@ -1052,19 +1054,19 @@ function canonicalBodyNormHits(
     const w = window("records");
     const whole = db
       .prepare(
-        `SELECT id FROM records WHERE scope = ? AND status = 'active' AND instr(bodyNorm, ?) > 0${w.frag}
+        `SELECT id, bodyNorm FROM records WHERE scope = ? AND status = 'active' AND instr(bodyNorm, ?) > 0${w.frag}
          ORDER BY createdAt DESC, id ASC LIMIT ?`,
       )
-      .all(scope, normalizedQuery, ...w.args, cap) as Array<{ id: string }>;
+      .all(scope, normalizedQuery, ...w.args, cap) as Array<{ id: string; bodyNorm: string }>;
     if (whole.length > 0 || terms.length === 1) return whole;
     const conds = terms.map(() => `instr(bodyNorm, ?) > 0`).join(" OR ");
     const w2 = window("records");
     const perTerm = db
       .prepare(
-        `SELECT id FROM records WHERE scope = ? AND status = 'active' AND (${conds})${w2.frag}
+        `SELECT id, bodyNorm FROM records WHERE scope = ? AND status = 'active' AND (${conds})${w2.frag}
          ORDER BY createdAt DESC, id ASC LIMIT ?`,
       )
-      .all(scope, ...terms, ...w2.args, cap) as Array<{ id: string }>;
+      .all(scope, ...terms, ...w2.args, cap) as Array<{ id: string; bodyNorm: string }>;
     return perTerm;
   } catch {
     return [];
@@ -2053,6 +2055,92 @@ export function recallRecords(
       biHits.forEach((h, i) => {
         if (!biRank.has(h.id)) biRank.set(h.id, i);
       });
+      // 2d) Canonical substitute ranks (bounded to the ≤FUSION_CANDIDATE_MAX
+      // canonical hit ids). A canonical hit whose derived index entry is
+      // missing or stale only carries the flat +1 canon bonus and is
+      // displaced from small top-k by healthy bigram-overlap competitors.
+      // For those, substitute the lexical signal they would have received:
+      // FTS-damaged-and-missing-from-lexRank gets the FTS weight, bigram-
+      // damaged-and-missing-from-biRank gets the bigram weight, ranked by a
+      // cheap deterministic char-bigram overlap between the normalized query
+      // and the canonical bodyNorm already in memory (ties: canonical order).
+      // Each damage lookup is one bounded query; a lookup failure treats
+      // every canonical hit as damaged for that index (fail toward
+      // findability) without throwing. Healthy derived entries never reach
+      // these maps, so the healthy-index path scores byte-identically.
+      const lexSub = new Map<string, number>();
+      const biSub = new Map<string, number>();
+      if (canonSet.size > 0) {
+        const canonIds = canonHits.slice(0, FUSION_CANDIDATE_MAX).map((h) => h.id);
+        const bodyNormOf = new Map<string, string>(
+          canonHits.slice(0, FUSION_CANDIDATE_MAX).map((h) => [h.id, h.bodyNorm]),
+        );
+        const ftsHealthy = new Set<string>();
+        const biHealthy = new Set<string>();
+        try {
+          const ph = canonIds.map(() => "?").join(",");
+          const rows = db
+            .prepare(`SELECT recordId, body FROM fts_notes WHERE recordId IN (${ph})`)
+            .all(...canonIds) as Array<{ recordId: string; body: string }>;
+          for (const r of rows) {
+            // fts_notes.body is indexed from records.bodyNorm (see
+            // bestEffortIndexNote/rebuildDerivedIndexes): a row whose indexed
+            // text no longer equals the canonical bodyNorm is stale damage.
+            if (r.body === bodyNormOf.get(r.recordId)) ftsHealthy.add(r.recordId);
+          }
+        } catch {
+          /* lookup failed: every canonical hit is treated as FTS-damaged */
+        }
+        try {
+          const ph = canonIds.map(() => "?").join(",");
+          const rows = db
+            .prepare(`SELECT id, bigram FROM char_bigrams WHERE kind = 'note' AND id IN (${ph})`)
+            .all(...canonIds) as Array<{ id: string; bigram: string }>;
+          const got = new Map<string, Set<string>>();
+          for (const r of rows) {
+            let s = got.get(r.id);
+            if (!s) {
+              s = new Set<string>();
+              got.set(r.id, s);
+            }
+            s.add(r.bigram);
+          }
+          for (const id of canonIds) {
+            const want = new Set(bigramsOf(bodyNormOf.get(id) ?? ""));
+            const have = got.get(id);
+            if (have !== undefined && have.size === want.size && [...want].every((b) => have.has(b))) {
+              biHealthy.add(id);
+            }
+          }
+        } catch {
+          /* lookup failed: every canonical hit is treated as bigram-damaged */
+        }
+        const qBigrams = new Set(bigramsOf(p.query));
+        const overlapOf = (id: string): number => {
+          const bs = new Set(bigramsOf(bodyNormOf.get(id) ?? ""));
+          let n = 0;
+          for (const b of qBigrams) {
+            if (bs.has(b)) n += 1;
+          }
+          return n;
+        };
+        const canonOrder = new Map<string, number>();
+        canonHits.forEach((h, i) => {
+          if (!canonOrder.has(h.id)) canonOrder.set(h.id, i);
+        });
+        const damaged = canonIds
+          .filter((id) => !ftsHealthy.has(id) || !biHealthy.has(id))
+          .sort(
+            (a, b) =>
+              overlapOf(b) - overlapOf(a) ||
+              (canonOrder.get(a) as number) - (canonOrder.get(b) as number) ||
+              (a < b ? -1 : a > b ? 1 : 0),
+          );
+        damaged.forEach((id, i) => {
+          if (!ftsHealthy.has(id) && !lexRank.has(id)) lexSub.set(id, i);
+          if (!biHealthy.has(id) && !biRank.has(id)) biSub.set(id, i);
+        });
+      }
       const pool = new Set<string>([...lexRank.keys(), ...biRank.keys(), ...rawSet, ...canonSet, ...vecRank.keys(), ...seedIds]);
       // Pool cap: keep top 60 by lexical+vector pre-order (lex rank, then id).
       let poolIds = [...pool];
@@ -2061,7 +2149,10 @@ export function recallRecords(
           const lr = lexRank.has(id) ? 1 / (1 + (lexRank.get(id) as number)) : 0;
           const br = biRank.has(id) ? 0.5 / (1 + (biRank.get(id) as number)) : 0;
           const vr = vecRank.has(id) ? VECTOR_FUSION_WEIGHT / 4 / (1 + (vecRank.get(id) as number)) : 0;
-          return lr + br + vr + (rawSet.has(id) ? 2 : 0) + (canonSet.has(id) ? 1 : 0) + (seedIds.has(id) ? 0.25 : 0);
+          // Substitute lexical signal for damaged canonical-only hits.
+          const ls = lexRank.has(id) || !lexSub.has(id) ? 0 : 1 / (1 + (lexSub.get(id) as number));
+          const bs = biRank.has(id) || !biSub.has(id) ? 0 : 0.5 / (1 + (biSub.get(id) as number));
+          return lr + ls + br + bs + vr + (rawSet.has(id) ? 2 : 0) + (canonSet.has(id) ? 1 : 0) + (seedIds.has(id) ? 0.25 : 0);
         };
         poolIds.sort((a, b) => preScore(b) - preScore(a) || (a < b ? -1 : a > b ? 1 : 0));
         poolIds = poolIds.slice(0, FUSION_CANDIDATE_MAX);
@@ -2089,7 +2180,13 @@ export function recallRecords(
       const score = (id: string): number => {
         let s = 0;
         if (lexRank.has(id)) s += 3 / (1 + (lexRank.get(id) as number));
+        // Substitute FTS signal for canonical hits missing from lexRank
+        // because their fts_notes entry is missing or stale.
+        else if (lexSub.has(id)) s += 3 / (1 + (lexSub.get(id) as number));
         if (biRank.has(id)) s += 1.5 / (1 + (biRank.get(id) as number));
+        // Substitute bigram signal for canonical hits missing from biRank
+        // because their char_bigrams entry is missing or stale.
+        else if (biSub.has(id)) s += 1.5 / (1 + (biSub.get(id) as number));
         if (vecRank.has(id)) s += VECTOR_FUSION_WEIGHT / (1 + (vecRank.get(id) as number));
         if (rawSet.has(id)) s += 2;
         if (canonSet.has(id)) s += 1;
