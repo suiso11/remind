@@ -396,7 +396,7 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           recallNewHitsLatest: usesLatest,
           recallExcludesSuperseded: excludesSuperseded,
         };
-        if (oldStatus !== "superseded" || newRec?.status !== "active" || (newRec?.supersedes ?? null) !== oldId || !excludesSuperseded) {
+        if (oldStatus !== "superseded" || newRec?.status !== "active" || (newRec?.supersedes ?? null) !== oldId || !excludesSuperseded || !usesLatest) {
           failed = true;
           invariants.push(`s${scale} correction lifecycle violated: ${JSON.stringify(correction)}`);
         }
