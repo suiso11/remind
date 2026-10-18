@@ -704,15 +704,19 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
     // and verifies via the DB after recall that the row was still corrupted
     // when recall ran (recall never repairs derived rows). A recall hit on
     // the target then proves the canonical bodyNorm fallback for real.
+    //
+    // Since the canonical substitute-rank fix, a canonical-only hit with a
+    // damaged derived entry receives the substitute lexical signal it would
+    // have had with a healthy index, so it is ASSERTED at small top-k
+    // (conversation-shaped query, limit OPS_K) — no longer merely
+    // informational (the flat +1 displacement bound no longer applies).
     let indexFallback: Record<string, unknown> = { status: "not-run" };
     if (seedWritesOk && fillerIds.length > 0) {
       const target = fillerIds[0] as string;
       const q = fillerQuery(scale, 0);
       // Single anchor-term recall at a wider limit: the target is the ONLY
       // record whose bodyNorm contains the whole anchor query, so any hit
-      // proves the canonical bodyNorm fallback (a top-3-limited recall can
-      // legitimately displace it via generic char-bigram overlap scores —
-      // a fused-ranking bound, reported honestly below, not index loss).
+      // proves the canonical bodyNorm fallback.
       const qAnchor = `anchortoken${scale}x0`;
       let db: DatabaseSync | null = null;
       try {
@@ -740,10 +744,10 @@ function runScale(cliPath: string, scale: number): { report: ScaleReport; failed
           corruptFtsRowStillHits: fallbackHit.ids.includes(target),
           ftsRowStillCorruptedAfterRecall: stillCorrupted,
           ftsRowCount,
-          note: "full-empty FTS tables are startup-repaired (maybeRebuildDerivedIndexes); the proven fallback is per-row derived damage the count-based repair does not detect, verified via the DB after recall. The asserted probe recalls the unique anchor query at limit 10: the record is the only whole-query bodyNorm match, so any hit proves the canonical fallback (top-3 recall can legitimately displace it by char-bigram overlap; conversation-shaped-query result reported informationally)",
+          note: "full-empty FTS tables are startup-repaired (maybeRebuildDerivedIndexes); the proven fallback is per-row derived damage the count-based repair does not detect, verified via the DB after recall. The conversation-shaped query at limit OPS_K (3) asserts the target within top 3: with the canonical substitute-rank fix the damaged canonical hit receives the lexical signal a healthy index would have given it, so it is no longer displaced by char-bigram-overlap competitors. The unique-anchor query at limit 10 remains asserted as the pure canonical-fallback proof",
           conversationShapedQueryStillHits: partial.ids.includes(target),
         };
-        if (!fallbackHit.ids.includes(target) || !stillCorrupted) {
+        if (!fallbackHit.ids.includes(target) || !partial.ids.includes(target) || !stillCorrupted) {
           failed = true;
           invariants.push(`s${scale} index fallback missed: ${JSON.stringify(indexFallback)}`);
         }
