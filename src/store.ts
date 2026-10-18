@@ -1948,15 +1948,17 @@ export function recallRecords(
       };
 
       // Candidate metadata for final ordering (createdAt for tie-break).
-      const meta = new Map<string, { createdAt: string }>();
+      // revision/kind come from the same rows: recall items carry the source
+      // record identity (F-I01-01 additions, backward-compatible fields).
+      const meta = new Map<string, { createdAt: string; revision: number; kind: string }>();
       const orderIds = [...new Set<string>([...poolIds, ...graphDist.keys()])];
       if (orderIds.length > 0) {
         try {
           const placeholders = orderIds.map(() => "?").join(",");
           const rows = db
-            .prepare(`SELECT id, createdAt FROM records WHERE id IN (${placeholders})`)
-            .all(...orderIds) as Array<{ id: string; createdAt: string }>;
-          for (const r of rows) meta.set(r.id, { createdAt: r.createdAt });
+            .prepare(`SELECT id, createdAt, revision, kind FROM records WHERE id IN (${placeholders})`)
+            .all(...orderIds) as Array<{ id: string; createdAt: string; revision: number; kind: string }>;
+          for (const r of rows) meta.set(r.id, { createdAt: r.createdAt, revision: r.revision, kind: r.kind });
         } catch {
           throw new Error("read failed");
         }
@@ -1974,10 +1976,21 @@ export function recallRecords(
         })
         .slice(0, p.limit);
 
-      // Bounded projection: snippets only, never raw bodies.
-      let items: Array<{ id: string; snippet: string; truncated: boolean; tags: string[]; createdAt: string }>;
+      // Bounded projection: snippets only, never raw bodies. Items carry the
+      // source record's revision and kind alongside the pinned snippet
+      // (backward-compatible additions; existing keys unchanged).
+      let items: Array<{
+        id: string;
+        snippet: string;
+        truncated: boolean;
+        tags: string[];
+        createdAt: string;
+        revision: number;
+        kind: string;
+      }>;
       try {
         items = ranked.map((id) => {
+          const m = meta.get(id) as { createdAt: string; revision: number; kind: string };
           const row = db
             .prepare(`SELECT body, createdAt FROM records WHERE id = ?`)
             .get(id) as { body: string; createdAt: string };
@@ -1985,7 +1998,7 @@ export function recallRecords(
           const tags = (
             db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
           ).map((r) => r.tag);
-          return { id, snippet, truncated, tags, createdAt: row.createdAt };
+          return { id, snippet, truncated, tags, createdAt: m.createdAt, revision: m.revision, kind: m.kind };
         });
       } catch {
         throw new Error("read failed");

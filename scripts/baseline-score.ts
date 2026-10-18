@@ -274,12 +274,24 @@ export interface RecallItem {
   truncated: boolean;
   tags: string[];
   createdAt: string;
+  /** Additive F-I01-01 record-identity fields (optional). */
+  revision?: number;
+  kind?: string;
 }
 
 function validRecallItem(v: unknown): v is RecallItem {
   if (!isPlainObject(v)) return false;
-  // Same adopted contract as fake-adapter: exactly these 5 fields.
-  if (Object.keys(v).sort().join(",") !== "createdAt,id,snippet,tags,truncated") return false;
+  // Adopted contract fields plus the additive F-I01-01 keys (revision, kind
+  // optional). Unknown extras beyond that set remain rejected.
+  const keys = Object.keys(v).sort().join(",");
+  if (
+    keys !== "createdAt,id,snippet,tags,truncated" &&
+    keys !== "createdAt,id,kind,revision,snippet,tags,truncated"
+  ) {
+    return false;
+  }
+  if (v["revision"] !== undefined && typeof v["revision"] !== "number") return false;
+  if (v["kind"] !== undefined && typeof v["kind"] !== "string") return false;
   if (!validRecallId(v["id"])) return false;
   if (typeof v["snippet"] !== "string" || [...(v["snippet"] as string)].length > 200) return false;
   if (hasLoneSurrogate(v["snippet"] as string)) return false;

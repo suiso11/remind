@@ -62,6 +62,9 @@ export interface FakeMemoryHit {
   truncated: boolean;
   tags: string[];
   createdAt: string;
+  /** Additive F-I01-01 fields (optional; recorded when present, never required). */
+  revision?: number;
+  kind?: string;
 }
 
 export type FakeAdapterResult =
@@ -153,9 +156,17 @@ function validId(s: unknown): s is string {
 
 function validItem(v: unknown): v is FakeMemoryHit {
   if (!isPlainObject(v)) return false;
-  // Strict shape: exactly the adopted contract fields, no unknown extras.
+  // Adopted contract fields plus the additive F-I01-01 record-identity keys
+  // (revision, kind optional). Unknown extras beyond that set remain rejected.
   const keys = Object.keys(v).sort().join(",");
-  if (keys !== "createdAt,id,snippet,tags,truncated") return false;
+  if (
+    keys !== "createdAt,id,snippet,tags,truncated" &&
+    keys !== "createdAt,id,kind,revision,snippet,tags,truncated"
+  ) {
+    return false;
+  }
+  if (v["revision"] !== undefined && typeof v["revision"] !== "number") return false;
+  if (v["kind"] !== undefined && typeof v["kind"] !== "string") return false;
   if (!validId(v["id"])) return false;
   if (typeof v["snippet"] !== "string" || countCp(v["snippet"]) > 200) return false;
   if (hasLoneSurrogate(v["snippet"] as string)) return false;
