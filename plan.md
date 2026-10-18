@@ -139,6 +139,7 @@ raw 現物は event.append で不変保持。record 本文に raw 複写なし�
 - **保守（蒸留・統合・M3 で実装済み）:** `maintain.distill` は候補化・承認を経ず、summary/correction レコードを通常の冪等 op で直接・自律的に書く。有界バッチ・同時実行 1・失敗隔離・リトライキュー・取消可能で行う。失敗は当該バッチのみ巻き戻し、成功済みを汚さない。実モデルが統合を出力しない場合は keep（適用 0・原物不変）とし、統合の機構自体は決定論的テストで検証する（§9 R9・`docs/retention.md`）。
 - **育成の合意済み方針（M3 で最小実証済み）:** 育成は**保持バイアス**とし、人間の承認・分類を要求しない。内容・文脈の判定は外部送信なしの**ローカル小規模 LLM** が行う。事実・出来事・実験条件と観察は一過性の感情より長く保持し、一過性の感情（例: 落ち込んでいる）は通常想起から薄れさせ恒常的な人格特性にしない。固定 TTL・経過時間のみの忘却則は持たない。原記録（raw・旧 record）は保持し、自動忘却は**通常想起からの可逆引退**に留める。最新訂正を通常利用し、旧版と実験の元観察は履歴として残す。
 - **見直しの契機と有界性（計画）:** 有界の関連記憶見直しは**追加・訂正・実際の引用（ACTUAL use）**を契機とする背景処理とし、毎ターンの全 corpus 見直しはしない。会話応答を阻害（block）しない。モデル・ランタイム・見直し入力・評価閾値・資源 bounds は未解決（§12）であり、固定定数・モデルをここで新設しない。
+- **R14 育成の実装方針（決定者 haruka・2026-10-18）:** 育成保守は**可逆引退**（通常想起の対象外・行保持・`record.reactivate` で取戻し可）に留め、外部への送信は行わない。既存の ledger（正本・派生索引）は一切変更しない。終端 `archived` は可逆引退とは**別物**であり、混同しない（archive は終端のまま）。**自動的な原物削除はしない**。残りの実装詳細（理由コード・境界条件等）は R15–R18 に後回しとして記録する。
 - **提案 safeguard（計画・コード強制と検証）:** 不確実な場合・LLM 失敗時は状態を変更せず現状維持とする。コードは削除を強制的に禁じ（物理削除なし・検証で外的送信なしを確認する想定）、自動忘却は可逆引退に留める。safeguard の具体的な実装・検証手順は未解決（§12）。
 - **一時的非表示と持続引退の分離（合意済み）:** 「この会話中は出さない」等の一時的な非表示（non-presentation）と、耐久的な引退（durable retirement）は別物として扱う。前者は会話スコープの一時措置であり、後者の状態変更と混同しない。既存の終端 `archived` は可逆引退ではなく、明示的検索の範囲も未決定（黙って決めない）。
 
@@ -202,6 +203,22 @@ raw 現物は event.append で不変保持。record 本文に raw 複写なし�
 - **U3 ベクトル索引:** モデル選定・pin・ライセンス・チャンク方針（M2 で柔軟に判断。意味検索能力自体は計画完成に必須。欠落時は語彙＋グラフ縮退）。
 - **U4 残件:** 高度なスケジューリング（起動条件・バッチ幅・熱重み調整、MVP・完成の必須外）・評価（データセット・指標・閾値）・有界定数の最終値（§8 既定値は暫定、実測で見直し）。運用ライフサイクル＋規模の実測 harness（`scripts/evaluate-operations.ts`・`npm run eval:operations`、訂正/引退・再活性化・feedback heat・索引 fallback・キュー有界を 10/30/60 件で実 CLI 実証、閾値なし）は到達したが、評価閾値・資源 bounds 最終値の決定は本 U4 に残る。
  - **U5 育成の技術詳細（M3 の実装選択で確定・残件は任意のみ）:** `retired` を第 4 `status` 値とする状態・スキーマ表現（savepoint 再構築移行、`user_version` 不変）、明示的検索 API（`record.search`・active+retired・heat/再活性化なし）、`retire/reactivate` の固定理由コード、有界キュー・単一 flight リース・per-action 保守適用・safeguard（不確実・失敗・欠落時は不変、削除禁止、provision 以外の外的送信禁止）は M3 で確定済み（`docs/retention.md`）。モデル・ランタイム（`onnx-community/Qwen2.5-1.5B-Instruct` @ `d54957e3`、apache-2.0、`@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`、量子化 `onnx/model_q4.onnx`、完全オフライン・greedy 決定論）、二段階判定（保持ゲート＋位置指定統合＋共有事実確認、モデルは ID を複写しない）も確定。残件は高度なスケジューリング・評価閾値・資源 bounds の最終値のみであり、固定 TTL・`archived` の可逆扱い・外的送信は主張しない。
+
+- **R09 決定記録: M2 埋め込みモデルの選定（決定者 haruka・2026-10-18）:** 既存の公式候補提案記録群（README「R09 (M2/M3 承認ゲート用) 公式候補提案記録」・metadata のみ取得、重みダウンロードなし）から**狭めて**選定した。比較（metadata 根拠のみ）:
+
+  | 項目 | 第一候補 `intfloat/multilingual-e5-small` rev `614241f6` | 第二候補 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` rev `e8f8c211` |
+  | --- | --- | --- |
+  | ライセンス | card 宣言 MIT | card 宣言 Apache-2.0（HF API `cardData.license: "apache-2.0"`・tags `license:apache-2.0`） |
+  | source | e5 公式 base | 公式 sentence-transformers 変換（+ 本体の Xenova ONNX 変換 `Xenova/...` rev `2c4055b12046f11709e9df2c122e59ffbdc2f900`、transformers.js 用） |
+  | revision/sha pin | 未 pin | ONNX LFS `sha256:10f7a088420252b26caf819236ca2c9d2987afd0fc06fec7553b542a5655a05a`（基）・採用 pin は Xenova 転換 rev 全文字（manifest.json が sha256 を記録） |
+  | ランタイム互換 | transformers.js で prefix・pooling 調整が必須 | すでに配線済み（`src/vectors.ts`・`scripts/provision-model.ts`・`@huggingface/transformers@4.3.1`） |
+  | token 上限 | 実効 512 tokens | SentenceTransformer 実効 128 tokens（`sentence_bert_config.json` `max_seq_length: 128`） |
+  | prefix | `query:` / `passage:` 必須 | なし（mean pool） |
+  | local-only | 可（provision 時取得のみ） | 可（provision 時取得のみ・実行時完全オフライン） |
+
+  **:** **採用は既に配線済みの Xenova 変換 `Xenova/paraphrase-multilingual-MiniLM-L12-v2` @ `2c4055b12046f11709e9df2c122e59ffbdc2f900`（Apache-2.0 base、ライセンス確認済み pin・`@huggingface/transformers` 依存追加は承認済み）とする。** e5-small は不採用: 必須 prefix・pooling 調整で現行配線との互換がなく、採用益が小さい。Ollama は使用しない（外部ランタイム新設をしない）。
+
+- **R13 決定記録: M2 評価方針（決定者 haruka・2026-10-18・閾値は案・R11–R12 実行前に確定）:** 評価は **seeded-only** とする。合成 seed コーパス・クエリ・ラベルのみ使用し、実ユーザデータは一切使わない。seed 観察結果は `docs/m2-eval.json` に記録する（`scripts/eval-m2.ts`・`scripts/evaluate-baseline.ts`）。アブレーションは語彙＋グラフ vs ベクトル単独 vs 融合。指標: hit@1, hit@3, P@3, recall, MRR, negatives の valid-empty 率, 縮退一致率（索引欠落・timeout 時に語彙＋グラフへ縮退し継続する割合）, p50/p95 レイテンシ増分。閾値（**案**・融合 hit@3 ≥ baseline+0.2、negative 回帰なし、p95 増分 ≤ 50ms、縮退一致率 100%）は R11–R12 実行前に確定する。
 
 ---
 
