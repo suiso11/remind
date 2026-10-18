@@ -134,3 +134,15 @@ R09 (M2/M3 承認ゲート用) 公式候補提案記録 (metadata のみ、未�
 ## 未実装の明示
 
 - Companion 連携、削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みはない。`archive` は検索除外であり削除ではなく、可逆引退ではない。`archived` の明示的検索範囲は未決定。高度なスケジューリング (起動条件・熱重み調整) は任意の将来課題。`usedCount` は `record.feedback` の引用計数の累積のみ。
+- Companion 連携の契約部分は I01 決定 (2026-10-18、F-I01-01..08) で採択済み (詳細は下記「I01/I04 契約決定の記録」)。削除 (消去) API、エクスポート API、直接 Markdown 編集の取込みは引き続き未実装であり、privacy metadata (F-I01-05) は使用するフィールドが未決定のため未実装。
+
+## I01/I04 契約決定の記録 (2026-10-18・実装済み・追加のみ)
+
+I01 (Companion 連携契約) と I04 (retrieval 契約) の決定 F-I01-01..08・F-I04-01..06 (decider haruka、source: companion_harness/docs/plan/decision_inputs_2026-10-18.md) を受けて、既存 op へ追加フィールドのみを実装した (新規 op・新規 error code なし、 既存の順序・上限・heat・露出・byte 予算の挙動不変):
+
+- `record.recall` の各 item は元記録の `revision` と `kind` を含む (同じ行から付加的に返す。引用が実使用 revision を固定し、`model_inference` を `user_fact` と区別できる)。`recallId + items[{..., revision, kind}]`。
+- `record.recall` 成功 data は必ず top-level `vector` 状態を持つ (F-I01-06): `"disabled"` (設定 `vectors` 無効/欠落)、`"used"` (クエリ埋め込みが計算されベクトル候補が実際に参加)、`"unavailable"` (有効だがモデル/索引/クエリ埋め込みが欠落または失敗で語彙+グラフ縮退で実行)。計算追加なし・順位変更なし・byte 予算 probe はそのまま正しい。
+- `record.search` の各 item も `revision` を含む (PR #15、`feat/search-item-revision`)。
+- 数値 `v` が 1 以外の JSON は `BAD_REQUEST` で固定メッセージ `unsupported protocol version` を返す (envelope は `v:1` のまま、新 error code なし)。`v` 欠落・非数値は従来どおり `bad request`。
+
+これらは後方互換の付加フィールドであり、未知招来キーを検証する呼出側 (`src/fake-adapter.ts`・`scripts/baseline-score.ts`) は付加 superset を受け入れる。
