@@ -8,7 +8,7 @@
     "memory-cli": "dist/src/cli.js"
   },
   "engines": {
-    "node": ">=24.12.0 <25"
+    "node": ">=26.12.0 <27"
   },
   "packageManager": "npm@11.6.2",
   "scripts": {
