@@ -157,3 +157,12 @@ I01 (Companion 連携契約) と I04 (retrieval 契約) の決定 F-I01-01..08�
 - 設定 `requirePrivacy` (既定 false): `true` のとき `privacy` を欠く `event.append / record.remember` は `BAD_REQUEST` で拒否する。
 - `privacy` は `record.get` および `record.search` の各 item で返す。privacy を持たない旧世代の行は `privacy: null` と読み戻る。`record.recall` の出力・順位には影響しない (P4a: 保存と返却のみ)。
 - 蒸留 (`maintain.distill`) が生成する記憶 (summary/consolidation) は origin を `self_activity` に固定し、sensitivity は伝播則に従う: source のいずれか 1 件でも `sensitive` なら `sensitive`、全 source が privacy 既知なら `normal`、それ以外 (privacy 不明の source を含む) は `null`。
+
+## 本番構成 (2026-10-19 追記・追加のみ)
+
+Companion との連携が本番運用中 (2026-10-19 現在):
+
+- I01/I04 連携契約は 2026-10-18 に採用済み (decider haruka)。Companion は呼出ごとに remind CLI を spawn し、`COMPANION_MEMORY_JSON` 経由で memory JSON を渡す (一行 JSON 入出力の既存 CLI 契約を利用)。
+- 本番 check-out: `~/remind_master`。設定: `~/.config/remind/memory.config.json`。データ: `~/.local/share/remind`。
+- バックアップ・自動デプロイは companion_harness 側 `scripts/deploy` が管理 (companion_harness PRs #91/#92、同 PR は 2026-10-19 時点で open)。
+- 育成 (cultivation) 用 LLM は現時点で無効 (disabled)。
