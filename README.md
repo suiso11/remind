@@ -6,7 +6,7 @@
 
 ## 前提
 
-- Node.js `24.12.0`、npm `11.6.2`
+- Node.js `26.12.0`、npm `11.6.2`
 - 依存なし（SQLite は Node 標準 `node:sqlite`）
 - 例は Windows PowerShell のパイプ (1 行 JSON 入力、1 行 JSON 出力、終了コード `0`)
 
