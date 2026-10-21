@@ -2048,7 +2048,9 @@ export function graphPage(
     if (nCursor === null) return budgeted(bad(), config);
   }
   const maxLimit = graphLimitMax(config);
-  let nLimit = config.limits.limitDefault;
+  // An omitted limit must still respect graphLimitMax even when the general
+  // limitDefault is larger; otherwise an omitted limit bypasses the graph cap.
+  let nLimit = Math.min(config.limits.limitDefault, maxLimit);
   if (limit !== undefined) {
     if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
     if (limit < 1) return budgeted(bad(), config);
@@ -2070,7 +2072,6 @@ export function graphPage(
       let lo = 1;
       let hi = nLimit;
       const maxBytes = graphResponseMaxBytes(config);
-      const edgeBudget = (n: number): number => Math.max(1, n * config.limits.linksMax);
       while (lo <= hi) {
         const mid = Math.floor((lo + hi) / 2);
         const page = buildGraphPage(db, {
@@ -2079,7 +2080,6 @@ export function graphPage(
           cursor: nCursor,
           limit: mid,
           snippetMaxCp: config.limits.snippetMaxCp,
-          maxEdges: edgeBudget(mid),
         });
         const probe = ok({ nodes: page.nodes, nextCursor: page.nextCursor, version });
         if (Buffer.byteLength(JSON.stringify(probe), "utf8") <= maxBytes) {
@@ -2159,7 +2159,8 @@ export function graphLocal(
     nIncludeRetired = includeRetired;
   }
   const maxLimit = graphLimitMax(config);
-  let nLimit = config.limits.limitDefault;
+  // Same rule as graph.page: the effective default never exceeds the cap.
+  let nLimit = Math.min(config.limits.limitDefault, maxLimit);
   if (limit !== undefined) {
     if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
     if (limit < 1) return budgeted(bad(), config);

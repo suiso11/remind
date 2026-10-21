@@ -25,8 +25,9 @@
  * selection and does not broaden the `record.search` protocol
  * (active+retired only; archived revival stays unsupported).
  *
- * Bounds: node/edge reads use LIMIT+1 (never a full-corpus scan), output
- * bytes are capped, ordering is deterministic (createdAt DESC/ASC + id ASC),
+ * Bounds: node reads use LIMIT+1 (never a full-corpus scan), edge reads are
+ * bounded by the selected node count rather than the current linksMax,
+ * output bytes are capped, ordering is deterministic (createdAt DESC/ASC + id ASC),
  * and the writer replaces only its owned view file atomically (temp+rename).
  * Over-bound builds fail with a fixed error and leave any prior view intact.
  * Raw bodies are never embedded: panels show snippets + source-ref /
@@ -171,27 +172,26 @@ function readGraphTags(db: GraphDb, ids: string[]): Map<string, string[]> {
 }
 
 /**
- * Read raw outbound refs for the given records. Returns overflow=true when
- * the LIMIT+1 edge bound is exceeded (caller maps it to the graph bound).
+ * Read all persisted outbound refs for the given records. The number of
+ * source records is already bounded by the caller (page/node limit), so this
+ * deliberately has no row LIMIT: a historical row may legitimately hold more
+ * links than the current `limits.linksMax`, and treating linksMax as a read
+ * bound would reject persisted data. Callers that need an edge budget apply
+ * it to the derived edge set or rely on deterministic byte-budget shrinking.
  */
-function readGraphLinks(
-  db: GraphDb,
-  ids: string[],
-  maxEdges: number,
-): { linksById: Map<string, string[]>; overflow: boolean } {
+function readGraphLinks(db: GraphDb, ids: string[]): Map<string, string[]> {
   const linksById = new Map<string, string[]>();
   for (const id of ids) linksById.set(id, []);
-  if (ids.length === 0) return { linksById, overflow: false };
+  if (ids.length === 0) return linksById;
   const idList = ids.map(() => "?").join(",");
   const linkRows = db
-    .prepare(`SELECT fromId, toRef FROM record_links WHERE fromId IN (${idList}) ORDER BY fromId ASC, toRef ASC LIMIT ?`)
-    .all(...ids, maxEdges + 1) as Array<Record<string, unknown>>;
-  if (linkRows.length > maxEdges) return { linksById, overflow: true };
+    .prepare(`SELECT fromId, toRef FROM record_links WHERE fromId IN (${idList}) ORDER BY fromId ASC, toRef ASC`)
+    .all(...ids) as Array<Record<string, unknown>>;
   for (const r of linkRows) {
     const list = linksById.get(str(r["fromId"]));
     if (list) list.push(str(r["toRef"]));
   }
-  return { linksById, overflow: false };
+  return linksById;
 }
 
 /**
@@ -233,8 +233,7 @@ export function buildGraphData(
       if (list && list.length < 64) list.push(str(r["eventId"]));
     }
   }
-  const { linksById, overflow } = readGraphLinks(db, ids, opts.maxEdges);
-  if (overflow) throw new GraphLimitError();
+  const linksById = readGraphLinks(db, ids);
 
   const unresolvedSet = new Set<string>();
   const edges: GraphEdge[] = [];
@@ -371,8 +370,6 @@ export interface GraphPageOptions {
   cursor: GraphPageCursor | null;
   limit: number;
   snippetMaxCp: number;
-  /** LIMIT+1 edge bound for this page (caller derives it from limits). */
-  maxEdges: number;
 }
 
 export interface GraphPageData {
@@ -466,8 +463,7 @@ export function buildGraphPage(db: GraphDb, opts: GraphPageOptions): GraphPageDa
   const ids = shown.map((r) => str(r["id"]));
 
   const tagsById = readGraphTags(db, ids);
-  const { linksById, overflow } = readGraphLinks(db, ids, opts.maxEdges);
-  if (overflow) throw new GraphLimitError();
+  const linksById = readGraphLinks(db, ids);
 
   const allRefs: string[] = [];
   for (const refs of linksById.values()) allRefs.push(...refs);
@@ -626,13 +622,29 @@ function selectLocalRow(r: Record<string, unknown>, hop: number): LocalRow {
   };
 }
 
+/** Chunked `NOT IN` clauses so large visited sets stay under SQLite's parameter limit. */
+function notInClauses(ids: string[]): { clauses: string[]; args: string[] } {
+  const chunk = 400;
+  const clauses: string[] = [];
+  const args: string[] = [];
+  for (let i = 0; i < ids.length; i += chunk) {
+    const part = ids.slice(i, i + chunk);
+    clauses.push(`(${part.map(() => "?").join(",")})`);
+    args.push(...part);
+  }
+  return { clauses, args };
+}
+
 /**
  * Neighbours of `frontier` over undirected record links (outbound AND
  * inbound/backlinks), restricted to the same scope and included statuses.
  * Consolidation links are ordinary record_links rows here; their kind is
- * derived from the source record when edges are emitted. Bounded by
- * `cap` rows per direction (LIMIT), chunked to stay under SQLite's
- * parameter limit.
+ * derived from the source record when edges are emitted.
+ *
+ * The SQL set is deduplicated (UNION) and already-visited nodes are excluded
+ * BEFORE `LIMIT cap` is applied. Bounding the raw link rows first would let a
+ * node that links to several frontier nodes consume every slot and hide other
+ * reachable neighbours (and make the next-hop truncation probe wrong).
  */
 function readLocalNeighbors(
   db: GraphDb,
@@ -640,32 +652,31 @@ function readLocalNeighbors(
   statuses: string[],
   frontier: string[],
   cap: number,
+  visited: ReadonlySet<string>,
 ): Array<Record<string, unknown>> {
   if (frontier.length === 0 || cap < 1) return [];
   const statusList = statuses.map(() => "?").join(",");
+  const excluded = notInClauses([...visited]);
+  const excludeSql = excluded.clauses.map((c) => ` AND r.id NOT IN ${c}`).join("");
   const out: Array<Record<string, unknown>> = [];
   const chunk = 400;
   for (let i = 0; i < frontier.length; i += chunk) {
     const part = frontier.slice(i, i + chunk);
     const idList = part.map(() => "?").join(",");
-    const baseArgs = [...part, scope, ...statuses, cap];
-    const outbound = db
+    const rows = db
       .prepare(
         `SELECT r.id, r.body, r.kind, r.status, r.createdAt
-         FROM record_links l JOIN records r ON r.id = l.toRef
-         WHERE l.fromId IN (${idList}) AND r.scope = ? AND r.status IN (${statusList})
+         FROM records r
+         WHERE r.scope = ? AND r.status IN (${statusList})
+           AND r.id IN (
+             SELECT l.toRef FROM record_links l WHERE l.fromId IN (${idList})
+             UNION
+             SELECT l.fromId FROM record_links l WHERE l.toRef IN (${idList})
+           )${excludeSql}
          ORDER BY r.createdAt DESC, r.id ASC LIMIT ?`,
       )
-      .all(...baseArgs) as Array<Record<string, unknown>>;
-    const inbound = db
-      .prepare(
-        `SELECT r.id, r.body, r.kind, r.status, r.createdAt
-         FROM record_links l JOIN records r ON r.id = l.fromId
-         WHERE l.toRef IN (${idList}) AND r.scope = ? AND r.status IN (${statusList})
-         ORDER BY r.createdAt DESC, r.id ASC LIMIT ?`,
-      )
-      .all(...baseArgs) as Array<Record<string, unknown>>;
-    out.push(...outbound, ...inbound);
+      .all(scope, ...statuses, ...part, ...part, ...excluded.args, cap) as Array<Record<string, unknown>>;
+    out.push(...rows);
   }
   return out;
 }
@@ -704,6 +715,7 @@ export function buildGraphLocal(
       statuses,
       frontier,
       Math.max(1, slots + 1),
+      visited,
     );
     const seen = new Set<string>();
     const candidates: LocalRow[] = [];
@@ -733,7 +745,7 @@ export function buildGraphLocal(
       // The limit is exhausted; probe the next hop so truncated reflects
       // real omitted neighbours without reading a whole extra layer.
       if (hop < opts.depth) {
-        const more = readLocalNeighbors(db, opts.scope, statuses, frontier, 1);
+        const more = readLocalNeighbors(db, opts.scope, statuses, frontier, 1, visited);
         if (more.some((r) => !visited.has(str(r["id"])))) truncated = true;
       }
       break;
