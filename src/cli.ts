@@ -25,7 +25,8 @@
  * Autonomous ops (all direct-commit, no approval/TTY):
  *   event.append, record.remember, record.get, record.list,
  *   record.recall, record.search, record.feedback, record.correct,
- *   record.archive, record.retire, record.reactivate, maintain.distill
+ *   record.archive, record.retire, record.reactivate, maintain.distill,
+ *   maintain.episodes
  *
  * maintain.distill runs under the startup-configured maintenance.timeoutMs
  * budget (default 120s, separate from the regular 5s cliMs) because it
@@ -44,6 +45,7 @@ import {
   validateRequest,
   type ResponseEnvelope,
 } from "./protocol.js";
+import { episodeWindows } from "./episodes.js";
 import { initDb, isLegacyDbError } from "./db.js";
 import { effectiveBusyMs, runStoreOpWithDeadline } from "./deadline.js";
 import * as fs from "node:fs";
@@ -52,10 +54,14 @@ import {
   correctRecord,
   eventAppend,
   feedbackRecords,
+  getEvent,
   getRecord,
+  listEpisodes,
   listRecords,
+  rangeEvents,
   reactivateRecord,
   recallRecords,
+  recordSources,
   rememberRecord,
   retireRecord,
   searchRecords,
@@ -294,6 +300,16 @@ export function handleValidatedRequest(
       return getRecord(db, config, params);
     case "record.list":
       return listRecords(db, config, params);
+    case "record.sources":
+      return recordSources(db, config, params);
+    case "event.get":
+      return getEvent(db, config, params);
+    case "event.range":
+      return rangeEvents(db, config, params);
+    case "episode.list":
+      return listEpisodes(db, config, params);
+    case "episode.windows":
+      return episodeWindows(db, config, params);
     case "record.recall":
       return recallRecords(db, config, params);
     case "record.feedback":
@@ -340,12 +356,18 @@ const STORE_OPS = new Set([
   "record.list",
   "record.recall",
   "record.search",
+  "record.sources",
+  "event.get",
+  "event.range",
+  "episode.list",
+  "episode.windows",
   "record.feedback",
   "record.correct",
   "record.archive",
   "record.retire",
   "record.reactivate",
   "maintain.distill",
+  "maintain.episodes",
 ]);
 
 async function main(): Promise<void> {
@@ -465,7 +487,9 @@ async function main(): Promise<void> {
             // maintain.distill gets the long startup-configured maintenance
             // budget (local-model inference); all other ops keep cliMs.
             const budget =
-              v.req.op === "maintain.distill" ? maintenanceTimeoutMs(config) : config.timeouts.cliMs;
+              v.req.op === "maintain.distill" || v.req.op === "maintain.episodes"
+                ? maintenanceTimeoutMs(config)
+                : config.timeouts.cliMs;
             opBudget = budget;
             const opRemaining = budget - elapsed();
             if (opRemaining <= 0) {

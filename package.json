@@ -22,9 +22,11 @@
     "clean": "node -e \"require('fs').rm('dist',{recursive:true,force:true},()=>{})\"",
     "provision:model": "npm run build && node dist/scripts/provision-model.js",
     "provision:llm": "npm run build && node dist/scripts/provision-llm.js",
+    "ingest": "npm run build && node dist/scripts/ingest.js",
     "rebuild:vectors": "npm run build && node dist/scripts/rebuild-vectors.js",
     "rebuild:graph": "npm run build && node dist/scripts/rebuild-graph.js",
     "smoke:m3": "npm run build && node dist/scripts/smoke-m3.js",
+    "smoke:episodes": "npm run build && node dist/scripts/smoke-episodes.js",
     "eval:m2": "npm run build && node dist/scripts/eval-m2.js",
     "smoke:semantic": "npm run build && node dist/scripts/smoke-semantic.js"
   },

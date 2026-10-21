@@ -321,9 +321,12 @@ describe("m1 protocol op allowlist: no approval-era ops", () => {
     }
     assert.deepEqual(
       [...WRITE_OPS].sort(),
-      ["event.append", "maintain.distill", "record.archive", "record.correct", "record.feedback", "record.reactivate", "record.remember", "record.retire"].sort(),
+      ["event.append", "maintain.distill", "maintain.episodes", "record.archive", "record.correct", "record.feedback", "record.reactivate", "record.remember", "record.retire"].sort(),
     );
-    assert.deepEqual([...READ_OPS].sort(), ["record.get", "record.list", "record.recall", "record.search"].sort());
+    assert.deepEqual(
+      [...READ_OPS].sort(),
+      ["episode.list", "episode.windows", "event.get", "event.range", "record.get", "record.list", "record.recall", "record.search", "record.sources"].sort(),
+    );
   });
 
   it("rejects candidate/approval/TTY-era ops as BAD_REQUEST", () => {
@@ -382,8 +385,22 @@ describe("event.append: idempotency, scope, bounds", () => {
   it("rejects unknown scope, over-budget bodies, and unknown fields", () => {
     const ctx = setup();
     try {
+      const rawMax = ctx.config.limits.rawBodyMaxCp ?? 8000;
+      const rawCount = (): number =>
+        (ctx.db.prepare(`SELECT COUNT(*) AS n FROM raw_events`).get() as { n: number }).n;
       assert.equal(appendRaw(ctx.db, ctx.config, { scope: "nope/scope" }, "k-scope").code, "FORBIDDEN_SCOPE");
-      assert.equal(appendRaw(ctx.db, ctx.config, { body: "x".repeat(2001) }, "k-big").code, "LIMIT_EXCEEDED");
+      const before = rawCount();
+      assert.equal(appendRaw(ctx.db, ctx.config, { body: "x".repeat(rawMax + 1) }, "k-big").code, "LIMIT_EXCEEDED");
+      assert.equal(rawCount(), before);
+      const atOldRecordLimit = appendRaw(
+        ctx.db,
+        ctx.config,
+        { eventId: "e-2001", body: "y".repeat(2001) },
+        "k-2001",
+      );
+      assert.equal(atOldRecordLimit.ok, true);
+      assert.equal(atOldRecordLimit.code, "OK");
+      assert.equal(rawCount(), before + 1);
       assert.equal(appendRaw(ctx.db, ctx.config, { body: "   " }, "k-empty").code, "BAD_REQUEST");
       const extra = eventAppend(
         ctx.db,

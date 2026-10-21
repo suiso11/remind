@@ -1,7 +1,9 @@
 {
   "dbPath": "./memory.db",
   "vaultPath": "./vault",
-  "allowedScopes": ["personal/default"],
+  "allowedScopes": [
+    "personal/default"
+  ],
   "limits": {
     "bodyMaxCp": 2000,
     "queryMaxCp": 500,
@@ -11,7 +13,10 @@
     "limitDefault": 10,
     "limitMax": 25,
     "snippetMaxCp": 200,
-    "responseMaxBytes": 8192
+    "responseMaxBytes": 8192,
+    "rawBodyMaxCp": 8000,
+    "rawPageMaxCp": 2000,
+    "rangeLimitMax": 50
   },
   "timeouts": {
     "cliMs": 5000,
@@ -39,6 +44,12 @@
   },
   "maintenance": {
     "timeoutMs": 120000
+  },
+  "episodes": {
+    "utcOffsetMinutes": 540,
+    "windowMaxCp": 1200,
+    "maxNewTokens": 128,
+    "batchMax": 5
   },
   "requirePrivacy": false
 }

@@ -57,6 +57,12 @@ import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import { cultivationBounds, maintenanceTimeoutMs } from "./config.js";
 import {
+  canonicalSourceRefs,
+  sourceRefKey,
+  sourceRefFromColumns,
+  type SourceRef,
+} from "./sourceref.js";
+import {
   RETIRE_REASONS,
   acquireCultivationLease,
   applyCultivationBatch,
@@ -252,12 +258,25 @@ function loadPeers(db: DatabaseSync, scope: string, selfId: string): Array<{ id:
   }
 }
 
-function loadSourceRefs(db: DatabaseSync, recordId: string): string[] {
+/**
+ * Load refs with span provenance intact. Legacy rows (both span columns NULL)
+ * come back as plain eventId strings, so all-string unions keep hashing and
+ * storing exactly as before.
+ */
+function loadSourceRefs(db: DatabaseSync, recordId: string): SourceRef[] {
   try {
     const rows = db
-      .prepare(`SELECT eventId FROM record_source_refs WHERE recordId = ? ORDER BY eventId ASC`)
-      .all(recordId) as Array<{ eventId: string }>;
-    return rows.map((r) => r.eventId);
+      .prepare(
+        `SELECT eventId, spanStart, spanEnd FROM record_source_refs
+         WHERE recordId = ?
+         ORDER BY eventId ASC, spanStart ASC NULLS FIRST, spanEnd ASC NULLS FIRST`,
+      )
+      .all(recordId) as Array<{
+        eventId: string;
+        spanStart: number | null;
+        spanEnd: number | null;
+      }>;
+    return rows.map((r) => sourceRefFromColumns(r.eventId, r.spanStart, r.spanEnd));
   } catch {
     return [];
   }
@@ -652,7 +671,12 @@ export async function maintainDistill(
       // Provenance union is conservative: when both sources together carry
       // more distinct source refs than sourceRefsMax, the merge is skipped
       // (audited keep) rather than written with truncated provenance.
-      const refUnion = [...new Set([...loadSourceRefs(db, target.id), ...loadSourceRefs(db, other.id)])].sort();
+      // Union by (eventId,start,end): distinct spans on the same event survive.
+      const refByKey = new Map<string, SourceRef>();
+      for (const r of [...loadSourceRefs(db, target.id), ...loadSourceRefs(db, other.id)]) {
+        refByKey.set(sourceRefKey(r), r);
+      }
+      const refUnion = canonicalSourceRefs([...refByKey.values()]);
       if (refUnion.length > config.limits.sourceRefsMax) {
         planned.push({ review: s.review, action: keepOf(target.id, target.revision), retry: false });
         continue;
