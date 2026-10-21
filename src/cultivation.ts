@@ -45,6 +45,11 @@ import {
 import { enqueueProjection } from "./projection.js";
 import { deriveConsolidationPrivacy } from "./privacy.js";
 import {
+  parseSourceRefsParam,
+  storedSourceRefs,
+  type SourceRef,
+} from "./sourceref.js";
+import {
   applyResponseBudget,
   fail,
   ok,
@@ -744,7 +749,7 @@ export interface CultivationSummaryInput {
   provenance: { source: string; observedAt: string };
   tags?: string[];
   links?: string[];
-  sourceRefs?: string[];
+  sourceRefs?: SourceRef[];
 }
 
 export interface CultivationAction {
@@ -1177,25 +1182,29 @@ export function applyCultivationBatch(
         } else {
           nLinks = [];
         }
-        // sourceRefs: union the model supplies; each must exist same-scope.
-        let nRefs: string[] | null = null;
+        // sourceRefs: union the caller supplies; each must exist same-scope.
+        // Entries are either legacy eventId strings or code-point spans; the
+        // union preserves (eventId,start,end) so consolidation never drops
+        // span provenance. SPAN bounds are checked against the raw body.
+        let nRefs: SourceRef[] | null = null;
         if (s.sourceRefs !== undefined) {
-          if (!Array.isArray(s.sourceRefs) || s.sourceRefs.length > config.limits.sourceRefsMax) {
-            skip(Array.isArray(s.sourceRefs) ? "LIMIT_EXCEEDED" : "BAD_REQUEST");
+          const parsedRefs = parseSourceRefsParam(s.sourceRefs, config.limits.sourceRefsMax);
+          if (parsedRefs === "bad") {
+            skip("BAD_REQUEST");
             continue;
           }
-          const seen = new Set<string>();
+          if (parsedRefs === "over") {
+            skip("LIMIT_EXCEEDED");
+            continue;
+          }
           let missing: string | null = null;
           let forbidden = false;
-          for (const r of s.sourceRefs) {
-            if (typeof r !== "string" || countCp(r) < 1 || countCp(r) > 256 || hasControl(r)) {
-              missing = "BAD_REQUEST";
-              break;
-            }
-            let row: { scope: string } | undefined;
+          for (const r of parsedRefs) {
+            const eventId = typeof r === "string" ? r : r.eventId;
+            let row: { scope: string; body: string } | undefined;
             try {
-              row = db.prepare(`SELECT scope FROM raw_events WHERE eventId = ?`).get(r) as
-                | { scope: string }
+              row = db.prepare(`SELECT scope, body FROM raw_events WHERE eventId = ?`).get(eventId) as
+                | { scope: string; body: string }
                 | undefined;
             } catch {
               throw new Error("read failed");
@@ -1208,7 +1217,10 @@ export function applyCultivationBatch(
               forbidden = true;
               break;
             }
-            seen.add(r);
+            if (typeof r !== "string" && r.end > countCp(row.body)) {
+              missing = "BAD_REQUEST";
+              break;
+            }
           }
           if (missing) {
             skip(missing);
@@ -1218,7 +1230,7 @@ export function applyCultivationBatch(
             skip("FORBIDDEN_SCOPE");
             continue;
           }
-          nRefs = [...seen].sort();
+          nRefs = parsedRefs;
         } else {
           nRefs = [];
         }
@@ -1239,7 +1251,14 @@ export function applyCultivationBatch(
           summaryPrivacy === null ? null : summaryPrivacy.sensitivity, summaryPrivacy === null ? null : summaryPrivacy.origin);
         for (const t of nTags) db.prepare(`INSERT INTO record_tags(recordId, tag) VALUES (?, ?)`).run(summaryId, t);
         for (const l of nLinks) db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(summaryId, l);
-        for (const r of nRefs) db.prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES (?, ?)`).run(summaryId, r);
+        {
+          const refStmt = db.prepare(
+            `INSERT INTO record_source_refs(recordId, eventId, spanStart, spanEnd) VALUES (?, ?, ?, ?)`,
+          );
+          for (const r of storedSourceRefs(nRefs)) {
+            refStmt.run(summaryId, r.eventId, r.start, r.end);
+          }
+        }
         db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(summaryId, now);
         applied++;
         results.push({ recordId, action, applied: true, code: "OK", summaryId });

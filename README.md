@@ -21,7 +21,9 @@ Copy-Item memory.config.example.json memory.config.json
 - `dbPath`: SQLite 正本の場所 (設定ファイルからの相対解決)。例 `./memory.db`
 - `vaultPath`: Markdown 投影先 (必須、欠落は起動失敗)。例 `./vault`
 - `allowedScopes`: 利用可能スコープ。例 `["personal/default"]`
-- `limits`: `bodyMaxCp / queryMaxCp / tagsMax / linksMax / sourceRefsMax / limitDefault / limitMax / snippetMaxCp / responseMaxBytes`
+- `limits`: `bodyMaxCp / queryMaxCp / tagsMax / linksMax / sourceRefsMax / limitDefault / limitMax / snippetMaxCp / responseMaxBytes` (+ `rawBodyMaxCp / rawPageMaxCp / rangeLimitMax`)
+- `bodyMaxCp` は record 本文のみに適用する。raw 本文は `rawBodyMaxCp` (既定 8000、1..65536)、`event.get` の 1 頁は `rawPageMaxCp` (既定 2000、1..65536)、`event.range / episode.list / episode.windows` の `limit` 上限は `rangeLimitMax` (既定 50、1..1000) を使う。`rangeLimitMax` を省略した場合は `max(50, limitDefault)` が既定になり、`limitDefault` が 51..100 でも起動失敗しない (明示した場合のみ `limitDefault <= rangeLimitMax` を検査する)。
+- `episodes` (任意): `utcOffsetMinutes` (既定 0、-720..840)、`windowMaxCp` (既定 1200、200..4000)、`maxNewTokens` (既定 128、16..256)、`batchMax` (既定 5、1..50)。`utcOffsetMinutes` は `day` の日境界だけをずらし、保存時刻は UTC のまま。
 - `timeouts`: `cliMs` (全体期限)、`busyMs` (SQLite 待機)
 - `dbMaxBytes`: 上限超過の書き込みは `STORE_UNAVAILABLE` で巻き戻し。読み取りは継続する
 - `requirePrivacy` (任意・既定 false): `true` のとき `privacy` を欠く `event.append / record.remember` は `BAD_REQUEST` で拒否する (下記「privacy metadata (F-I01-05)」)
@@ -56,6 +58,61 @@ npm run build
 - `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。
 - `record.archive` は `active -> archived` の終端遷移 (復帰なし)。`reasonCode` は `USER_ARCHIVED / OBSOLETE / DUPLICATE` の固定コードのみ。行は保持され、削除ではない。
 - `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード)。`record.list` に `status:"retired"` を指定すると引退済みを一覧できる。`record.search` は active + retired の明示的検索。
+- `bodyMaxCp` は record 本文のみの上限である。`event.append` の raw 本文は `rawBodyMaxCp` で受ける (record の上限を raw に流用しない)。
+
+## raw 取出し (event.get / event.range / record.sources)
+
+```powershell
+'{"v":1,"op":"event.get","params":{"eventId":"e-001","scope":"personal/default","offset":0,"maxCp":2000}}' | node dist/src/cli.js --config ./memory.config.json
+'{"v":1,"op":"event.range","params":{"scope":"personal/default","sessionId":"s1","since":"2026-09-01T00:00:00.000Z","until":"2026-09-02T00:00:00.000Z","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
+'{"v":1,"op":"record.sources","params":{"id":"<recordId>","scope":"personal/default"}}' | node dist/src/cli.js --config ./memory.config.json
+```
+
+- `event.get` は raw 1 件を code point 頁で返す。params は `eventId / scope` (+任意 `offset / maxCp`)。応答は `eventId / sessionId / turnId / source / observedAt / createdAt / privacy / chunk / totalCp / offset / body / nextOffset`。`maxCp` 既定は `rawPageMaxCp`、`nextOffset` が `null` になるまで連結すると原文と一致する。`offset > totalCp` は `BAD_REQUEST`、`maxCp > rawPageMaxCp` は `LIMIT_EXCEEDED`、欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。
+- `event.range` は raw を `observedAt ASC, eventId ASC` で頁送りする。params は `scope` (+任意 `sessionId / docId / since / until / cursor / limit`)。`since` inclusive、`until` exclusive。各 item は `eventId / sessionId / turnId / observedAt / chunk / totalCp / snippet / truncated`、`nextCursor` は不透明。`limit > rangeLimitMax` は `LIMIT_EXCEEDED`、形式不正 (`cursor` 含む) は `BAD_REQUEST`。
+- `record.sources` は record の `sourceRefs` を raw に解決する。応答は `id / sources[{eventId, sessionId, observedAt, chunk, totalCp, span, excerpt, truncated} | {eventId, missing:true}]`。`span` があれば `excerpt` はその code point 範囲、legacy の文字列 ref なら本文先頭。欠落 raw は `missing:true` で捏造せず、record 欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。raw 読取りは heat・exposures を変えない。
+- 上限超過は `LIMIT_EXCEEDED`、それ以外の形式不正は `BAD_REQUEST` (既存の `NOT_FOUND / FORBIDDEN_SCOPE / STORE_UNAVAILABLE` はそのまま)。
+
+## 長文取込 (チャンク・npm run ingest)
+
+```powershell
+npm run ingest -- --config ./memory.config.json --scope personal/default --file ./doc.md --doc-id doc-001
+```
+
+- `--config / --scope / --file / --doc-id` は必須、`--session / --source` は任意。`--privacy-sensitivity <normal|sensitive>` と `--privacy-origin <conversation|self_activity>` は両方指定するか両方省略する (片方だけ・不正値は usage error で終了 2)。指定時は全チャンクの `event.append` に `privacy` として渡す。`requirePrivacy: true` の config で両方省略した場合は、DB を開く前に固定の `error: ingest failed BAD_REQUEST` で終了 2 になる。UTF-8 文書を `rawBodyMaxCp` 以下のチャンクに分割する。境界は段落 (`\n\n` / CRLF) → 行 (`\n`) → code point 強制切断の順で、surrogate pair を割らず、空白のみのチャンクは作らない。NFKC 正規化は code point を増やし得る (例: `…` → `...`) ため、各チャンクは raw 長と `normalizeBody` 後長の両方で `rawBodyMaxCp` 以下になるよう境界を選ぶ。
+- 書込み前に全チャンクを検証する: raw 長・正規化後長が上限超過なら `LIMIT_EXCEEDED`、正規化後に空なら `BAD_REQUEST` で、DB を開かず 1 件も追記しない (fail closed)。
+- 各チャンクは冪等な `event.append` になる: `eventId = <docId>-c<seq>`、`idempotencyKey = ingest-<docId>-<seq>`、`turnId = <seq>`、`sessionId` 既定 `doc:<docId>`、`source` 既定 `file:<basename>`、`observedAt` はファイル mtime、`chunk = {docId, seq}`。同じファイルの再実行は `deduplicated` で二重追記しない。
+- 標準出力は 1 行 `{docId, chunks, appended, deduplicated}`。引数・config 不正は stderr + 終了 2、DB 起動失敗は終了 3。同じ `(docId, seq)` を別 `eventId` で追記すると `CONFLICT`。
+
+## span 付き sourceRefs
+
+```powershell
+'{"v":1,"op":"record.remember","idempotencyKey":"rem-span-001","params":{"body":"orchard harvest span memo","kind":"user_fact","provenance":{"source":"session:s1:turn:1","observedAt":"2026-09-01T00:00:00.000Z"},"scope":"personal/default","sourceRefs":[{"eventId":"e-001","start":0,"end":18}]}}' | node dist/src/cli.js --config ./memory.config.json
+```
+
+- `sourceRefs[]` の各要素は legacy の `eventId` 文字列、または `{eventId, start, end}`。`start` inclusive、`end` exclusive の code point 範囲で、`start >= 0`、`end > start`、`end <= event の totalCp`。個数上限は `sourceRefsMax`。
+- span 不正 (順序・範囲外・余分/欠落キー・非整数) は `BAD_REQUEST`。参照先は同一 scope の既存 event のみで、欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。文字列 ref は従来どおり本文全体を指し、`record.sources` の `excerpt` は先頭 `rawPageMaxCp` まで。
+- `remember / correct` と育成系は同じ正規化 (sort + dedup) を共有する。文字列だけの legacy 入力は従来と同一 hash のため、再送の `deduplicated` は変わらない。
+
+## エピソード (episode.list / episode.windows / maintain.episodes)
+
+```powershell
+'{"v":1,"op":"episode.list","params":{"scope":"personal/default","kind":"doc","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
+'{"v":1,"op":"episode.windows","params":{"scope":"personal/default","kind":"doc","episodeKey":"doc-001","limit":50}}' | node dist/src/cli.js --config ./memory.config.json
+'{"v":1,"op":"maintain.episodes","idempotencyKey":"ep-001","params":{"scope":"personal/default","kind":"session","limit":5}}' | node dist/src/cli.js --config ./memory.config.json
+```
+
+- `kind` は `session | doc | day`。`episodeKey` は session の `sessionId`、doc の `docId`、day は `utcOffsetMinutes` で切ったローカル日。既定 `batchMax` は 5 で、`maintain.episodes` の `limit` もこの上限を超えると `LIMIT_EXCEEDED`。
+- `maintain.episodes` は write op (`idempotencyKey` 必須、`maintenance.timeoutMs` 予算、`maintain.distill` と同一 lease で単一 flight)。各 raw event を `windowMaxCp` 以下の span に分け、CJK 文書は日本語プロンプト + assistant prefill `要約：` で 1 window の要約を生成する。生成文は (1) `要約：` の除去を含む整形、(2) 要約中の固有名詞・数字などの anchor token が window raw に存在するかの決定的ガード、(3) window raw に対する厳密 YES/NO 検証、の順に通す。検証プロンプトは候補要約を常に全文含み、短縮するのは source 側だけである。候補全文と最小 source (`EPISODE_VERIFY_MIN_SOURCE_CP`、source がそれより短ければ全文) が予算に収まらない候補は検証不能として YES を問わず、window は verbatim に落とす (reduce の文は drop し、全滅時は extractive fallback)。内容拒否 (parse 失敗・anchor 不在・NO) の window は record を書かないのではなく、その window の raw 文を span 付き `summary` record として保存し `episode-window-verbatim` tag を付ける (`windowsVerbatim`)。timeout・モデル失敗時は何も書かず、その event から再試行可能に止める。
+- 完了は raw event 単位で `episode_event_done` に記録する (最後の window canonical record + ledger と同一 transaction。window が無い再実行・修復時は fenced な done 行のみ)。`episode.list` の `stale` は timestamp 比較ではなく、done 行の無い pending raw event または `foldedRecordIds` に含まれない active window の有無で決まる。`coveredThrough` は互換のため残す report で、done event の `MAX(observedAt)` を返す (選択・staleness には使わない)。
+- すべての canonical / ledger 書込みは run owner の lease fence を同じ transaction 内で再確認する。推論中に lease を失った場合は `CONFLICT` で全体を rollback し、部分書込みを残さない。
+- privacy は `maintain.distill` と同じ規則で伝播する。window は raw event の sensitivity を `origin: self_activity` で継承し、episode は引用 window から `sensitive` 優先・全 known なら `normal`・unknown を含めば `null` とする。`requirePrivacy` 時に raw event の privacy が unknown なら、その event は書かず pending のまま残す。
+- reduce は最大 5 window ずつ、各文の末尾に引用番号 `[1][3]` を要求する cited prompt で行う。各文は引用した window の raw span に (a) anchor ガード、(b) 文単位の厳密 YES/NO を通ったものだけを残す。全文が落ちた場合は検証済み window 要約を順に連結する extractive fallback とし、episode record は必ず前進する (`sentencesKept: 0`)。初回は `summary`、増分は `record.correct` の `correction`。
+- 増分更新では既存 window を再生成せず、新規 window だけ書く。episode 級要約は `record.correct` で旧版を `superseded` にし履歴を残す。訂正競合時は新 summary + 旧版 `archived` (`OBSOLETE`) に退避し、物理削除はしない。LLM 無効・欠落時は `{episodes:[], applied:0, degraded:true}` を返し、状態を変えない (エラーにしない)。
+- reduce の生成・文検証が一時的失敗 (null / timeout / 例外) を返した場合は extractive を書かず episode を延期する (`reduceDeferred: true`、`stale` のまま、次回再試行)。内容拒否 (parse 失敗・anchor 不在・NO) だけが extractive fallback の対象。
+- `record.correct` で episode / window record を訂正すると、旧 revision の episode ledger 所属 (`episode_summaries` の行と episode 級 `foldedRecordIds` の window id) を新 revision へ引き継ぐ。
+- 応答 `episodes[{kind, episodeKey, windowsWritten, windowsVerbatim, windowsRejected, episodeRecordId, coveredThrough, sentencesKept, sentencesDropped, extractive}] + applied + degraded`。`windowsRejected` は verbatim 回復分も含むモデル拒否回数。`episode.list` は `items[{kind, episodeKey, startAt, endAt, eventCount, totalCp, summaryRecordIds, stale}] + nextCursor` を返し、`summaryRecordIds` は active の episode 要約のみ、`stale` は done 行の無い pending raw event または未 fold の active window があるとき true (`coveredThrough` は done event の最大 observedAt を返す互換 report で、判定には使わない)。`episode.windows` は active な window record を `recordId / eventId / span{start,end} / snippet / truncated` で返す (`limit` 上限は `rangeLimitMax`)。
+- 実測 (実 Qwen2.5-1.5B CPU、`npm run smoke:episodes`): smoke OK、合計 161.5s。doc episode は model window 2 / verbatim 3、session `s-ep` は model window 1 / verbatim 2。両 episode body は extractive fallback (`sentencesKept: 0`) で、model が書いた window 要約に raw に無い固有名詞は無かった。以前の自由文 reduce は「Elena and her husband」という幻覚を受理したが、引用付き・raw 検証付き reduce に置換した。既知の制約: 漢字複合語の anchor (raw `金曜` に対する `金曜日` など) は偽陽性拒否となり verbatim に落ちる、verbatim window は後から再要約しない、`record_source_refs` の移行は copy+swap で表を再構築する。
 
 ## リンク・backlink・Markdown 投影
 
@@ -99,9 +156,11 @@ npm run eval:m2          # 合成データでの語彙/意味の比較評価 (�
 npm run eval:operations   # 運用ライフサイクル+規模の合成評価 (一時 DB、実 CLI)
 npm run provision:llm    # 育成 LLM の取得 (唯一の M3 ネットワーク工程)
 npm run smoke:m3         # 実 LLM での CLI 育成スモーク (一時 DB)
+npm run ingest -- --config ./memory.config.json --scope personal/default --file ./doc.md --doc-id doc-001  # 長文チャンク取込
+npm run smoke:episodes   # 実 LLM での取込 -> episode 索引スモーク (一時 DB)
 ```
 
-<書き込み永続化失敗時の巻き戻しは `tests/m1-rollback.test.ts` で確認する (audit/operations の INSERT 拒否で 5 操作とも `STORE_UNAVAILABLE`・正本不変・再送で 1 件のみ確定)。露出上限の原子性は `tests/r06-exposure-cap.test.ts` (2 件: 実 recallId で厳密 1000 行・最古逐語刈り込み・消去後 feedback 行列・DELETE 拒否の全行巻戻し+再送成功) で確認する。 投影キューの耐久回復は `tests/r07-projection-recovery.test.ts` (3 件: close+reopen 永続 + 独立 future 行不変/分離回復・同一宛先 regular 最終 Markdown への実 rename 段階 primitive fault 保持/再 drain 復元・recall+feedback populated な 8 列 exposures/usage/heat を含む完全再構築 + exposure 有効/二重 heat なし)、実子プロセス CLI の境界・リプレイは `tests/r08-cli-boundary-replay.test.ts` (9 件: 先行 LF/EOF・多行・保持 TIMEOUT (cliMs 有界 assert)・不正 UTF-8・32768 境界・保持 multibyte streaming byte cap (20000 文字/40000 バイト)・起動 busy・実 worker TIMEOUT (positive threadId の BEGIN 到達、子時計での親 TIMEOUT+exit 有界: preload の実起動・実 stdout・実 exit 刻みを cliMs+1000 で assert し設定無視の 5000 固定を棄却、negative control で 5000 固定時に子時計 5016ms で fail 確認) 後の同キー再送単一確定→deduplicated replay) で確認する。fault 相は厳密 2500/10000 注入のまま、回復相は同一 DB・同一 scope・同一キー+同一 params を既存標準 (出荷例 5000/2000) で再送する (設定は冪等 hash ではない)。包装 bin 契約は `tests/r08-bin-entry.test.ts` (1 件: manifest 解決の platform 対応 launcher 経由で event.append 永続・remember/get 往復・同キー replay が正準効果ちょうど 1 件→deduplicated) で確認する。同一正本への同時訂正競合は `tests/m1-recall.test.ts` の共有ファイル競合試験 (2 件: 2 本の実 worker スレッドが各々の実 DatabaseSync で native BEGIN rendezvous し、ちょうど 1 件 OK/1 件 CONFLICT、勝者の正準/ref/link/heat/operation/成功 audit のみ残留、敗者残滓ゼロ; ready/done の settled outcome を起動直後に束縛し失敗時も全 settlement を消費する即時 lifecycle、無効 temp DB path での実 open 失敗前に ready が settled 失敗・両 completion 消費・両 worker 実 exit・fixture 除去の failure-edge) で確認する。build は外部 chmod なし (Node fs.chmodSync、win32 guard) で、Windows CI は chmod.exe を含む PATH だけを除去して chmod 不可を確認してから `npm test` する。全 80 件が Linux ローカルで成功、smoke も一時 DB/実 CLI で成功。独立 temp-only smoke (実 API での厳密 cap+DELETE 拒否/再送/feedback heat 行列、および POSIX symlink launcher 経由の write/read/replay) も成功。独立 native failure smoke (無効 DB path の実 worker error+exit 1/除去) と実コンパイル API の winning-key replay smoke (同キー再送 deduplicated) も成功。
+<書き込み永続化失敗時の巻き戻しは `tests/m1-rollback.test.ts` で確認する (audit/operations の INSERT 拒否で 5 操作とも `STORE_UNAVAILABLE`・正本不変・再送で 1 件のみ確定)。露出上限の原子性は `tests/r06-exposure-cap.test.ts` (2 件: 実 recallId で厳密 1000 行・最古逐語刈り込み・消去後 feedback 行列・DELETE 拒否の全行巻戻し+再送成功) で確認する。 投影キューの耐久回復は `tests/r07-projection-recovery.test.ts` (3 件: close+reopen 永続 + 独立 future 行不変/分離回復・同一宛先 regular 最終 Markdown への実 rename 段階 primitive fault 保持/再 drain 復元・recall+feedback populated な 8 列 exposures/usage/heat を含む完全再構築 + exposure 有効/二重 heat なし)、実子プロセス CLI の境界・リプレイは `tests/r08-cli-boundary-replay.test.ts` (9 件: 先行 LF/EOF・多行・保持 TIMEOUT (cliMs 有界 assert)・不正 UTF-8・32768 境界・保持 multibyte streaming byte cap (20000 文字/40000 バイト)・起動 busy・実 worker TIMEOUT (positive threadId の BEGIN 到達、子時計での親 TIMEOUT+exit 有界: preload の実起動・実 stdout・実 exit 刻みを cliMs+1000 で assert し設定無視の 5000 固定を棄却、negative control で 5000 固定時に子時計 5016ms で fail 確認) 後の同キー再送単一確定→deduplicated replay) で確認する。fault 相は厳密 2500/10000 注入のまま、回復相は同一 DB・同一 scope・同一キー+同一 params を既存標準 (出荷例 5000/2000) で再送する (設定は冪等 hash ではない)。包装 bin 契約は `tests/r08-bin-entry.test.ts` (1 件: manifest 解決の platform 対応 launcher 経由で event.append 永続・remember/get 往復・同キー replay が正準効果ちょうど 1 件→deduplicated) で確認する。同一正本への同時訂正競合は `tests/m1-recall.test.ts` の共有ファイル競合試験 (2 件: 2 本の実 worker スレッドが各々の実 DatabaseSync で native BEGIN rendezvous し、ちょうど 1 件 OK/1 件 CONFLICT、勝者の正準/ref/link/heat/operation/成功 audit のみ残留、敗者残滓ゼロ; ready/done の settled outcome を起動直後に束縛し失敗時も全 settlement を消費する即時 lifecycle、無効 temp DB path での実 open 失敗前に ready が settled 失敗・両 completion 消費・両 worker 実 exit・fixture 除去の failure-edge) で確認する。build は外部 chmod なし (Node fs.chmodSync、win32 guard) で、Windows CI は chmod.exe を含む PATH だけを除去して chmod 不可を確認してから `npm test` する。全 226 件 (raw-read 16 件・episodes 12 件を含む) が Linux ローカルで成功、smoke も一時 DB/実 CLI で成功。独立 temp-only smoke (実 API での厳密 cap+DELETE 拒否/再送/feedback heat 行列、および POSIX symlink launcher 経由の write/read/replay) も成功。独立 native failure smoke (無効 DB path の実 worker error+exit 1/除去) と実コンパイル API の winning-key replay smoke (同キー再送 deduplicated) も成功。
 
   受け入れ条件は `docs/acceptance-manifest.md`、保持・育成方針は `docs/retention.md` を参照。M3 育成 (`record.retire / reactivate / search` + 有界キュー・単一 flight・二段階実モデル `maintain.distill`) は実装済みで、`tests/m3-state.test.ts` (23 件：回帰 9 件含む) と実モデル `npm run smoke:m3` が通る。終端 `archive` を可逆引退とみなさない。同一バッチの相互指名ペアは無順序ペアで 1 回のみ統合する (代表 1 件が要約、対は監査付き keep、重複サマリなし)。
 

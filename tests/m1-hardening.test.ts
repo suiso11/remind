@@ -128,6 +128,8 @@ describe("budgets: response, input, and field limits", () => {
         "LIMIT_EXCEEDED",
       );
       const before = (ctx.db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n;
+      const rawBefore = (ctx.db.prepare(`SELECT COUNT(*) AS n FROM raw_events`).get() as { n: number }).n;
+      const rawMax = ctx.config.limits.rawBodyMaxCp ?? 8000;
       assert.equal(
         eventAppend(
           ctx.db,
@@ -136,7 +138,7 @@ describe("budgets: response, input, and field limits", () => {
             eventId: "e-big",
             sessionId: "s1",
             turnId: "t1",
-            body: "z".repeat(2001),
+            body: "z".repeat(rawMax + 1),
             provenance: { source: "session:s1:turn:3", observedAt: OBS },
             scope: "personal/default",
           },
@@ -145,6 +147,24 @@ describe("budgets: response, input, and field limits", () => {
         "LIMIT_EXCEEDED",
       );
       assert.equal((ctx.db.prepare(`SELECT COUNT(*) AS n FROM records`).get() as { n: number }).n, before);
+      assert.equal((ctx.db.prepare(`SELECT COUNT(*) AS n FROM raw_events`).get() as { n: number }).n, rawBefore);
+      // bodyMaxCp is records-only now: a 2001-cp raw body is within rawBodyMaxCp.
+      const atOldRecordLimit = eventAppend(
+        ctx.db,
+        ctx.config,
+        {
+          eventId: "e-2001",
+          sessionId: "s1",
+          turnId: "t1",
+          body: "y".repeat(2001),
+          provenance: { source: "session:s1:turn:3", observedAt: OBS },
+          scope: "personal/default",
+        },
+        "k-2001",
+      );
+      assert.equal(atOldRecordLimit.ok, true);
+      assert.equal(atOldRecordLimit.code, "OK");
+      assert.equal((ctx.db.prepare(`SELECT COUNT(*) AS n FROM raw_events`).get() as { n: number }).n, rawBefore + 1);
     } finally {
       ctx.cleanup();
     }

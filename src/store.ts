@@ -28,7 +28,13 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
-import { requirePrivacyEnabled } from "./config.js";
+import {
+  episodesBounds,
+  rangeLimitMax,
+  rawBodyMaxCp,
+  rawPageMaxCp,
+  requirePrivacyEnabled,
+} from "./config.js";
 import {
   bodyHashFor,
   canonicalStringify,
@@ -51,10 +57,17 @@ import {
   type PrivacyMetadata,
 } from "./privacy.js";
 import {
+  parseSourceRefsParam,
+  sourceRefFromColumns,
+  storedSourceRefs,
+  type SourceRef,
+} from "./sourceref.js";
+import {
   REACTIVATE_REASONS,
   RETIRE_REASONS,
   enqueueCultivationReview,
   ensureCultivationSchema,
+  isCultivationLeaseHeldBy,
 } from "./cultivation.js";
 import {
   applyResponseBudget,
@@ -217,6 +230,81 @@ function ensurePrivacyColumns(db: DatabaseSync): void {
   }
 }
 
+/**
+ * P1 additive migration: nullable raw event chunk columns (docId, chunkSeq)
+ * plus a partial unique index ensuring (scope, docId, chunkSeq) is unique
+ * only for chunked events. ALTER TABLE ADD COLUMN only; legacy rows stay
+ * NULL and never collide. Idempotent/savepoint-based like the privacy
+ * migration.
+ */
+function ensureRawChunkColumns(db: DatabaseSync): void {
+  const tableHasColumn = (table: string, col: string): boolean => {
+    try {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      return cols.some((c) => c.name === col);
+    } catch {
+      return false;
+    }
+  };
+  if (!tableHasColumn("raw_events", "docId")) {
+    db.exec(`SAVEPOINT ensure_raw_chunk_columns`);
+    try {
+      db.exec(`ALTER TABLE raw_events ADD COLUMN docId TEXT NULL`);
+      db.exec(`ALTER TABLE raw_events ADD COLUMN chunkSeq INTEGER NULL CHECK(chunkSeq BETWEEN 0 AND 100000)`);
+      db.exec(`RELEASE SAVEPOINT ensure_raw_chunk_columns`);
+    } catch (e) {
+      try { db.exec(`ROLLBACK TO SAVEPOINT ensure_raw_chunk_columns`); } catch { /* preserve error */ }
+      try { db.exec(`RELEASE SAVEPOINT ensure_raw_chunk_columns`); } catch { /* preserve error */ }
+      throw e;
+    }
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_events_doc_chunk
+    ON raw_events(scope, docId, chunkSeq) WHERE docId IS NOT NULL`);
+}
+
+/**
+ * P1 guarded migration for record_source_refs spans. Legacy tables used
+ * PRIMARY KEY(recordId,eventId), which forbids the same eventId with a
+ * different span. Rebuild once (every row copied; legacy spans stay NULL)
+ * with a unique expression index so NULL spans remain unique like before
+ * while distinct spans coexist. Fresh tables skip the rebuild.
+ */
+function ensureSourceRefSpans(db: DatabaseSync): void {
+  let cols: Array<{ name: string; pk: number }>;
+  try {
+    cols = db.prepare(`PRAGMA table_info(record_source_refs)`).all() as Array<{
+      name: string;
+      pk: number;
+    }>;
+  } catch {
+    return;
+  }
+  if (cols.length === 0) return;
+  const hasSpans = cols.some((c) => c.name === "spanStart") && cols.some((c) => c.name === "spanEnd");
+  const hasLegacyPk = cols.some((c) => c.pk > 0);
+  if (!hasSpans || hasLegacyPk) {
+    db.exec(`SAVEPOINT ensure_source_ref_spans`);
+    try {
+      db.exec(`CREATE TABLE record_source_refs_new(
+        recordId TEXT NOT NULL, eventId TEXT NOT NULL,
+        spanStart INTEGER NULL, spanEnd INTEGER NULL,
+        CHECK((spanStart IS NULL AND spanEnd IS NULL) OR
+              (spanStart IS NOT NULL AND spanEnd IS NOT NULL AND spanStart >= 0 AND spanEnd > spanStart)))`);
+      db.exec(`INSERT INTO record_source_refs_new(recordId, eventId, spanStart, spanEnd)
+        SELECT recordId, eventId, ${hasSpans ? "spanStart, spanEnd" : "NULL, NULL"} FROM record_source_refs`);
+      db.exec(`DROP TABLE record_source_refs`);
+      db.exec(`ALTER TABLE record_source_refs_new RENAME TO record_source_refs`);
+      db.exec(`RELEASE SAVEPOINT ensure_source_ref_spans`);
+    } catch (e) {
+      try { db.exec(`ROLLBACK TO SAVEPOINT ensure_source_ref_spans`); } catch { /* preserve error */ }
+      try { db.exec(`RELEASE SAVEPOINT ensure_source_ref_spans`); } catch { /* preserve error */ }
+      throw e;
+    }
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_refs_unique
+    ON record_source_refs(recordId, eventId, COALESCE(spanStart, -1), COALESCE(spanEnd, -1))`);
+}
+
 export function ensureM1Schema(db: DatabaseSync): void {
   // M3 additive migration first: pre-M3 files keep every canonical row.
   migrateRecordsStatusForRetired(db);
@@ -226,7 +314,8 @@ export function ensureM1Schema(db: DatabaseSync): void {
     source TEXT NOT NULL, observedAt TEXT NOT NULL,
     scope TEXT NOT NULL, runId TEXT NULL, createdAt TEXT NOT NULL,
     privacySensitivity TEXT NULL CHECK(privacySensitivity IN ('normal','sensitive')),
-    privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity')))`);
+    privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity')),
+    docId TEXT NULL, chunkSeq INTEGER NULL CHECK(chunkSeq BETWEEN 0 AND 100000))`);
   db.exec(`CREATE TABLE IF NOT EXISTS records(
     id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyNorm TEXT NOT NULL, bodyHash TEXT NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','summary','correction')),
@@ -238,9 +327,18 @@ export function ensureM1Schema(db: DatabaseSync): void {
   // F-I01-05 additive privacy columns for databases created before the
   // columns existed (nullable; old rows stay NULL = legacy/unknown privacy).
   ensurePrivacyColumns(db);
+  // P1 additive chunk columns (legacy rows NULL) for old databases.
+  ensureRawChunkColumns(db);
   db.exec(`CREATE TABLE IF NOT EXISTS record_tags(recordId TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(recordId, tag))`);
   db.exec(`CREATE TABLE IF NOT EXISTS record_links(fromId TEXT NOT NULL, toRef TEXT NOT NULL, PRIMARY KEY(fromId, toRef))`);
-  db.exec(`CREATE TABLE IF NOT EXISTS record_source_refs(recordId TEXT NOT NULL, eventId TEXT NOT NULL, PRIMARY KEY(recordId, eventId))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS record_source_refs(
+    recordId TEXT NOT NULL, eventId TEXT NOT NULL,
+    spanStart INTEGER NULL, spanEnd INTEGER NULL,
+    CHECK((spanStart IS NULL AND spanEnd IS NULL) OR
+          (spanStart IS NOT NULL AND spanEnd IS NOT NULL AND spanStart >= 0 AND spanEnd > spanStart)))`);
+  // P1 guarded rebuild for pre-span tables (PK recordId,eventId); legacy rows
+  // keep NULL spans and every existing row is copied.
+  ensureSourceRefSpans(db);
   db.exec(`CREATE TABLE IF NOT EXISTS operations(
     idempotencyKey TEXT PRIMARY KEY, op TEXT NOT NULL, requestHash TEXT NOT NULL,
     responseJson TEXT NOT NULL, createdAt TEXT NOT NULL)`);
@@ -259,6 +357,45 @@ export function ensureM1Schema(db: DatabaseSync): void {
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_raw USING fts5(eventId UNINDEXED, body)`);
   db.exec(`CREATE TABLE IF NOT EXISTS char_bigrams(kind TEXT NOT NULL, id TEXT NOT NULL, bigram TEXT NOT NULL, PRIMARY KEY(kind, id, bigram))`);
+  // P2 derived episode ledger (rebuildable; never canonical). Episode windows
+  // and episode-level summaries reference canonical records by id. Additive:
+  // databases created before this slice gain the table on next init.
+  db.exec(`CREATE TABLE IF NOT EXISTS episode_summaries(
+    scope TEXT,
+    kind TEXT CHECK(kind IN ('session','doc','day')),
+    episodeKey TEXT,
+    level TEXT CHECK(level IN ('window','episode')),
+    recordId TEXT,
+    eventId TEXT NULL,
+    spanStart INTEGER NULL,
+    spanEnd INTEGER NULL,
+    coveredThrough TEXT NULL,
+    foldedRecordIds TEXT NULL,
+    createdAt TEXT,
+    PRIMARY KEY(scope, kind, episodeKey, recordId))`);
+  // Additive column for databases created before the fold marker existed.
+  // Rows written by earlier builds keep NULL (no folded set), which reads as
+  // "nothing folded yet" and is repaired on the next maintenance pass.
+  const episodeColumns = db.prepare(`PRAGMA table_info(episode_summaries)`).all() as Array<{
+    name: string;
+  }>;
+  if (!episodeColumns.some((c) => c.name === "foldedRecordIds")) {
+    db.exec(`ALTER TABLE episode_summaries ADD COLUMN foldedRecordIds TEXT NULL`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_episode
+    ON episode_summaries(scope, kind, episodeKey, level)`);
+  // Explicit per-event completion marker. An event is pending until its last
+  // verified/verbatim window transaction (or a no-op "all windows already
+  // present" repair) inserts this row. Unlike a createdAt watermark this is
+  // order-independent: observation order and tie timestamps cannot skip a
+  // failed event forever. Additive table; old databases gain it on init.
+  db.exec(`CREATE TABLE IF NOT EXISTS episode_event_done(
+    scope TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('session','doc','day')),
+    episodeKey TEXT NOT NULL,
+    eventId TEXT NOT NULL,
+    doneAt TEXT NOT NULL,
+    PRIMARY KEY(scope, kind, episodeKey, eventId))`);
   // Derived vector index (rebuildable; never canonical). One row per record:
   // L2-normalized float32 LE embedding of the normalized body (dim pinned).
   // Missing rows, dim mismatches, and non-finite/zero vectors are ignored by
@@ -1139,22 +1276,37 @@ function parseLinks(links: unknown, max: number): string[] | "bad" | "over" {
   return [...seen].sort();
 }
 
-function parseSourceRefs(refs: unknown, max: number): string[] | "bad" | "over" {
-  if (refs === undefined) return [];
-  if (!Array.isArray(refs)) return "bad";
-  if (refs.length > max) return "over";
-  const seen = new Set<string>();
-  for (const r of refs) {
-    if (typeof r !== "string") return "bad";
-    if (countCp(r) < 1 || countCp(r) > 256 || hasControl(r)) return "bad";
-    seen.add(r);
-  }
-  return [...seen].sort();
+function parseSourceRefs(refs: unknown, max: number): SourceRef[] | "bad" | "over" {
+  return parseSourceRefsParam(refs, max);
 }
 
 /* ------------------------------------------------------------------ */
 /* event.append                                                        */
 /* ------------------------------------------------------------------ */
+
+const CHUNK_DOC_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+interface RawChunk {
+  docId: string;
+  seq: number;
+}
+
+/** Optional `chunk: {docId, seq}`; absent => null, any other shape => invalid. */
+function parseChunkParam(v: unknown): RawChunk | null | "invalid" {
+  if (v === undefined) return null;
+  if (!isPlainObject(v)) return "invalid";
+  const keys = Object.keys(v);
+  if (keys.length !== 2 || !keys.includes("docId") || !keys.includes("seq")) {
+    return "invalid";
+  }
+  const docId = v["docId"];
+  const seq = v["seq"];
+  if (typeof docId !== "string" || !CHUNK_DOC_ID_RE.test(docId)) return "invalid";
+  if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0 || seq > 100000) {
+    return "invalid";
+  }
+  return { docId, seq };
+}
 
 export function eventAppend(
   db: DatabaseSync,
@@ -1164,7 +1316,7 @@ export function eventAppend(
   nowOverride?: string,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
-  const allowed = new Set(["eventId", "sessionId", "turnId", "body", "provenance", "scope", "runId", "privacy"]);
+  const allowed = new Set(["eventId", "sessionId", "turnId", "body", "provenance", "scope", "runId", "privacy", "chunk"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return budgeted(bad(), config);
   }
@@ -1175,10 +1327,11 @@ export function eventAppend(
     }
   }
   if (typeof body !== "string") return budgeted(bad(), config);
-  if (countCp(body) > config.limits.bodyMaxCp) return budgeted(limitExceeded(), config);
+  const rawBodyMax = rawBodyMaxCp(config);
+  if (countCp(body) > rawBodyMax) return budgeted(limitExceeded(), config);
   const nBody = normalizeBody(body);
   if (countCp(nBody) < 1) return budgeted(bad(), config);
-  if (countCp(nBody) > config.limits.bodyMaxCp) return budgeted(limitExceeded(), config);
+  if (countCp(nBody) > rawBodyMax) return budgeted(limitExceeded(), config);
   const prov = parseProvenance(provenance);
   if (!prov) return budgeted(bad(), config);
   const nScope = parseScope(scope);
@@ -1189,35 +1342,24 @@ export function eventAppend(
   const nPrivacy = parsePrivacyParam(params["privacy"]);
   if (nPrivacy === "invalid") return budgeted(bad(), config);
   if (requirePrivacyEnabled(config) && nPrivacy === null) return budgeted(bad(), config);
+  const nChunk = parseChunkParam(params["chunk"]);
+  if (nChunk === "invalid") return budgeted(bad(), config);
 
-  const reqHash = requestHashFor(
-    "event.append",
-    nPrivacy === null
-      ? // F-I01-05 legacy compatibility: when privacy is absent, the hashed
-        // params must be byte-identical to the pre-privacy normalization
-        // (omit the key entirely; do not include privacy: null).
-        {
-          body: body as string,
-          eventId,
-          observedAt: prov.observedAt,
-          runId: nRunId,
-          scope: nScope,
-          sessionId,
-          source: prov.source,
-          turnId,
-        }
-      : {
-          body: body as string,
-          eventId,
-          observedAt: prov.observedAt,
-          privacy: nPrivacy,
-          runId: nRunId,
-          scope: nScope,
-          sessionId,
-          source: prov.source,
-          turnId,
-        },
-  );
+  // Legacy hash compatibility: absent keys are omitted entirely, so requests
+  // without privacy/chunk hash byte-identically to the pre-slice normal form.
+  const hashedParams: Record<string, unknown> = {
+    body: body as string,
+    eventId,
+    observedAt: prov.observedAt,
+    runId: nRunId,
+    scope: nScope,
+    sessionId,
+    source: prov.source,
+    turnId,
+  };
+  if (nPrivacy !== null) hashedParams["privacy"] = nPrivacy;
+  if (nChunk !== null) hashedParams["chunk"] = nChunk;
+  const reqHash = requestHashFor("event.append", hashedParams);
 
   let saved: StoredOp | null = null;
   try {
@@ -1246,10 +1388,11 @@ export function eventAppend(
       const probe: ResponseEnvelope = ok({ event: { eventId } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
-        `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt, privacySensitivity, privacyOrigin)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt, privacySensitivity, privacyOrigin, docId, chunkSeq)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(eventId as string, sessionId as string, turnId as string, rawBody, nBody, prov.source, prov.observedAt, nScope, nRunId, now,
-        nPrivacy === null ? null : nPrivacy.sensitivity, nPrivacy === null ? null : nPrivacy.origin);
+        nPrivacy === null ? null : nPrivacy.sensitivity, nPrivacy === null ? null : nPrivacy.origin,
+        nChunk === null ? null : nChunk.docId, nChunk === null ? null : nChunk.seq);
       const stored = budgeted(probe, config);
       db.prepare(
         `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
@@ -1309,7 +1452,7 @@ interface NormalizedRemember {
   scope: string;
   tags: string[];
   links: string[];
-  sourceRefs: string[];
+  sourceRefs: SourceRef[];
   runId: string | null;
   /** F-I01-05: validated optional privacy (null = absent / legacy-compatible). */
   privacy: PrivacyMetadata | null;
@@ -1384,26 +1527,86 @@ function parseRememberParams(
   };
 }
 
-/** Verify every sourceRef exists as same-scope raw; returns error envelope or null. */
+/**
+ * Verify every sourceRef exists as same-scope raw and (when spanned) stays
+ * within that event's code-point length: 0 <= start < end <= totalCp.
+ */
 function checkSourceRefs(
   db: DatabaseSync,
   config: AppConfig,
   scope: string,
-  refs: string[],
+  refs: SourceRef[],
 ): ResponseEnvelope | null {
   for (const r of refs) {
-    let row: { scope: string } | undefined;
+    const eventId = typeof r === "string" ? r : r.eventId;
+    let row: { scope: string; body: string } | undefined;
     try {
-      row = db.prepare(`SELECT scope FROM raw_events WHERE eventId = ?`).get(r) as
-        | { scope: string }
+      row = db.prepare(`SELECT scope, body FROM raw_events WHERE eventId = ?`).get(eventId) as
+        | { scope: string; body: string }
         | undefined;
     } catch {
       return budgeted(fail("STORE_UNAVAILABLE"), config);
     }
     if (!row) return budgeted(fail("NOT_FOUND"), config);
     if (row.scope !== scope) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (typeof r !== "string" && r.end > countCp(row.body)) {
+      return budgeted(bad(), config);
+    }
   }
   return null;
+}
+
+/** In-transaction re-validation: same checks as checkSourceRefs, fail closed. */
+function verifySourceRefsInTxn(
+  db: DatabaseSync,
+  scope: string,
+  refs: SourceRef[],
+): void {
+  for (const r of refs) {
+    const eventId = typeof r === "string" ? r : r.eventId;
+    const row = db.prepare(`SELECT scope, body FROM raw_events WHERE eventId = ?`).get(eventId) as
+      | { scope: string; body: string }
+      | undefined;
+    if (!row) throw new Error("source lost");
+    if (row.scope !== scope) throw new Error("source scope");
+    if (typeof r !== "string" && r.end > countCp(row.body)) throw new Error("source span");
+  }
+}
+
+function insertSourceRefs(
+  db: DatabaseSync,
+  recordId: string,
+  refs: SourceRef[],
+): void {
+  const stmt = db.prepare(
+    `INSERT INTO record_source_refs(recordId, eventId, spanStart, spanEnd) VALUES (?, ?, ?, ?)`,
+  );
+  for (const s of storedSourceRefs(refs)) {
+    stmt.run(recordId, s.eventId, s.start, s.end);
+  }
+}
+
+/**
+ * Optional ownership fence for a canonical write (used by maintain.episodes).
+ * The whole write transaction is refused unless the caller still owns the live
+ * m3 lease; `afterInsert` runs inside that same transaction so a caller can
+ * commit its derived ledger rows atomically with the canonical record.
+ */
+export interface CanonicalWriteFence {
+  owner: string;
+  /** Timestamp used to evaluate lease liveness. */
+  now: string;
+  afterInsert?: (db: DatabaseSync, recordId: string) => void;
+}
+
+function assertCanonicalWriteFence(
+  db: DatabaseSync,
+  fence: CanonicalWriteFence | undefined,
+): void {
+  if (!fence) return;
+  if (!isCultivationLeaseHeldBy(db, fence.owner, fence.now)) {
+    throw new Error("lease lost");
+  }
 }
 
 export function rememberRecord(
@@ -1412,6 +1615,7 @@ export function rememberRecord(
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride?: string,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   const parsed = parseRememberParams(config, params);
   if (!parsed.ok) return budgeted(parsed.res, config);
@@ -1481,14 +1685,11 @@ export function rememberRecord(
   let committed: ResponseEnvelope;
   try {
     committed = withTransaction(db, (): ResponseEnvelope => {
+      // Ownership fence evaluated inside this canonical transaction: a lease
+      // stolen during inference rolls the whole write back.
+      assertCanonicalWriteFence(db, fence);
       // Re-verify refs inside the txn (fail closed on concurrent change).
-      for (const r of n.sourceRefs) {
-        const row = db.prepare(`SELECT scope FROM raw_events WHERE eventId = ?`).get(r) as
-          | { scope: string }
-          | undefined;
-        if (!row) throw new Error("source lost");
-        if (row.scope !== n.scope) throw new Error("source scope");
-      }
+      verifySourceRefsInTxn(db, n.scope, n.sourceRefs);
       const probe: ResponseEnvelope = ok({ record: { id } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
@@ -1502,10 +1703,9 @@ export function rememberRecord(
       for (const l of n.links) {
         db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(id, l);
       }
-      for (const r of n.sourceRefs) {
-        db.prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES (?, ?)`).run(id, r);
-      }
+      insertSourceRefs(db, id, n.sourceRefs);
       db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(id, now);
+      fence?.afterInsert?.(db, id);
       const stored = budgeted(probe, config);
       db.prepare(
         `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
@@ -1538,10 +1738,12 @@ export function rememberRecord(
     bestEffortIndexNote(db, id, n.bodyNorm);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "lease lost") return budgeted(fail("CONFLICT"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "source lost") return budgeted(fail("NOT_FOUND"), config);
     if (msg === "source scope") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "source span") return budgeted(bad(), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       let again: StoredOp | null = null;
       try {
@@ -1617,8 +1819,10 @@ function readRecordView(db: DatabaseSync, id: string): RecordView | null {
   const links = (
     db.prepare(`SELECT toRef FROM record_links WHERE fromId = ? ORDER BY toRef ASC`).all(id) as Array<{ toRef: string }>
   ).map((r) => r.toRef);
+  // Distinct keeps the legacy record.get shape (one eventId per source) even
+  // when the same event is cited through multiple spans.
   const sourceRefs = (
-    db.prepare(`SELECT eventId FROM record_source_refs WHERE recordId = ? ORDER BY eventId ASC`).all(id) as Array<{ eventId: string }>
+    db.prepare(`SELECT DISTINCT eventId FROM record_source_refs WHERE recordId = ? ORDER BY eventId ASC`).all(id) as Array<{ eventId: string }>
   ).map((r) => r.eventId);
   return {
     id: row.id,
@@ -1794,6 +1998,807 @@ export function listRecords(
     const msg = e instanceof Error ? e.message : String(e);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* P1 raw reads: event.get / event.range / record.sources              */
+/* ------------------------------------------------------------------ */
+
+function chunkFromColumns(
+  docId: string | null | undefined,
+  seq: number | null | undefined,
+): { docId: string; seq: number } | null {
+  if (typeof docId !== "string" || typeof seq !== "number") return null;
+  return { docId, seq };
+}
+
+function encodeEventCursor(observedAt: string, eventId: string): string {
+  return Buffer.from(JSON.stringify({ o: observedAt, e: eventId }), "utf8").toString("base64url");
+}
+
+function decodeEventCursor(v: unknown): { observedAt: string; eventId: string } | null {
+  if (typeof v !== "string" || v.length === 0 || !/^[A-Za-z0-9_-]+$/.test(v)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(v, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(parsed)) return null;
+  const keys = Object.keys(parsed);
+  if (keys.length !== 2 || !keys.includes("o") || !keys.includes("e")) return null;
+  const observedAt = canonicalTime(parsed["o"]);
+  const eventId = parsed["e"];
+  if (observedAt === null) return null;
+  if (typeof eventId !== "string" || countCp(eventId) < 1 || countCp(eventId) > 128 || hasControl(eventId)) {
+    return null;
+  }
+  return { observedAt, eventId };
+}
+
+export function getEvent(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  for (const k of Object.keys(params)) {
+    if (k !== "eventId" && k !== "scope" && k !== "offset" && k !== "maxCp") {
+      return budgeted(bad(), config);
+    }
+  }
+  const { eventId, scope, offset, maxCp } = params;
+  if (
+    typeof eventId !== "string" ||
+    checkLenCp(eventId, 1, 128) !== "ok" ||
+    hasControl(eventId)
+  ) {
+    return budgeted(bad(), config);
+  }
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  const pageMax = rawPageMaxCp(config);
+  let nOffset = 0;
+  if (offset !== undefined) {
+    if (typeof offset !== "number" || !Number.isInteger(offset) || offset < 0) {
+      return budgeted(bad(), config);
+    }
+    nOffset = offset;
+  }
+  let nMaxCp = pageMax;
+  if (maxCp !== undefined) {
+    if (typeof maxCp !== "number" || !Number.isInteger(maxCp) || maxCp < 1) {
+      return budgeted(bad(), config);
+    }
+    if (maxCp > pageMax) return budgeted(limitExceeded(), config);
+    nMaxCp = maxCp;
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      let row:
+        | {
+            eventId: string;
+            sessionId: string;
+            turnId: string;
+            source: string;
+            observedAt: string;
+            createdAt: string;
+            body: string;
+            scope: string;
+            privacySensitivity: string | null;
+            privacyOrigin: string | null;
+            docId: string | null;
+            chunkSeq: number | null;
+          }
+        | undefined;
+      try {
+        row = db
+          .prepare(
+            `SELECT eventId, sessionId, turnId, source, observedAt, createdAt, body, scope,
+                    privacySensitivity, privacyOrigin, docId, chunkSeq
+             FROM raw_events WHERE eventId = ?`,
+          )
+          .get(eventId) as typeof row;
+      } catch {
+        throw new Error("read failed");
+      }
+      if (!row) throw new Error("missing");
+      if (row.scope !== nScope) throw new Error("scope mismatch");
+      const cps = [...row.body];
+      const totalCp = cps.length;
+      if (nOffset > totalCp) throw new Error("bad offset");
+      const end = Math.min(totalCp, nOffset + nMaxCp);
+      const body = cps.slice(nOffset, end).join("");
+      const stored = budgeted(
+        ok({
+          eventId: row.eventId,
+          sessionId: row.sessionId,
+          turnId: row.turnId,
+          source: row.source,
+          observedAt: row.observedAt,
+          createdAt: row.createdAt,
+          privacy: privacyFromColumns(row.privacySensitivity, row.privacyOrigin),
+          chunk: chunkFromColumns(row.docId, row.chunkSeq),
+          totalCp,
+          offset: nOffset,
+          body,
+          nextOffset: end < totalCp ? end : null,
+        }),
+        config,
+      );
+      if (!stored.ok) throw new Error("response over budget");
+      auditInsert(db, {
+        ts: now,
+        op: "event.get",
+        targetId: row.eventId,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: nMaxCp,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "missing") return budgeted(fail("NOT_FOUND"), config);
+    if (msg === "scope mismatch") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "bad offset") return budgeted(bad(), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+export function rangeEvents(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["scope", "sessionId", "docId", "since", "until", "cursor", "limit"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { scope, sessionId, docId, since, until, cursor, limit } = params;
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  let nSessionId: string | null = null;
+  if (sessionId !== undefined) {
+    if (
+      typeof sessionId !== "string" ||
+      checkLenCp(sessionId, 1, 128) !== "ok" ||
+      hasControl(sessionId)
+    ) {
+      return budgeted(bad(), config);
+    }
+    nSessionId = sessionId;
+  }
+  let nDocId: string | null = null;
+  if (docId !== undefined) {
+    if (typeof docId !== "string" || !CHUNK_DOC_ID_RE.test(docId)) {
+      return budgeted(bad(), config);
+    }
+    nDocId = docId;
+  }
+  let nSince: string | null = null;
+  if (since !== undefined && since !== null) {
+    const c = canonicalTime(since);
+    if (c === null) return budgeted(bad(), config);
+    nSince = c;
+  }
+  let nUntil: string | null = null;
+  if (until !== undefined && until !== null) {
+    const c = canonicalTime(until);
+    if (c === null) return budgeted(bad(), config);
+    nUntil = c;
+  }
+  let nCursor: { observedAt: string; eventId: string } | null = null;
+  if (cursor !== undefined && cursor !== null) {
+    nCursor = decodeEventCursor(cursor);
+    if (nCursor === null) return budgeted(bad(), config);
+  }
+  const maxLimit = rangeLimitMax(config);
+  let nLimit = config.limits.limitDefault;
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
+    if (limit < 1) return budgeted(bad(), config);
+    if (limit > maxLimit) return budgeted(limitExceeded(), config);
+    nLimit = limit;
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      let rows: Array<{
+        eventId: string;
+        sessionId: string;
+        turnId: string;
+        body: string;
+        observedAt: string;
+        docId: string | null;
+        chunkSeq: number | null;
+      }>;
+      try {
+        let sql = `SELECT eventId, sessionId, turnId, body, observedAt, docId, chunkSeq
+                   FROM raw_events WHERE scope = ?`;
+        const args: Array<string | number> = [nScope];
+        if (nSessionId !== null) {
+          sql += ` AND sessionId = ?`;
+          args.push(nSessionId);
+        }
+        if (nDocId !== null) {
+          sql += ` AND docId = ?`;
+          args.push(nDocId);
+        }
+        if (nSince !== null) {
+          sql += ` AND observedAt >= ?`;
+          args.push(nSince);
+        }
+        if (nUntil !== null) {
+          sql += ` AND observedAt < ?`;
+          args.push(nUntil);
+        }
+        if (nCursor !== null) {
+          sql += ` AND (observedAt > ? OR (observedAt = ? AND eventId > ?))`;
+          args.push(nCursor.observedAt, nCursor.observedAt, nCursor.eventId);
+        }
+        sql += ` ORDER BY observedAt ASC, eventId ASC LIMIT ?`;
+        args.push(nLimit + 1);
+        rows = db.prepare(sql).all(...args) as typeof rows;
+      } catch {
+        throw new Error("read failed");
+      }
+      const shown = rows.slice(0, nLimit);
+      const items = shown.map((r) => {
+        const cps = [...r.body];
+        const max = config.limits.snippetMaxCp;
+        return {
+          eventId: r.eventId,
+          sessionId: r.sessionId,
+          turnId: r.turnId,
+          observedAt: r.observedAt,
+          chunk: chunkFromColumns(r.docId, r.chunkSeq),
+          totalCp: cps.length,
+          snippet: cps.length <= max ? r.body : cps.slice(0, max).join(""),
+          truncated: cps.length > max,
+        };
+      });
+      const last = shown.length > 0 ? shown[shown.length - 1] : null;
+      const nextCursor =
+        rows.length > nLimit && last
+          ? encodeEventCursor(last.observedAt, last.eventId)
+          : null;
+      const stored = budgeted(ok({ items, nextCursor }), config);
+      if (!stored.ok) throw new Error("response over budget");
+      auditInsert(db, {
+        ts: now,
+        op: "event.range",
+        targetId: null,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: nLimit,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+export function recordSources(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  for (const k of Object.keys(params)) {
+    if (k !== "id" && k !== "scope") return budgeted(bad(), config);
+  }
+  const { id, scope } = params;
+  if (typeof id !== "string" || id.length === 0 || id.length > 256) {
+    return budgeted(bad(), config);
+  }
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  const excerptMax = rawPageMaxCp(config);
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      let record: { id: string; scope: string } | undefined;
+      try {
+        record = db.prepare(`SELECT id, scope FROM records WHERE id = ?`).get(id) as
+          | { id: string; scope: string }
+          | undefined;
+      } catch {
+        throw new Error("read failed");
+      }
+      if (!record) throw new Error("missing");
+      if (record.scope !== nScope) throw new Error("scope mismatch");
+      let refs: Array<{ eventId: string; spanStart: number | null; spanEnd: number | null }>;
+      try {
+        refs = db
+          .prepare(
+            `SELECT eventId, spanStart, spanEnd FROM record_source_refs
+             WHERE recordId = ?
+             ORDER BY eventId ASC, spanStart ASC NULLS FIRST, spanEnd ASC NULLS FIRST`,
+          )
+          .all(id) as typeof refs;
+      } catch {
+        throw new Error("read failed");
+      }
+      // Resolve each ref once; excerpt caps are applied later so the whole
+      // response can be kept within responseMaxBytes deterministically.
+      const base = refs.map((r) => {
+        let raw:
+          | {
+              sessionId: string;
+              observedAt: string;
+              body: string;
+              scope: string;
+              docId: string | null;
+              chunkSeq: number | null;
+            }
+          | undefined;
+        try {
+          raw = db
+            .prepare(
+              `SELECT sessionId, observedAt, body, scope, docId, chunkSeq
+               FROM raw_events WHERE eventId = ?`,
+            )
+            .get(r.eventId) as typeof raw;
+        } catch {
+          throw new Error("read failed");
+        }
+        if (!raw || raw.scope !== nScope) {
+          return { eventId: r.eventId, missing: true as const };
+        }
+        const cps = [...raw.body];
+        const hasSpan =
+          r.spanStart !== null && r.spanStart !== undefined &&
+          r.spanEnd !== null && r.spanEnd !== undefined;
+        const start = hasSpan ? Math.min(r.spanStart as number, cps.length) : 0;
+        const end = hasSpan ? Math.min(r.spanEnd as number, cps.length) : cps.length;
+        return {
+          eventId: r.eventId,
+          sessionId: raw.sessionId,
+          observedAt: raw.observedAt,
+          chunk: chunkFromColumns(raw.docId, raw.chunkSeq),
+          totalCp: cps.length,
+          span: hasSpan ? { start: r.spanStart as number, end: r.spanEnd as number } : null,
+          segment: cps.slice(start, end),
+        };
+      });
+      // Share the excerpt budget across every source instead of giving each
+      // one rawPageMaxCp. If the encoded envelope still does not fit, halve
+      // the (uniform) caps down to a floor. Full text stays available through
+      // event.get with offset=span.start.
+      const sourceCount = base.length;
+      const initialCap =
+        sourceCount === 0 ? excerptMax : Math.max(1, Math.floor(excerptMax / sourceCount));
+      const floor = Math.min(16, initialCap);
+      let caps = base.map(() => initialCap);
+      for (;;) {
+        const sources = base.map((s, i) => {
+          if ("missing" in s) return s;
+          const cap = caps[i] as number;
+          return {
+            eventId: s.eventId,
+            sessionId: s.sessionId,
+            observedAt: s.observedAt,
+            chunk: s.chunk,
+            totalCp: s.totalCp,
+            span: s.span,
+            excerpt: s.segment.slice(0, cap).join(""),
+            truncated: s.segment.length > cap,
+          };
+        });
+        const candidate = ok({ id, sources });
+        if (successFits(candidate, config.limits.responseMaxBytes)) {
+          const stored = budgeted(candidate, config);
+          auditInsert(db, {
+            ts: now,
+            op: "record.sources",
+            targetId: id as string,
+            code: stored.code,
+            scope: nScope,
+            bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+            limitN: null,
+            runId: null,
+            recallId: null,
+            reasonCode: null,
+          });
+          return stored;
+        }
+        const next = caps.map((cap) => Math.max(floor, Math.floor(cap / 2)));
+        if (next.every((cap, i) => cap === caps[i])) {
+          throw new Error("response over budget");
+        }
+        caps = next;
+      }
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "missing") return budgeted(fail("NOT_FOUND"), config);
+    if (msg === "scope mismatch") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* P2 episodes: derived episode summaries + episode.list               */
+/* ------------------------------------------------------------------ */
+
+export type EpisodeKind = "session" | "doc" | "day";
+export type EpisodeLevel = "window" | "episode";
+
+/** Row accepted by insertEpisodeSummary (caller owns the transaction). */
+export interface EpisodeSummaryInput {
+  scope: string;
+  kind: EpisodeKind;
+  episodeKey: string;
+  level: EpisodeLevel;
+  recordId: string;
+  eventId?: string | null;
+  spanStart?: number | null;
+  spanEnd?: number | null;
+  coveredThrough?: string | null;
+  /**
+   * Window recordIds folded into this episode-level row. Used as the explicit
+   * "already reduced" marker for staleness; never a timestamp. Ignored for
+   * level='window'.
+   */
+  foldedRecordIds?: string[] | null;
+  createdAt: string;
+}
+
+/** Stored episode_summaries row as returned by listEpisodeSummaries. */
+export interface EpisodeSummaryRow {
+  scope: string;
+  kind: EpisodeKind;
+  episodeKey: string;
+  level: EpisodeLevel;
+  recordId: string;
+  eventId: string | null;
+  spanStart: number | null;
+  spanEnd: number | null;
+  coveredThrough: string | null;
+  foldedRecordIds: string[];
+  createdAt: string;
+}
+
+/** Per-event completion row (explicit pending marker complement). */
+export interface EpisodeEventDoneInput {
+  scope: string;
+  kind: EpisodeKind;
+  episodeKey: string;
+  eventId: string;
+  doneAt: string;
+}
+
+/**
+ * Mark one raw event fully processed. No transaction is opened here so the
+ * caller can write it in the same transaction as the event's last window (or
+ * its ledger repair). Re-marking is idempotent.
+ */
+export function insertEpisodeEventDone(db: DatabaseSync, row: EpisodeEventDoneInput): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO episode_event_done(scope, kind, episodeKey, eventId, doneAt)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(row.scope, row.kind, row.episodeKey, row.eventId, row.doneAt);
+}
+
+/**
+ * Insert one derived episode ledger row. No transaction is opened here so a
+ * maintainer can write window + episode rows atomically with its own txn.
+ * Re-inserting the same (scope, kind, episodeKey, recordId) replaces it.
+ */
+export function insertEpisodeSummary(db: DatabaseSync, row: EpisodeSummaryInput): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO episode_summaries(
+       scope, kind, episodeKey, level, recordId, eventId,
+       spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    row.scope,
+    row.kind,
+    row.episodeKey,
+    row.level,
+    row.recordId,
+    row.eventId ?? null,
+    row.spanStart ?? null,
+    row.spanEnd ?? null,
+    row.coveredThrough ?? null,
+    row.foldedRecordIds === undefined || row.foldedRecordIds === null
+      ? null
+      : JSON.stringify(row.foldedRecordIds),
+    row.createdAt,
+  );
+}
+
+function parseFoldedRecordIds(raw: unknown): string[] {
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((v): v is string => typeof v === "string");
+  } catch {
+    return [];
+  }
+}
+
+/** Read derived episode ledger rows (optionally filtered to one level). */
+export function listEpisodeSummaries(
+  db: DatabaseSync,
+  scope: string,
+  kind: EpisodeKind,
+  episodeKey: string,
+  level?: EpisodeLevel,
+): EpisodeSummaryRow[] {
+  let sql = `SELECT scope, kind, episodeKey, level, recordId, eventId,
+                    spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt
+             FROM episode_summaries
+             WHERE scope = ? AND kind = ? AND episodeKey = ?`;
+  const args: Array<string> = [scope, kind, episodeKey];
+  if (level !== undefined) {
+    sql += ` AND level = ?`;
+    args.push(level);
+  }
+  sql += ` ORDER BY createdAt DESC, recordId ASC`;
+  const rows = db.prepare(sql).all(...args) as unknown as Array<
+    Omit<EpisodeSummaryRow, "foldedRecordIds"> & { foldedRecordIds: string | null }
+  >;
+  return rows.map((row) => ({
+    ...row,
+    foldedRecordIds: parseFoldedRecordIds(row.foldedRecordIds),
+  }));
+}
+
+function encodeEpisodeCursor(startAt: string, episodeKey: string): string {
+  return Buffer.from(JSON.stringify({ s: startAt, k: episodeKey }), "utf8").toString("base64url");
+}
+
+function decodeEpisodeCursor(v: unknown): { startAt: string; episodeKey: string } | null {
+  if (typeof v !== "string" || v.length === 0 || !/^[A-Za-z0-9_-]+$/.test(v)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(v, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(parsed)) return null;
+  const keys = Object.keys(parsed);
+  if (keys.length !== 2 || !keys.includes("s") || !keys.includes("k")) return null;
+  const startAt = canonicalTime(parsed["s"]);
+  const episodeKey = parsed["k"];
+  if (startAt === null) return null;
+  if (
+    typeof episodeKey !== "string" ||
+    countCp(episodeKey) < 1 ||
+    countCp(episodeKey) > 256 ||
+    hasControl(episodeKey)
+  ) {
+    return null;
+  }
+  return { startAt, episodeKey };
+}
+
+const EPISODE_KINDS = new Set<string>(["session", "doc", "day"]);
+
+export function listEpisodes(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["scope", "kind", "since", "until", "cursor", "limit"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { scope, kind, since, until, cursor, limit } = params;
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  if (typeof kind !== "string" || !EPISODE_KINDS.has(kind)) {
+    return budgeted(bad(), config);
+  }
+  const nKind = kind as EpisodeKind;
+  let nSince: string | null = null;
+  if (since !== undefined && since !== null) {
+    const c = canonicalTime(since);
+    if (c === null) return budgeted(bad(), config);
+    nSince = c;
+  }
+  let nUntil: string | null = null;
+  if (until !== undefined && until !== null) {
+    const c = canonicalTime(until);
+    if (c === null) return budgeted(bad(), config);
+    nUntil = c;
+  }
+  let nCursor: { startAt: string; episodeKey: string } | null = null;
+  if (cursor !== undefined && cursor !== null) {
+    nCursor = decodeEpisodeCursor(cursor);
+    if (nCursor === null) return budgeted(bad(), config);
+  }
+  const maxLimit = rangeLimitMax(config);
+  let nLimit = config.limits.limitDefault;
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
+    if (limit < 1) return budgeted(bad(), config);
+    if (limit > maxLimit) return budgeted(limitExceeded(), config);
+    nLimit = limit;
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const offset = episodesBounds(config).utcOffsetMinutes;
+  const offsetModifier = `${offset >= 0 ? "+" : ""}${offset} minutes`;
+  const keyExpr =
+    nKind === "session" ? "sessionId" : nKind === "doc" ? "docId" : `date(observedAt, ?)`;
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      let rows: Array<{
+        episodeKey: string;
+        startAt: string;
+        endAt: string;
+        eventCount: number;
+        totalCp: number;
+        maxCreatedAt: string;
+      }>;
+      try {
+        let sql = `SELECT episodeKey, startAt, endAt, eventCount, totalCp, maxCreatedAt
+                   FROM (
+                     SELECT ${keyExpr} AS episodeKey,
+                            MIN(observedAt) AS startAt,
+                            MAX(observedAt) AS endAt,
+                            COUNT(*) AS eventCount,
+                            SUM(length(body)) AS totalCp,
+                            MAX(createdAt) AS maxCreatedAt
+                     FROM raw_events
+                     WHERE scope = ?${nKind === "doc" ? " AND docId IS NOT NULL" : ""}
+                     GROUP BY episodeKey
+                   ) WHERE 1 = 1`;
+        // keyExpr's offset placeholder precedes the scope placeholder.
+        const args: Array<string | number> =
+          nKind === "day" ? [offsetModifier, nScope] : [nScope];
+        if (nSince !== null) {
+          sql += ` AND startAt >= ?`;
+          args.push(nSince);
+        }
+        if (nUntil !== null) {
+          sql += ` AND startAt < ?`;
+          args.push(nUntil);
+        }
+        if (nCursor !== null) {
+          sql += ` AND (startAt > ? OR (startAt = ? AND episodeKey > ?))`;
+          args.push(nCursor.startAt, nCursor.startAt, nCursor.episodeKey);
+        }
+        sql += ` ORDER BY startAt ASC, episodeKey ASC LIMIT ?`;
+        args.push(nLimit + 1);
+        rows = db.prepare(sql).all(...args) as typeof rows;
+      } catch {
+        throw new Error("read failed");
+      }
+      const shown = rows.slice(0, nLimit);
+      const summaryStmt = db.prepare(
+        `SELECT s.recordId AS recordId, s.coveredThrough AS coveredThrough,
+                s.foldedRecordIds AS foldedRecordIds, r.status AS status
+         FROM episode_summaries s
+         LEFT JOIN records r ON r.id = s.recordId
+         WHERE s.scope = ? AND s.kind = ? AND s.episodeKey = ? AND s.level = 'episode'
+         ORDER BY s.createdAt DESC, s.recordId ASC`,
+      );
+      const eventPredicate =
+        nKind === "session"
+          ? "e.sessionId = ?"
+          : nKind === "doc"
+            ? "e.docId = ?"
+            : "date(e.observedAt, ?) = ?";
+      const pendingStmt = db.prepare(
+        `SELECT 1 AS found FROM raw_events e
+         WHERE e.scope = ? AND ${eventPredicate}
+           AND NOT EXISTS (
+             SELECT 1 FROM episode_event_done d
+             WHERE d.scope = e.scope AND d.kind = ? AND d.episodeKey = ?
+               AND d.eventId = e.eventId)
+         LIMIT 1`,
+      );
+      const windowStmt = db.prepare(
+        `SELECT w.recordId AS recordId FROM episode_summaries w
+         JOIN records rw ON rw.id = w.recordId AND rw.status = 'active'
+         WHERE w.scope = ? AND w.kind = ? AND w.episodeKey = ? AND w.level = 'window'`,
+      );
+      const items = shown.map((r) => {
+        const summaries = summaryStmt.all(nScope, nKind, r.episodeKey) as Array<{
+          recordId: string;
+          coveredThrough: string | null;
+          foldedRecordIds: string | null;
+          status: string | null;
+        }>;
+        const summaryRecordIds = summaries
+          .filter((s) => s.status === "active")
+          .map((s) => s.recordId);
+        // Explicit fold markers from every episode-level row. Timestamps are
+        // never used to decide staleness: picking the "latest" row by
+        // createdAt would be ambiguous on ties (and could resurrect an
+        // already-folded window). A window counts as folded if any reduce
+        // ever included it.
+        const folded = new Set<string>();
+        for (const s of summaries) {
+          for (const id of parseFoldedRecordIds(s.foldedRecordIds)) folded.add(id);
+        }
+        const pendingArgs: Array<string | number> =
+          nKind === "day"
+            ? [nScope, offsetModifier, r.episodeKey, nKind, r.episodeKey]
+            : [nScope, r.episodeKey, nKind, r.episodeKey];
+        const pending = pendingStmt.get(...pendingArgs) !== undefined;
+        const windows = windowStmt.all(nScope, nKind, r.episodeKey) as Array<{
+          recordId: string;
+        }>;
+        const unfolded = windows.some((w) => !folded.has(w.recordId));
+        const stale = pending || unfolded;
+        return {
+          kind: nKind,
+          episodeKey: r.episodeKey,
+          startAt: r.startAt,
+          endAt: r.endAt,
+          eventCount: r.eventCount,
+          totalCp: r.totalCp,
+          summaryRecordIds,
+          stale,
+        };
+      });
+      const last = shown.length > 0 ? shown[shown.length - 1] : null;
+      const nextCursor =
+        rows.length > nLimit && last
+          ? encodeEpisodeCursor(last.startAt, last.episodeKey)
+          : null;
+      const stored = budgeted(ok({ items, nextCursor }), config);
+      if (!stored.ok) throw new Error("response over budget");
+      auditInsert(db, {
+        ts: now,
+        op: "episode.list",
+        targetId: null,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: nLimit,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }
@@ -2470,12 +3475,111 @@ export function feedbackRecords(
 /* record.correct (atomic revision + supersede)                        */
 /* ------------------------------------------------------------------ */
 
+interface CarriedEpisodeSummaryRow {
+  scope: string;
+  kind: EpisodeKind;
+  episodeKey: string;
+  level: EpisodeLevel;
+  eventId: string | null;
+  spanStart: number | null;
+  spanEnd: number | null;
+  coveredThrough: string | null;
+  foldedRecordIds: string | null;
+}
+
+/**
+ * Keep the derived episode ledger consistent with a canonical correction.
+ * A new revision changes the record id; without carrying rows forward,
+ * episode.list would drop an episode summary whose old id was superseded, and
+ * a corrected window would look unfolded. Runs inside the correction txn and
+ * before any caller `afterInsert` (which uses INSERT OR REPLACE) so the
+ * maintainer's fresh ledger data wins for the new id.
+ */
+function carryForwardEpisodeSummaries(
+  db: DatabaseSync,
+  oldId: string,
+  newId: string,
+  now: string,
+): void {
+  let rows: CarriedEpisodeSummaryRow[];
+  try {
+    rows = db
+      .prepare(
+        `SELECT scope, kind, episodeKey, level, eventId, spanStart, spanEnd,
+                coveredThrough, foldedRecordIds
+         FROM episode_summaries WHERE recordId = ?`,
+      )
+      .all(oldId) as unknown as CarriedEpisodeSummaryRow[];
+  } catch {
+    return;
+  }
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO episode_summaries(
+       scope, kind, episodeKey, level, recordId, eventId,
+       spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const row of rows) {
+    insert.run(
+      row.scope,
+      row.kind,
+      row.episodeKey,
+      row.level,
+      newId,
+      row.eventId,
+      row.spanStart,
+      row.spanEnd,
+      row.coveredThrough,
+      row.foldedRecordIds,
+      now,
+    );
+  }
+  // Episode-level fold markers may still name the old window id. Rewrite them
+  // to the new revision so the corrected window stays folded and the episode
+  // is not reported stale again.
+  let foldedRows: Array<CarriedEpisodeSummaryRow & { recordId: string; createdAt: string }>;
+  try {
+    foldedRows = db
+      .prepare(
+        `SELECT scope, kind, episodeKey, level, recordId, eventId, spanStart,
+                spanEnd, coveredThrough, foldedRecordIds, createdAt
+         FROM episode_summaries ep
+         WHERE ep.level = 'episode'
+           AND EXISTS (
+             SELECT 1 FROM json_each(COALESCE(ep.foldedRecordIds, '[]')) j
+             WHERE j.value = ?)`,
+      )
+      .all(oldId) as unknown as typeof foldedRows;
+  } catch {
+    return;
+  }
+  for (const row of foldedRows) {
+    const ids = parseFoldedRecordIds(row.foldedRecordIds).map((id) =>
+      id === oldId ? newId : id,
+    );
+    insertEpisodeSummary(db, {
+      scope: row.scope,
+      kind: row.kind,
+      episodeKey: row.episodeKey,
+      level: row.level,
+      recordId: row.recordId,
+      eventId: row.eventId,
+      spanStart: row.spanStart,
+      spanEnd: row.spanEnd,
+      coveredThrough: row.coveredThrough,
+      foldedRecordIds: [...new Set(ids)],
+      createdAt: row.createdAt,
+    });
+  }
+}
+
 export function correctRecord(
   db: DatabaseSync,
   config: AppConfig,
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride?: string,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
   const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId", "privacy"]);
@@ -2576,6 +3680,7 @@ export function correctRecord(
   let committed: ResponseEnvelope;
   try {
     committed = withTransaction(db, (): ResponseEnvelope => {
+      assertCanonicalWriteFence(db, fence);
       let target: { scope: string; status: string; revision: number; privacySensitivity: string | null; privacyOrigin: string | null } | undefined;
       try {
         target = db
@@ -2591,13 +3696,7 @@ export function correctRecord(
       // record's privacy (including null for legacy rows).
       const effPrivacy: PrivacyMetadata | null =
         nPrivacy ?? privacyFromColumns(target.privacySensitivity, target.privacyOrigin);
-      for (const r of nRefs) {
-        const row = db.prepare(`SELECT scope FROM raw_events WHERE eventId = ?`).get(r) as
-          | { scope: string }
-          | undefined;
-        if (!row) throw new Error("source lost");
-        if (row.scope !== nScope) throw new Error("source scope");
-      }
+      verifySourceRefsInTxn(db, nScope, nRefs);
       const probe: ResponseEnvelope = ok({ record: { id: newId, supersedes: recordId } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       // Conditional flip is the arbiter: exactly one concurrent correction wins.
@@ -2618,10 +3717,12 @@ export function correctRecord(
       for (const l of nLinks) {
         db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(newId, l);
       }
-      for (const r of nRefs) {
-        db.prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES (?, ?)`).run(newId, r);
-      }
+      insertSourceRefs(db, newId, nRefs);
       db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(newId, now);
+      // Carry the derived ledger first; a caller's afterInsert may then
+      // replace the new-id row with its fresh fold/coverage data.
+      carryForwardEpisodeSummaries(db, recordId, newId, now);
+      fence?.afterInsert?.(db, newId);
       const stored = budgeted(probe, config);
       db.prepare(
         `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
@@ -2660,6 +3761,7 @@ export function correctRecord(
     return committed;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "lease lost") return budgeted(fail("CONFLICT"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "missing" || msg === "source lost") {
@@ -2668,6 +3770,7 @@ export function correctRecord(
       return budgeted(fail("NOT_FOUND"), config);
     }
     if (msg === "scope mismatch" || msg === "source scope") return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (msg === "source span") return budgeted(bad(), config);
     if (msg === "not active") return budgeted(fail("CONFLICT"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       let again: StoredOp | null = null;
@@ -2705,6 +3808,7 @@ export function archiveRecord(
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride?: string,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
   const allowed = new Set(["id", "scope", "reasonCode"]);
@@ -2747,6 +3851,7 @@ export function archiveRecord(
   let committed: ResponseEnvelope;
   try {
     committed = withTransaction(db, (): ResponseEnvelope => {
+      assertCanonicalWriteFence(db, fence);
       let target: { scope: string; status: string } | undefined;
       try {
         target = db.prepare(`SELECT scope, status FROM records WHERE id = ?`).get(id) as
@@ -2802,6 +3907,7 @@ export function archiveRecord(
     return committed;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "lease lost") return budgeted(fail("CONFLICT"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "missing") return budgeted(fail("NOT_FOUND"), config);

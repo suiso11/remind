@@ -18,15 +18,20 @@ import {
   correctRecord,
   eventAppend,
   feedbackRecords,
+  getEvent,
   getRecord,
+  listEpisodes,
   listRecords,
+  rangeEvents,
   reactivateRecord,
   recallRecords,
+  recordSources,
   rememberRecord,
   retireRecord,
   searchRecords,
   type RecallVectorInput,
 } from "./store.js";
+import { episodeWindows, maintainEpisodes } from "./episodes.js";
 import { drainProjection } from "./projection.js";
 import { applyResponseBudget, fail } from "./protocol.js";
 import { normalizeBody } from "./normalize.js";
@@ -92,6 +97,16 @@ function runOpSync(db: DatabaseSync, req: Req, vector?: RecallVectorInput) {
       return getRecord(db, cfg, req.params);
     case "record.list":
       return listRecords(db, cfg, req.params);
+    case "record.sources":
+      return recordSources(db, cfg, req.params);
+    case "event.get":
+      return getEvent(db, cfg, req.params);
+    case "event.range":
+      return rangeEvents(db, cfg, req.params);
+    case "episode.list":
+      return listEpisodes(db, cfg, req.params);
+    case "episode.windows":
+      return episodeWindows(db, cfg, req.params);
     case "record.recall":
       return recallRecords(db, cfg, req.params, undefined, vector);
     case "record.search":
@@ -127,6 +142,12 @@ function runOpSync(db: DatabaseSync, req: Req, vector?: RecallVectorInput) {
 }
 
 async function runOpAsync(db: DatabaseSync, req: Req, workerStartMs: number) {
+  if (req.op === "maintain.episodes") {
+    if (typeof req.idempotencyKey !== "string") {
+      return applyResponseBudget(fail("BAD_REQUEST"), req.config.limits.responseMaxBytes);
+    }
+    return maintainEpisodes(db, req.config, req.configPath, req.params, req.idempotencyKey);
+  }
   if (req.op === "maintain.distill") {
     if (typeof req.idempotencyKey !== "string") {
       return applyResponseBudget(fail("BAD_REQUEST"), req.config.limits.responseMaxBytes);

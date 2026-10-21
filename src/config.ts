@@ -11,6 +11,13 @@ export interface LimitsConfig {
   limitMax: number;
   snippetMaxCp: number;
   responseMaxBytes: number;
+  /**
+   * P1 raw-read bounds. Optional in the interface so existing programmatic
+   * configs keep compiling; loadConfig fills the documented defaults.
+   */
+  rawBodyMaxCp?: number;
+  rawPageMaxCp?: number;
+  rangeLimitMax?: number;
 }
 
 export interface TimeoutsConfig {
@@ -56,6 +63,22 @@ export interface MaintenanceConfig {
   timeoutMs: number;
 }
 
+/**
+ * P2 episode derivation bounds (startup-only, optional). Absent uses the
+ * documented defaults. utcOffsetMinutes only shifts the `day` episode key;
+ * stored timestamps stay canonical UTC.
+ */
+export interface EpisodesConfig {
+  /** Local-day offset from UTC in minutes (default 0). */
+  utcOffsetMinutes: number;
+  /** Max code points of raw events folded into one window (default 1200). */
+  windowMaxCp: number;
+  /** Max new tokens per episode summary generation (default 128). */
+  maxNewTokens: number;
+  /** Max episodes processed per batch (default 5). */
+  batchMax: number;
+}
+
 export interface AppConfig {
   dbPath: string;
   vaultPath: string;
@@ -71,6 +94,8 @@ export interface AppConfig {
   llm?: LlmConfig;
   /** M3 maintenance deadline (optional; absent uses the default long budget). */
   maintenance?: MaintenanceConfig;
+  /** P2 episode derivation bounds (optional; absent uses documented defaults). */
+  episodes?: EpisodesConfig;
   /**
    * F-I01-05 (optional boolean, default false): when true, event.append and
    * record.remember without a `privacy` object are BAD_REQUEST (no side
@@ -90,6 +115,7 @@ const TOP_KEYS = [
   "cultivation",
   "llm",
   "maintenance",
+  "episodes",
   "requirePrivacy",
 ] as const;
 const LIMIT_KEYS = [
@@ -102,6 +128,9 @@ const LIMIT_KEYS = [
   "limitMax",
   "snippetMaxCp",
   "responseMaxBytes",
+  "rawBodyMaxCp",
+  "rawPageMaxCp",
+  "rangeLimitMax",
 ] as const;
 const TIMEOUT_KEYS = ["cliMs", "busyMs"] as const;
 
@@ -223,6 +252,27 @@ export function loadConfig(configPath: string): AppConfig {
   const limitMax = lim["limitMax"] as number;
   if (limitDefault > limitMax) {
     throw new Error("limits.limitDefault must be <= limits.limitMax");
+  }
+  const rawBodyMaxCpRaw = lim["rawBodyMaxCp"] ?? RAW_BODY_MAX_CP_DEFAULT;
+  const eRb = checkRange("limits.rawBodyMaxCp", rawBodyMaxCpRaw, 1, 65536);
+  if (eRb) throw new Error(eRb);
+  const rawBodyMaxCp = rawBodyMaxCpRaw as number;
+  const rawPageMaxCpRaw = lim["rawPageMaxCp"] ?? RAW_PAGE_MAX_CP_DEFAULT;
+  const eRp = checkRange("limits.rawPageMaxCp", rawPageMaxCpRaw, 1, 65536);
+  if (eRp) throw new Error(eRp);
+  const rawPageMaxCp = rawPageMaxCpRaw as number;
+  // An omitted rangeLimitMax must never make a valid limitDefault (51..100)
+  // fail startup: default it to at least limitDefault. An explicitly set
+  // value keeps the strict cross-check below.
+  const hasRangeLimitMax = lim["rangeLimitMax"] !== undefined;
+  const rangeLimitMaxRaw = hasRangeLimitMax
+    ? lim["rangeLimitMax"]
+    : Math.max(RANGE_LIMIT_MAX_DEFAULT, limitDefault);
+  const eRl = checkRange("limits.rangeLimitMax", rangeLimitMaxRaw, 1, 1000);
+  if (eRl) throw new Error(eRl);
+  const rangeLimitMax = rangeLimitMaxRaw as number;
+  if (hasRangeLimitMax && limitDefault > rangeLimitMax) {
+    throw new Error("limits.limitDefault must be <= limits.rangeLimitMax");
   }
 
   if (!isPlainObject(timeouts)) throw new Error("timeouts must be an object");
@@ -346,6 +396,35 @@ export function loadConfig(configPath: string): AppConfig {
     maintenance = { timeoutMs: timeoutMs as number };
   }
 
+  let episodes: EpisodesConfig | undefined;
+  if ("episodes" in parsed && (parsed as Record<string, unknown>)["episodes"] !== undefined) {
+    const ep = (parsed as Record<string, unknown>)["episodes"];
+    if (!isPlainObject(ep)) throw new Error("episodes must be an object");
+    for (const k of Object.keys(ep)) {
+      if (!["utcOffsetMinutes", "windowMaxCp", "maxNewTokens", "batchMax"].includes(k)) {
+        throw new Error(`unknown episodes field: ${k}`);
+      }
+    }
+    const utcOffsetMinutes = ep["utcOffsetMinutes"] ?? EPISODES_DEFAULT_UTC_OFFSET_MINUTES;
+    const eO = checkRange("episodes.utcOffsetMinutes", utcOffsetMinutes, -720, 840);
+    if (eO) throw new Error(eO);
+    const windowMaxCp = ep["windowMaxCp"] ?? EPISODES_DEFAULT_WINDOW_MAX_CP;
+    const eW = checkRange("episodes.windowMaxCp", windowMaxCp, 200, 4000);
+    if (eW) throw new Error(eW);
+    const maxNewTokens = ep["maxNewTokens"] ?? EPISODES_DEFAULT_MAX_NEW_TOKENS;
+    const eN = checkRange("episodes.maxNewTokens", maxNewTokens, 16, 256);
+    if (eN) throw new Error(eN);
+    const batchMax = ep["batchMax"] ?? EPISODES_DEFAULT_BATCH_MAX;
+    const eB = checkRange("episodes.batchMax", batchMax, 1, 50);
+    if (eB) throw new Error(eB);
+    episodes = {
+      utcOffsetMinutes: utcOffsetMinutes as number,
+      windowMaxCp: windowMaxCp as number,
+      maxNewTokens: maxNewTokens as number,
+      batchMax: batchMax as number,
+    };
+  }
+
   let requirePrivacy: boolean | undefined;
   if ("requirePrivacy" in parsed && (parsed as Record<string, unknown>)["requirePrivacy"] !== undefined) {
     const rp = (parsed as Record<string, unknown>)["requirePrivacy"];
@@ -367,6 +446,9 @@ export function loadConfig(configPath: string): AppConfig {
       limitMax: limitMax,
       snippetMaxCp: lim["snippetMaxCp"] as number,
       responseMaxBytes: lim["responseMaxBytes"] as number,
+      rawBodyMaxCp,
+      rawPageMaxCp,
+      rangeLimitMax,
     },
     timeouts: {
       cliMs: to["cliMs"] as number,
@@ -377,8 +459,28 @@ export function loadConfig(configPath: string): AppConfig {
     ...(cultivation ? { cultivation } : {}),
     ...(llm ? { llm } : {}),
     ...(maintenance ? { maintenance } : {}),
+    ...(episodes ? { episodes } : {}),
     ...(requirePrivacy !== undefined ? { requirePrivacy } : {}),
   };
+}
+
+/** P1 raw-read defaults (applied when the limits keys are absent). */
+export const RAW_BODY_MAX_CP_DEFAULT = 8000;
+export const RAW_PAGE_MAX_CP_DEFAULT = 2000;
+export const RANGE_LIMIT_MAX_DEFAULT = 50;
+
+/** Resolved raw-read bounds for programmatic configs that omit the keys. */
+export function rawBodyMaxCp(config: AppConfig): number {
+  return config.limits.rawBodyMaxCp ?? RAW_BODY_MAX_CP_DEFAULT;
+}
+export function rawPageMaxCp(config: AppConfig): number {
+  return config.limits.rawPageMaxCp ?? RAW_PAGE_MAX_CP_DEFAULT;
+}
+export function rangeLimitMax(config: AppConfig): number {
+  return (
+    config.limits.rangeLimitMax ??
+    Math.max(RANGE_LIMIT_MAX_DEFAULT, config.limits.limitDefault)
+  );
 }
 
 /** M3 local-LLM + maintenance defaults (startup-only; documented in docs/retention.md). */
@@ -387,6 +489,22 @@ export const LLM_DEFAULT_TIMEOUT_MS = 60000;
 export const LLM_DEFAULT_MAX_NEW_TOKENS = 48;
 export const LLM_DEFAULT_MAX_PROMPT_CHARS = 2000;
 export const MAINTENANCE_DEFAULT_TIMEOUT_MS = 120000;
+
+/** P2 episode defaults (startup-only; documented in memory.config.example.json). */
+export const EPISODES_DEFAULT_UTC_OFFSET_MINUTES = 0;
+export const EPISODES_DEFAULT_WINDOW_MAX_CP = 1200;
+export const EPISODES_DEFAULT_MAX_NEW_TOKENS = 128;
+export const EPISODES_DEFAULT_BATCH_MAX = 5;
+
+export function episodesBounds(config: AppConfig): Required<EpisodesConfig> {
+  return {
+    utcOffsetMinutes:
+      config.episodes?.utcOffsetMinutes ?? EPISODES_DEFAULT_UTC_OFFSET_MINUTES,
+    windowMaxCp: config.episodes?.windowMaxCp ?? EPISODES_DEFAULT_WINDOW_MAX_CP,
+    maxNewTokens: config.episodes?.maxNewTokens ?? EPISODES_DEFAULT_MAX_NEW_TOKENS,
+    batchMax: config.episodes?.batchMax ?? EPISODES_DEFAULT_BATCH_MAX,
+  };
+}
 
 export function llmBounds(config: AppConfig): Required<LlmConfig> {
   return {
