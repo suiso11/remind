@@ -21,11 +21,14 @@ import {
   EPISODE_WINDOW_TAG,
   EPISODE_WINDOW_VERBATIM_TAG,
   anchorTokens,
+  buildEpisodeClaimPrompt,
+  buildEpisodeVerifyPrompt,
   dominantScript,
   episodeWindows,
   maintainEpisodes,
   missingAnchorTokens,
   promptLanguageFor,
+  verificationFits,
   type EpisodesGenerate,
 } from "../src/episodes.js";
 import {
@@ -110,6 +113,7 @@ function append(
     createdAt: string;
     sessionId?: string;
     docId?: string;
+    privacy?: { sensitivity: "normal" | "sensitive"; origin: "conversation" | "self_activity" };
   },
 ): void {
   const sessionId = opts.sessionId ?? "s1";
@@ -124,8 +128,34 @@ function append(
   if (opts.docId !== undefined) {
     params["chunk"] = { docId: opts.docId, seq: 0 };
   }
+  if (opts.privacy !== undefined) {
+    params["privacy"] = opts.privacy;
+  }
   const r = eventAppend(ctx.db, ctx.config, params, `ev-${opts.eventId}`, opts.createdAt);
   assert.equal(r.ok, true, JSON.stringify(r));
+}
+
+/** Minimal model-file layout so an injected generator is considered usable. */
+function enableFakeLlm(ctx: Ctx, maxPromptChars: number): void {
+  const modelDir = path.join(ctx.dir, "fake-llm");
+  fs.mkdirSync(path.join(modelDir, "onnx"), { recursive: true });
+  for (const f of [
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "onnx/model_q4.onnx",
+  ]) {
+    fs.writeFileSync(path.join(modelDir, f), "{}");
+  }
+  ctx.config.llm = {
+    modelDir,
+    timeoutMs: 5000,
+    enabled: true,
+    maxNewTokens: 48,
+    maxPromptChars,
+  };
 }
 
 /** Deterministic word body long enough to span several windows. */
@@ -233,6 +263,7 @@ interface Rec {
   tags: string[];
   links: string[];
   sourceRefs: string[];
+  privacy: { sensitivity: string; origin: string } | null;
 }
 
 function okData<T>(res: ResponseEnvelope): T {
@@ -604,7 +635,7 @@ describe("maintain.episodes windows, links, and reduce", () => {
       const ep = run.episodes[0]!;
       assert.ok(ep.windowsWritten > 0);
       assert.equal(ep.episodeRecordId, null);
-      assert.equal(ep.coveredThrough, null);
+      assert.equal(ep.coveredThrough, T0); // event is done even though reduce failed
       assert.ok(windowRows(ctx, "ev-r").length > 0);
       assert.equal(episodeRows(ctx).length, 0);
 
@@ -1130,10 +1161,14 @@ describe("maintain.episodes rerun, degradation, and idempotency", () => {
       const beforeCounts = stateCounts(ctx);
 
       // Simulate a crash after the window record committed but before its
-      // ledger row (and the episode-level ledger row) were written.
+      // ledger row, the done marker, and the episode-level ledger row were
+      // written (the done marker is atomic with the last window ledger row).
       const lost = beforeRows[0]!;
       ctx.db.prepare(`DELETE FROM episode_summaries WHERE recordId = ? AND level = 'window'`).run(lost.recordId);
       ctx.db.prepare(`DELETE FROM episode_summaries WHERE level = 'episode'`).run();
+      ctx.db
+        .prepare(`DELETE FROM episode_event_done WHERE scope = ? AND eventId = ?`)
+        .run(SCOPE, lost.eventId);
       assert.equal(windowRows(ctx).length, beforeRows.length - 1);
       assert.equal(episodeRows(ctx).length, 0);
 
@@ -1163,6 +1198,144 @@ describe("maintain.episodes rerun, degradation, and idempotency", () => {
       assert.equal(listed.items[0]!.stale, false);
       assert.deepEqual(listed.items[0]!.summaryRecordIds, [ep1.episodeRecordId]);
     } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("retries an event whose observation order is later than its creation order", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      // Processing order is observedAt ASC: A first (T0), B second (T1).
+      // B was created earlier than A, so a createdAt watermark would consider
+      // B covered after A succeeded and skip it forever.
+      append(ctx, {
+        eventId: "ev-order-a",
+        body: "alpha was observed first but created last",
+        observedAt: T0,
+        createdAt: T2,
+      });
+      append(ctx, {
+        eventId: "ev-order-b",
+        body: "beta was observed second but created first",
+        observedAt: T1,
+        createdAt: T1,
+      });
+
+      const base = makeGen();
+      const flaky: EpisodesGenerate = async (prompt, tokens) => {
+        const isReduce = /Write 1-3 sentences|1〜3文で書いてください/.test(prompt);
+        if (!isReduce && prompt.includes("beta")) return null;
+        return base(prompt, tokens);
+      };
+
+      const run1 = episodeData(await maintain(ctx, "ep-order-1", flaky, RUN1));
+      const ep1 = run1.episodes[0]!;
+      assert.equal(ep1.windowsWritten, 1); // only A
+      assert.equal(ep1.windowsRejected, 1); // B timed out
+      assert.equal(ep1.coveredThrough, T0); // max observedAt of done events only
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, true);
+      assert.deepEqual(
+        windowRows(ctx).map((r) => r.eventId),
+        ["ev-order-a"],
+      );
+
+      const run2 = episodeData(await maintain(ctx, "ep-order-2", makeGen(), RUN2));
+      const ep2 = run2.episodes[0]!;
+      assert.equal(ep2.windowsWritten, 1); // B is retried, not skipped
+      assert.equal(ep2.windowsRejected, 0);
+      assert.equal(ep2.coveredThrough, T1);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+      assert.deepEqual(
+        windowRows(ctx)
+          .map((r) => r.eventId)
+          .sort(),
+        ["ev-order-a", "ev-order-b"],
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("retries an event after a createdAt tie rather than treating the tie as coverage", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      append(ctx, {
+        eventId: "ev-tie-a",
+        body: "alpha tie created equal",
+        observedAt: T0,
+        createdAt: T0,
+      });
+      append(ctx, {
+        eventId: "ev-tie-b",
+        body: "beta tie created equal",
+        observedAt: T1,
+        createdAt: T0,
+      });
+
+      const base = makeGen();
+      const flaky: EpisodesGenerate = async (prompt, tokens) => {
+        const isReduce = /Write 1-3 sentences|1〜3文で書いてください/.test(prompt);
+        if (!isReduce && prompt.includes("beta")) return null;
+        return base(prompt, tokens);
+      };
+
+      const run1 = episodeData(await maintain(ctx, "ep-tie-1", flaky, RUN1));
+      assert.equal(run1.episodes[0]!.windowsWritten, 1);
+      assert.equal(run1.episodes[0]!.windowsRejected, 1);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, true);
+
+      const run2 = episodeData(await maintain(ctx, "ep-tie-2", makeGen(), RUN2));
+      assert.equal(run2.episodes[0]!.windowsWritten, 1);
+      assert.equal(run2.episodes[0]!.coveredThrough, T1);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("does not commit canonical or ledger writes after the lease is stolen", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      append(ctx, {
+        eventId: "ev-fence",
+        body: "lease fence body",
+        observedAt: T0,
+        createdAt: T0,
+      });
+      const before = counts(ctx);
+      const base = makeGen();
+      let stolen = false;
+      const thief: EpisodesGenerate = async (prompt, tokens) => {
+        if (!stolen && /You verify a summary|要約を検証/.test(prompt)) {
+          // Force a steal: RUN2 is beyond the lease acquired at RUN1.
+          const got = acquireCultivationLease(ctx.db, ctx.config, {
+            owner: "thief",
+            scope: SCOPE,
+            now: RUN2,
+          });
+          assert.equal(got.acquired, true);
+          stolen = true;
+        }
+        return base(prompt, tokens);
+      };
+
+      const res = await maintain(ctx, "ep-fence", thief, RUN1);
+      assert.equal(res.code, "CONFLICT");
+      assert.equal(stolen, true);
+      // The window write transaction rolled back: no canonical record, no
+      // window/done/episode ledger rows, and no idempotency envelope.
+      assert.deepEqual(counts(ctx), before);
+      assert.equal(windowRows(ctx).length, 0);
+      assert.equal(episodeRows(ctx).length, 0);
+      const done = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM episode_event_done`)
+        .get() as unknown as { n: number };
+      assert.equal(done.n, 0);
+    } finally {
+      releaseCultivationLease(ctx.db, "thief");
       ctx.cleanup();
     }
   });
@@ -1209,6 +1382,128 @@ describe("maintain.episodes rerun, degradation, and idempotency", () => {
       assert.ok(paged.items.every((i) => i.truncated === false));
       // episode.windows returns summary snippets; spans above are the raw tiles.
       assert.ok(paged.items.every((i) => i.snippet === "window summary"));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("maintain.episodes privacy propagation and verification budgets", () => {
+  it("never truncates the candidate and rejects prompts with too little source", () => {
+    const source = "alpha source text";
+    const longCandidate = Array.from({ length: 120 }, () => "summary").join(" ");
+    const shortCandidate = "short summary";
+
+    assert.equal(verificationFits(source, longCandidate, 500), false);
+    assert.equal(buildEpisodeVerifyPrompt(source, longCandidate, 500), null);
+    assert.equal(buildEpisodeClaimPrompt(source, longCandidate, 500), null);
+
+    assert.equal(verificationFits(source, shortCandidate, 500), true);
+    const verify = buildEpisodeVerifyPrompt(source, shortCandidate, 500);
+    assert.notEqual(verify, null);
+    assert.ok(verify!.includes(shortCandidate)); // full candidate, not a prefix
+    const claim = buildEpisodeClaimPrompt(source, shortCandidate, 500);
+    assert.notEqual(claim, null);
+    assert.ok(claim!.includes(shortCandidate));
+  });
+
+  it("stores the window verbatim when the full candidate cannot be verified", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      enableFakeLlm(ctx, 500);
+      const rawBody = "alpha source text";
+      append(ctx, { eventId: "ev-budget", body: rawBody, observedAt: T0, createdAt: T0 });
+      const longCandidate = Array.from({ length: 120 }, () => "summary").join(" ");
+
+      // The generator is willing to answer YES, but the verifier prompt can
+      // only fit the candidate by dropping the source, so no YES is requested.
+      const run = episodeData(
+        await maintain(ctx, "ep-budget-1", makeGen({ windowText: longCandidate }), RUN1),
+      );
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsWritten, 0);
+      assert.equal(ep.windowsVerbatim, 1);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const rows = windowRows(ctx);
+      assert.equal(rows.length, 1);
+      const w = rec(ctx, rows[0]!.recordId);
+      assert.equal(w.body, rawBody);
+      assert.ok(w.tags.includes(EPISODE_WINDOW_VERBATIM_TAG));
+      assert.equal(w.body.includes("summary"), false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("propagates privacy to windows and the episode record under requirePrivacy", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      ctx.config.requirePrivacy = true;
+      append(ctx, {
+        eventId: "ev-priv-normal",
+        body: "normal private source",
+        observedAt: T0,
+        createdAt: T0,
+        privacy: { sensitivity: "normal", origin: "conversation" },
+      });
+      append(ctx, {
+        eventId: "ev-priv-sensitive",
+        body: "sensitive private source",
+        observedAt: T1,
+        createdAt: T1,
+        privacy: { sensitivity: "sensitive", origin: "conversation" },
+      });
+
+      const run = episodeData(await maintain(ctx, "ep-priv-1", makeGen(), RUN1));
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsWritten, 2);
+      assert.equal(ep.windowsVerbatim, 0);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      for (const row of windowRows(ctx)) {
+        const expected = row.eventId === "ev-priv-sensitive" ? "sensitive" : "normal";
+        assert.deepEqual(rec(ctx, row.recordId).privacy, {
+          sensitivity: expected,
+          origin: "self_activity",
+        });
+      }
+      // Any sensitive source dominates: the episode is sensitive too.
+      assert.deepEqual(rec(ctx, ep.episodeRecordId as string).privacy, {
+        sensitivity: "sensitive",
+        origin: "self_activity",
+      });
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("leaves an event with unknown privacy pending instead of inventing privacy", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      // Legacy/unknown source written before strict privacy was enabled.
+      append(ctx, { eventId: "ev-priv-missing", body: "legacy body", observedAt: T0, createdAt: T0 });
+      ctx.config.requirePrivacy = true;
+
+      const before = stateCounts(ctx);
+      const run = episodeData(await maintain(ctx, "ep-priv-2", makeGen(), RUN1));
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsWritten, 0);
+      assert.equal(ep.windowsVerbatim, 0);
+      assert.equal(ep.episodeRecordId, null);
+      assert.equal(run.applied, 0);
+      assert.deepEqual(stateCounts(ctx), before);
+      assert.equal(windowRows(ctx).length, 0);
+      assert.equal(episodeRows(ctx).length, 0);
+      const done = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM episode_event_done`)
+        .get() as unknown as { n: number };
+      assert.equal(done.n, 0);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, true);
     } finally {
       ctx.cleanup();
     }

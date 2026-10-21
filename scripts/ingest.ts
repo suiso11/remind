@@ -24,6 +24,7 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { countCp, loadConfig, rawBodyMaxCp } from "../src/config.js";
 import { initDb } from "../src/db.js";
+import { normalizeBody } from "../src/normalize.js";
 import { splitTextRanges } from "../src/split.js";
 import { eventAppend } from "../src/store.js";
 
@@ -120,7 +121,22 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const chunks = chunkText(text, rawBodyMaxCp(config));
+  const maxCp = rawBodyMaxCp(config);
+  const chunks = chunkText(text, maxCp);
+  // Fail closed before opening the store or appending anything: every chunk
+  // must satisfy the same raw and normalized bounds eventAppend enforces, and
+  // must normalize to non-empty content.
+  for (const chunk of chunks) {
+    const normalized = countCp(normalizeBody(chunk));
+    if (countCp(chunk) > maxCp || normalized > maxCp) {
+      process.stderr.write("error: ingest failed LIMIT_EXCEEDED\n");
+      process.exit(2);
+    }
+    if (normalized < 1) {
+      process.stderr.write("error: ingest failed BAD_REQUEST\n");
+      process.exit(2);
+    }
+  }
   const effectiveSession = session ?? `doc:${docId}`;
   const effectiveSource = source ?? sourceFromBasename(path.basename(filePath));
   const derived = chunks.map((_, seq) => ({

@@ -67,6 +67,7 @@ import {
   RETIRE_REASONS,
   enqueueCultivationReview,
   ensureCultivationSchema,
+  isCultivationLeaseHeldBy,
 } from "./cultivation.js";
 import {
   applyResponseBudget,
@@ -369,10 +370,32 @@ export function ensureM1Schema(db: DatabaseSync): void {
     spanStart INTEGER NULL,
     spanEnd INTEGER NULL,
     coveredThrough TEXT NULL,
+    foldedRecordIds TEXT NULL,
     createdAt TEXT,
     PRIMARY KEY(scope, kind, episodeKey, recordId))`);
+  // Additive column for databases created before the fold marker existed.
+  // Rows written by earlier builds keep NULL (no folded set), which reads as
+  // "nothing folded yet" and is repaired on the next maintenance pass.
+  const episodeColumns = db.prepare(`PRAGMA table_info(episode_summaries)`).all() as Array<{
+    name: string;
+  }>;
+  if (!episodeColumns.some((c) => c.name === "foldedRecordIds")) {
+    db.exec(`ALTER TABLE episode_summaries ADD COLUMN foldedRecordIds TEXT NULL`);
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_episode
     ON episode_summaries(scope, kind, episodeKey, level)`);
+  // Explicit per-event completion marker. An event is pending until its last
+  // verified/verbatim window transaction (or a no-op "all windows already
+  // present" repair) inserts this row. Unlike a createdAt watermark this is
+  // order-independent: observation order and tie timestamps cannot skip a
+  // failed event forever. Additive table; old databases gain it on init.
+  db.exec(`CREATE TABLE IF NOT EXISTS episode_event_done(
+    scope TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('session','doc','day')),
+    episodeKey TEXT NOT NULL,
+    eventId TEXT NOT NULL,
+    doneAt TEXT NOT NULL,
+    PRIMARY KEY(scope, kind, episodeKey, eventId))`);
   // Derived vector index (rebuildable; never canonical). One row per record:
   // L2-normalized float32 LE embedding of the normalized body (dim pinned).
   // Missing rows, dim mismatches, and non-finite/zero vectors are ignored by
@@ -1563,12 +1586,36 @@ function insertSourceRefs(
   }
 }
 
+/**
+ * Optional ownership fence for a canonical write (used by maintain.episodes).
+ * The whole write transaction is refused unless the caller still owns the live
+ * m3 lease; `afterInsert` runs inside that same transaction so a caller can
+ * commit its derived ledger rows atomically with the canonical record.
+ */
+export interface CanonicalWriteFence {
+  owner: string;
+  /** Timestamp used to evaluate lease liveness. */
+  now: string;
+  afterInsert?: (db: DatabaseSync, recordId: string) => void;
+}
+
+function assertCanonicalWriteFence(
+  db: DatabaseSync,
+  fence: CanonicalWriteFence | undefined,
+): void {
+  if (!fence) return;
+  if (!isCultivationLeaseHeldBy(db, fence.owner, fence.now)) {
+    throw new Error("lease lost");
+  }
+}
+
 export function rememberRecord(
   db: DatabaseSync,
   config: AppConfig,
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride?: string,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   const parsed = parseRememberParams(config, params);
   if (!parsed.ok) return budgeted(parsed.res, config);
@@ -1638,6 +1685,9 @@ export function rememberRecord(
   let committed: ResponseEnvelope;
   try {
     committed = withTransaction(db, (): ResponseEnvelope => {
+      // Ownership fence evaluated inside this canonical transaction: a lease
+      // stolen during inference rolls the whole write back.
+      assertCanonicalWriteFence(db, fence);
       // Re-verify refs inside the txn (fail closed on concurrent change).
       verifySourceRefsInTxn(db, n.scope, n.sourceRefs);
       const probe: ResponseEnvelope = ok({ record: { id } });
@@ -1655,6 +1705,7 @@ export function rememberRecord(
       }
       insertSourceRefs(db, id, n.sourceRefs);
       db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(id, now);
+      fence?.afterInsert?.(db, id);
       const stored = budgeted(probe, config);
       db.prepare(
         `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
@@ -1687,6 +1738,7 @@ export function rememberRecord(
     bestEffortIndexNote(db, id, n.bodyNorm);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "lease lost") return budgeted(fail("CONFLICT"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "source lost") return budgeted(fail("NOT_FOUND"), config);
@@ -2384,6 +2436,12 @@ export interface EpisodeSummaryInput {
   spanStart?: number | null;
   spanEnd?: number | null;
   coveredThrough?: string | null;
+  /**
+   * Window recordIds folded into this episode-level row. Used as the explicit
+   * "already reduced" marker for staleness; never a timestamp. Ignored for
+   * level='window'.
+   */
+  foldedRecordIds?: string[] | null;
   createdAt: string;
 }
 
@@ -2398,7 +2456,29 @@ export interface EpisodeSummaryRow {
   spanStart: number | null;
   spanEnd: number | null;
   coveredThrough: string | null;
+  foldedRecordIds: string[];
   createdAt: string;
+}
+
+/** Per-event completion row (explicit pending marker complement). */
+export interface EpisodeEventDoneInput {
+  scope: string;
+  kind: EpisodeKind;
+  episodeKey: string;
+  eventId: string;
+  doneAt: string;
+}
+
+/**
+ * Mark one raw event fully processed. No transaction is opened here so the
+ * caller can write it in the same transaction as the event's last window (or
+ * its ledger repair). Re-marking is idempotent.
+ */
+export function insertEpisodeEventDone(db: DatabaseSync, row: EpisodeEventDoneInput): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO episode_event_done(scope, kind, episodeKey, eventId, doneAt)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(row.scope, row.kind, row.episodeKey, row.eventId, row.doneAt);
 }
 
 /**
@@ -2410,8 +2490,8 @@ export function insertEpisodeSummary(db: DatabaseSync, row: EpisodeSummaryInput)
   db.prepare(
     `INSERT OR REPLACE INTO episode_summaries(
        scope, kind, episodeKey, level, recordId, eventId,
-       spanStart, spanEnd, coveredThrough, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     row.scope,
     row.kind,
@@ -2422,8 +2502,22 @@ export function insertEpisodeSummary(db: DatabaseSync, row: EpisodeSummaryInput)
     row.spanStart ?? null,
     row.spanEnd ?? null,
     row.coveredThrough ?? null,
+    row.foldedRecordIds === undefined || row.foldedRecordIds === null
+      ? null
+      : JSON.stringify(row.foldedRecordIds),
     row.createdAt,
   );
+}
+
+function parseFoldedRecordIds(raw: unknown): string[] {
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((v): v is string => typeof v === "string");
+  } catch {
+    return [];
+  }
 }
 
 /** Read derived episode ledger rows (optionally filtered to one level). */
@@ -2435,7 +2529,7 @@ export function listEpisodeSummaries(
   level?: EpisodeLevel,
 ): EpisodeSummaryRow[] {
   let sql = `SELECT scope, kind, episodeKey, level, recordId, eventId,
-                    spanStart, spanEnd, coveredThrough, createdAt
+                    spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt
              FROM episode_summaries
              WHERE scope = ? AND kind = ? AND episodeKey = ?`;
   const args: Array<string> = [scope, kind, episodeKey];
@@ -2444,7 +2538,13 @@ export function listEpisodeSummaries(
     args.push(level);
   }
   sql += ` ORDER BY createdAt DESC, recordId ASC`;
-  return db.prepare(sql).all(...args) as unknown as EpisodeSummaryRow[];
+  const rows = db.prepare(sql).all(...args) as unknown as Array<
+    Omit<EpisodeSummaryRow, "foldedRecordIds"> & { foldedRecordIds: string | null }
+  >;
+  return rows.map((row) => ({
+    ...row,
+    foldedRecordIds: parseFoldedRecordIds(row.foldedRecordIds),
+  }));
 }
 
 function encodeEpisodeCursor(startAt: string, episodeKey: string): string {
@@ -2577,29 +2677,61 @@ export function listEpisodes(
       const shown = rows.slice(0, nLimit);
       const summaryStmt = db.prepare(
         `SELECT s.recordId AS recordId, s.coveredThrough AS coveredThrough,
-                r.status AS status
+                s.foldedRecordIds AS foldedRecordIds, r.status AS status
          FROM episode_summaries s
          LEFT JOIN records r ON r.id = s.recordId
          WHERE s.scope = ? AND s.kind = ? AND s.episodeKey = ? AND s.level = 'episode'
          ORDER BY s.createdAt DESC, s.recordId ASC`,
       );
+      const eventPredicate =
+        nKind === "session"
+          ? "e.sessionId = ?"
+          : nKind === "doc"
+            ? "e.docId = ?"
+            : "date(e.observedAt, ?) = ?";
+      const pendingStmt = db.prepare(
+        `SELECT 1 AS found FROM raw_events e
+         WHERE e.scope = ? AND ${eventPredicate}
+           AND NOT EXISTS (
+             SELECT 1 FROM episode_event_done d
+             WHERE d.scope = e.scope AND d.kind = ? AND d.episodeKey = ?
+               AND d.eventId = e.eventId)
+         LIMIT 1`,
+      );
+      const windowStmt = db.prepare(
+        `SELECT w.recordId AS recordId FROM episode_summaries w
+         JOIN records rw ON rw.id = w.recordId AND rw.status = 'active'
+         WHERE w.scope = ? AND w.kind = ? AND w.episodeKey = ? AND w.level = 'window'`,
+      );
       const items = shown.map((r) => {
         const summaries = summaryStmt.all(nScope, nKind, r.episodeKey) as Array<{
           recordId: string;
           coveredThrough: string | null;
+          foldedRecordIds: string | null;
           status: string | null;
         }>;
-        let covered: string | null = null;
-        for (const s of summaries) {
-          if (s.coveredThrough !== null && s.coveredThrough !== undefined) {
-            if (covered === null || s.coveredThrough > covered) covered = s.coveredThrough;
-          }
-        }
         const summaryRecordIds = summaries
           .filter((s) => s.status === "active")
           .map((s) => s.recordId);
-        const stale =
-          summaries.length === 0 || covered === null || r.maxCreatedAt > covered;
+        // Explicit fold markers from every episode-level row. Timestamps are
+        // never used to decide staleness: picking the "latest" row by
+        // createdAt would be ambiguous on ties (and could resurrect an
+        // already-folded window). A window counts as folded if any reduce
+        // ever included it.
+        const folded = new Set<string>();
+        for (const s of summaries) {
+          for (const id of parseFoldedRecordIds(s.foldedRecordIds)) folded.add(id);
+        }
+        const pendingArgs: Array<string | number> =
+          nKind === "day"
+            ? [nScope, offsetModifier, r.episodeKey, nKind, r.episodeKey]
+            : [nScope, r.episodeKey, nKind, r.episodeKey];
+        const pending = pendingStmt.get(...pendingArgs) !== undefined;
+        const windows = windowStmt.all(nScope, nKind, r.episodeKey) as Array<{
+          recordId: string;
+        }>;
+        const unfolded = windows.some((w) => !folded.has(w.recordId));
+        const stale = pending || unfolded;
         return {
           kind: nKind,
           episodeKey: r.episodeKey,
@@ -3317,6 +3449,7 @@ export function correctRecord(
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride?: string,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
   const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId", "privacy"]);
@@ -3417,6 +3550,7 @@ export function correctRecord(
   let committed: ResponseEnvelope;
   try {
     committed = withTransaction(db, (): ResponseEnvelope => {
+      assertCanonicalWriteFence(db, fence);
       let target: { scope: string; status: string; revision: number; privacySensitivity: string | null; privacyOrigin: string | null } | undefined;
       try {
         target = db
@@ -3455,6 +3589,7 @@ export function correctRecord(
       }
       insertSourceRefs(db, newId, nRefs);
       db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(newId, now);
+      fence?.afterInsert?.(db, newId);
       const stored = budgeted(probe, config);
       db.prepare(
         `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
@@ -3493,6 +3628,7 @@ export function correctRecord(
     return committed;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "lease lost") return budgeted(fail("CONFLICT"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "missing" || msg === "source lost") {
@@ -3539,6 +3675,7 @@ export function archiveRecord(
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride?: string,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
   const allowed = new Set(["id", "scope", "reasonCode"]);
@@ -3581,6 +3718,7 @@ export function archiveRecord(
   let committed: ResponseEnvelope;
   try {
     committed = withTransaction(db, (): ResponseEnvelope => {
+      assertCanonicalWriteFence(db, fence);
       let target: { scope: string; status: string } | undefined;
       try {
         target = db.prepare(`SELECT scope, status FROM records WHERE id = ?`).get(id) as
@@ -3636,6 +3774,7 @@ export function archiveRecord(
     return committed;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "lease lost") return budgeted(fail("CONFLICT"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "missing") return budgeted(fail("NOT_FOUND"), config);

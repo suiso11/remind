@@ -6,7 +6,13 @@
  * breaks ("\n"), then a hard cut on a code-point boundary, so surrogate
  * pairs are never split. Whitespace-only ranges are not emitted (matching
  * the historical ingest chunker); ranges never overlap and are in order.
+ *
+ * `eventAppend` bounds both the raw body and `normalizeBody(body)`. NFKC can
+ * expand code points (e.g. U+2026 "…" -> "..."), so a raw chunk within the
+ * limit can still be rejected after normalization. Boundaries are therefore
+ * chosen so both counts stay within `maxCp`.
  */
+import { countCp } from "./config.js";
 import { normalizeBody } from "./normalize.js";
 
 export interface TextRange {
@@ -16,10 +22,17 @@ export interface TextRange {
   end: number;
 }
 
+/** Exactly the normalized length `eventAppend` enforces. */
+function normalizedCp(cps: string[], start: number, end: number): number {
+  return countCp(normalizeBody(cps.slice(start, end).join("")));
+}
+
 /**
- * Split `text` into ranges of at most `maxCp` code points. Boundary search is
- * limited to the first `maxCp` code points of the remaining text, so every
- * emitted range stays within the bound.
+ * Split `text` into ranges of at most `maxCp` code points before and after
+ * normalization. Boundary search starts from the first `maxCp` code points of
+ * the remaining text (paragraph -> line -> hard cut), then shrinks only when
+ * normalization would exceed the bound. Code-point granularity means a
+ * surrogate pair is never split.
  */
 export function splitTextRanges(text: string, maxCp: number): TextRange[] {
   const cps = Array.from(text);
@@ -65,6 +78,32 @@ export function splitTextRanges(text: string, maxCp: number): TextRange[] {
       if (end < 0) end = limit;
     }
     if (end <= pos) end = Math.min(pos + cap, cps.length);
+    if (normalizedCp(cps, pos, end) > cap) {
+      // The raw boundary fits but NFKC expanded it past the limit. Find the
+      // largest smaller boundary whose normalized form fits. `lo` starts at
+      // the (normalized-empty) start, so a valid boundary is always retained
+      // under the mostly-monotone length function; verify and scan forward
+      // in the rare cases composition makes lengths dip non-monotonically.
+      let lo = pos;
+      let hi = end;
+      while (lo + 1 < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (normalizedCp(cps, pos, mid) <= cap) lo = mid;
+        else hi = mid;
+      }
+      if (lo === pos) {
+        for (let e = pos + 1; e < end; e++) {
+          if (normalizedCp(cps, pos, e) <= cap) {
+            lo = e;
+            break;
+          }
+        }
+      }
+      // No prefix can satisfy the bound (a single expanding code point with a
+      // tiny cap). Keep one code point so the caller can fail closed before
+      // committing instead of looping forever.
+      end = lo > pos ? lo : Math.min(pos + 1, cps.length);
+    }
     const chunk = cps.slice(pos, end).join("");
     if (normalizeBody(chunk).length > 0) ranges.push({ start: pos, end });
     pos = end;

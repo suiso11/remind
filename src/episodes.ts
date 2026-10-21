@@ -25,14 +25,18 @@
  *   failing event (retryable).
  * - llm disabled/missing => degraded OK with zero writes and zero state
  *   changes (no fake decisions, no heuristics).
- * - coveredThrough only advances over events whose windows all succeeded;
- *   window ledger rows make a partial-event retry idempotent.
+ * - coveredThrough is kept for response compatibility and reports the max
+ *   observedAt over events with an explicit episode_event_done row. It is NOT
+ *   used for staleness or selection: pending events and unfolded windows are
+ *   tracked explicitly (done rows + foldedRecordIds), so observation order and
+ *   creation-time ties cannot skip a failed event.
  */
 import { createHash, randomBytes } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
-import { episodesBounds, maintenanceTimeoutMs } from "./config.js";
-import { acquireCultivationLease, releaseCultivationLease } from "./cultivation.js";
+import { episodesBounds, maintenanceTimeoutMs, requirePrivacyEnabled } from "./config.js";
+import { acquireCultivationLease, isCultivationLeaseHeldBy, releaseCultivationLease } from "./cultivation.js";
+import { deriveConsolidationPrivacy, type PrivacyMetadata } from "./privacy.js";
 import {
   generateCompletion,
   llmEnabled,
@@ -50,10 +54,12 @@ import type { SourceRef } from "./sourceref.js";
 import {
   archiveRecord,
   correctRecord,
+  insertEpisodeEventDone,
   insertEpisodeSummary,
   isScopeAuthorized,
   listEpisodeSummaries,
   rememberRecord,
+  type CanonicalWriteFence,
   type EpisodeKind,
 } from "./store.js";
 
@@ -206,36 +212,96 @@ export function buildEpisodeWindowPrompt(text: string, maxPromptChars: number): 
   return tailClip(head + clipCp(text, budget) + tail, max);
 }
 
+/**
+ * Minimum source text a verifier must see (or the whole source when it is
+ * shorter). A candidate that only fits with less source than this cannot be
+ * verified meaningfully, so the caller treats it as a content rejection.
+ */
+export const EPISODE_VERIFY_MIN_SOURCE_CP = 200;
+
+interface VerificationTemplate {
+  head: string;
+  mid: string;
+  tail: string;
+}
+
+function verificationTemplate(lang: PromptLanguage): VerificationTemplate {
+  return lang === "cjk"
+    ? {
+        head:
+          "<|im_start|>system\nあなたは要約を検証します。YES または NO だけを出力し、それ以外は何も書かないでください。<|im_end|>\n" +
+          "<|im_start|>user\n本文：\n\"\"\"",
+        mid: "\"\"\"\n要約：\n\"\"\"",
+        tail:
+          "\"\"\"\n" +
+          namesInstruction(lang) +
+          "要約のすべての文が本文に支持されている場合は YES、そうでなければ NO と答えてください。<|im_end|>\n<|im_start|>assistant\n",
+      }
+    : {
+        head:
+          "<|im_start|>system\nYou verify a summary. Reply with only YES or NO and nothing else.<|im_end|>\n" +
+          "<|im_start|>user\nTEXT:\n\"\"\"",
+        mid: "\"\"\"\nSUMMARY:\n\"\"\"",
+        tail:
+          "\"\"\"\n" +
+          namesInstruction(lang) +
+          "Reply YES if every statement in SUMMARY is supported by TEXT. " +
+          "Otherwise reply NO.<|im_end|>\n<|im_start|>assistant\n",
+      };
+}
+
+interface VerificationBudget {
+  template: VerificationTemplate;
+  /** Code points available for the source text after the full candidate. */
+  available: number;
+  /** Full source when shorter than the minimum, else the minimum. */
+  minSource: number;
+  ok: boolean;
+}
+
+/**
+ * Budget the verifier template around the FULL candidate. The candidate is
+ * never clipped: a YES verdict must apply to exactly the candidate text the
+ * caller will store, so only the source may be shortened. When the remaining
+ * source budget is below the minimum (or the full source if shorter), the
+ * candidate is unverifiable and the builder returns null instead of asking a
+ * question about a prefix.
+ */
+function verificationBudget(
+  text: string,
+  candidate: string,
+  maxPromptChars: number,
+): VerificationBudget {
+  const max = clampMaxPromptChars(maxPromptChars);
+  const template = verificationTemplate(promptLanguageFor(text));
+  const overhead = cpLen(template.head) + cpLen(template.mid) + cpLen(template.tail);
+  const available = max - overhead - cpLen(candidate);
+  const minSource = Math.min(EPISODE_VERIFY_MIN_SOURCE_CP, cpLen(text));
+  return { template, available, minSource, ok: available >= minSource };
+}
+
+/**
+ * Exported decision (tests and callers): true only when the FULL candidate
+ * plus at least the minimum source text fit the verifier prompt budget.
+ */
+export function verificationFits(
+  text: string,
+  candidate: string,
+  maxPromptChars: number,
+): boolean {
+  return verificationBudget(text, candidate, maxPromptChars).ok;
+}
+
 /** Strict verification prompt: YES only when the summary is fully supported. */
 export function buildEpisodeVerifyPrompt(
   text: string,
   summary: string,
   maxPromptChars: number,
-): string {
-  const max = clampMaxPromptChars(maxPromptChars);
-  const lang = promptLanguageFor(text);
-  const head =
-    lang === "cjk"
-      ? "<|im_start|>system\nあなたは要約を検証します。YES または NO だけを出力し、それ以外は何も書かないでください。<|im_end|>\n" +
-        "<|im_start|>user\n本文：\n\"\"\""
-      : "<|im_start|>system\nYou verify a summary. Reply with only YES or NO and nothing else.<|im_end|>\n" +
-        "<|im_start|>user\nTEXT:\n\"\"\"";
-  const mid = lang === "cjk" ? "\"\"\"\n要約：\n\"\"\"" : "\"\"\"\nSUMMARY:\n\"\"\"";
-  const tail =
-    lang === "cjk"
-      ? "\"\"\"\n" +
-        namesInstruction(lang) +
-        "要約のすべての文が本文に支持されている場合は YES、そうでなければ NO と答えてください。<|im_end|>\n<|im_start|>assistant\n"
-      : "\"\"\"\n" +
-        namesInstruction(lang) +
-        "Reply YES if every statement in SUMMARY is supported by TEXT. " +
-        "Otherwise reply NO.<|im_end|>\n<|im_start|>assistant\n";
-  const budget = Math.max(0, max - cpLen(head) - cpLen(mid) - cpLen(tail));
-  const summaryBudget = Math.min(cpLen(summary), Math.floor(budget / 3));
-  const textBudget = Math.max(0, budget - summaryBudget);
-  const c = clipCp(summary, summaryBudget);
-  const t = clipCp(text, textBudget);
-  return tailClip(head + t + mid + c + tail, max);
+): string | null {
+  const b = verificationBudget(text, summary, maxPromptChars);
+  if (!b.ok) return null;
+  const { head, mid, tail } = b.template;
+  return head + clipCp(text, b.available) + mid + summary + tail;
 }
 
 /**
@@ -287,37 +353,67 @@ export function buildEpisodeCitedReducePrompt(
   return tailClip(head + body + tail, max);
 }
 
+function claimTemplate(lang: PromptLanguage): VerificationTemplate {
+  return lang === "cjk"
+    ? {
+        head:
+          "<|im_start|>system\nあなたは主張を検証します。YES または NO だけを出力し、それ以外は何も書かないでください。<|im_end|>\n" +
+          "<|im_start|>user\n本文：\n\"\"\"",
+        mid: "\"\"\"\n主張：\n\"\"\"",
+        tail:
+          "\"\"\"\n" +
+          namesInstruction(lang) +
+          "主張のすべての文が本文に支持されている場合は YES、そうでなければ NO と答えてください。<|im_end|>\n<|im_start|>assistant\n",
+      }
+    : {
+        head:
+          "<|im_start|>system\nYou verify a claim. Reply with only YES or NO and nothing else.<|im_end|>\n" +
+          "<|im_start|>user\nTEXT:\n\"\"\"",
+        mid: "\"\"\"\nCLAIM:\n\"\"\"",
+        tail:
+          "\"\"\"\n" +
+          namesInstruction(lang) +
+          "Reply YES if every statement in CLAIM is supported by TEXT. " +
+          "Otherwise reply NO.<|im_end|>\n<|im_start|>assistant\n",
+      };
+}
+
+function claimBudget(
+  text: string,
+  claim: string,
+  maxPromptChars: number,
+): VerificationBudget {
+  const max = clampMaxPromptChars(maxPromptChars);
+  const template = claimTemplate(promptLanguageFor(text));
+  const overhead = cpLen(template.head) + cpLen(template.mid) + cpLen(template.tail);
+  const available = max - overhead - cpLen(claim);
+  const minSource = Math.min(EPISODE_VERIFY_MIN_SOURCE_CP, cpLen(text));
+  return { template, available, minSource, ok: available >= minSource };
+}
+
 /**
  * Strict per-sentence claim verification against the cited RAW text (not a
- * summary). The instruction tail is preserved when the raw text is clipped.
+ * summary). The full claim is always shown; only the raw text may be clipped.
+ * Returns null when the full claim leaves too little raw text to verify.
  */
 export function buildEpisodeClaimPrompt(
   text: string,
   claim: string,
   maxPromptChars: number,
-): string {
-  const max = clampMaxPromptChars(maxPromptChars);
-  const lang = promptLanguageFor(text);
-  const head =
-    lang === "cjk"
-      ? "<|im_start|>system\nあなたは主張を検証します。YES または NO だけを出力し、それ以外は何も書かないでください。<|im_end|>\n" +
-        "<|im_start|>user\n本文：\n\"\"\""
-      : "<|im_start|>system\nYou verify a claim. Reply with only YES or NO and nothing else.<|im_end|>\n" +
-        "<|im_start|>user\nTEXT:\n\"\"\"";
-  const mid = lang === "cjk" ? "\"\"\"\n主張：\n\"\"\"" : "\"\"\"\nCLAIM:\n\"\"\"";
-  const tail =
-    lang === "cjk"
-      ? "\"\"\"\n" +
-        namesInstruction(lang) +
-        "主張のすべての文が本文に支持されている場合は YES、そうでなければ NO と答えてください。<|im_end|>\n<|im_start|>assistant\n"
-      : "\"\"\"\n" +
-        namesInstruction(lang) +
-        "Reply YES if every statement in CLAIM is supported by TEXT. " +
-        "Otherwise reply NO.<|im_end|>\n<|im_start|>assistant\n";
-  const budget = Math.max(0, max - cpLen(head) - cpLen(mid) - cpLen(tail));
-  const claimBudget = Math.min(cpLen(claim), Math.floor(budget / 3));
-  const textBudget = Math.max(0, budget - claimBudget);
-  return tailClip(head + clipCp(text, textBudget) + mid + clipCp(claim, claimBudget) + tail, max);
+): string | null {
+  const b = claimBudget(text, claim, maxPromptChars);
+  if (!b.ok) return null;
+  const { head, mid, tail } = b.template;
+  return head + clipCp(text, b.available) + mid + claim + tail;
+}
+
+/** True only when a full claim plus the minimum cited source fits. */
+export function claimVerificationFits(
+  text: string,
+  claim: string,
+  maxPromptChars: number,
+): boolean {
+  return claimBudget(text, claim, maxPromptChars).ok;
 }
 
 /** Strict verdict parse: only whitespace + YES is accepted. */
@@ -692,9 +788,11 @@ function keyExpression(kind: EpisodeKind): string {
 }
 
 /**
- * Stale episodes of one kind (per episode.list semantics): no episode-level
- * ledger row, no coveredThrough, or a raw event newer than coveredThrough.
- * Ordered by startAt ASC (then episodeKey) and bounded by `limit`.
+ * Stale episodes of one kind. Staleness is explicit, never timestamp-based:
+ * an episode needs work when it has (a) a raw event without an
+ * episode_event_done row, or (b) an active window ledger row that is not in
+ * the union of every episode-level row's foldedRecordIds set. Ordered by
+ * startAt ASC (then episodeKey) and bounded by `limit`.
  */
 function listStaleEpisodes(
   db: DatabaseSync,
@@ -710,23 +808,38 @@ function listStaleEpisodes(
   const args: Array<string | number> = [];
   if (kind === "day") args.push(offsetModifier);
   args.push(scope);
-  args.push(scope, kind);
+  args.push(scope, kind, scope, kind, scope, kind);
   let sql = `SELECT g.episodeKey AS episodeKey,
                     MIN(g.observedAt) AS startAt,
                     MAX(g.createdAt) AS maxCreatedAt
-             FROM (SELECT ${keyExpr} AS episodeKey, observedAt, createdAt
+             FROM (SELECT ${keyExpr} AS episodeKey, observedAt, createdAt, eventId
                    FROM raw_events
                    WHERE scope = ?${kind === "doc" ? " AND docId IS NOT NULL" : ""}) g
-             LEFT JOIN (SELECT episodeKey AS sk, MAX(coveredThrough) AS covered
-                        FROM episode_summaries
-                        WHERE scope = ? AND kind = ? AND level = 'episode'
-                        GROUP BY episodeKey) s ON s.sk = g.episodeKey`;
+             WHERE (
+               NOT EXISTS (
+                 SELECT 1 FROM episode_event_done d
+                 WHERE d.scope = ? AND d.kind = ? AND d.episodeKey = g.episodeKey
+                   AND d.eventId = g.eventId)
+               OR EXISTS (
+                 SELECT 1 FROM episode_summaries w
+                 JOIN records rw ON rw.id = w.recordId AND rw.status = 'active'
+                  WHERE w.scope = ? AND w.kind = ? AND w.episodeKey = g.episodeKey
+                    AND w.level = 'window'
+                    AND w.recordId NOT IN (
+                      -- Union over every episode-level row. Picking one row by
+                      -- createdAt would make staleness depend on timestamps
+                      -- again (and on an arbitrary winner when they tie).
+                      SELECT j.value
+                      FROM episode_summaries ep,
+                           json_each(COALESCE(ep.foldedRecordIds, '[]')) j
+                      WHERE ep.scope = ? AND ep.kind = ? AND ep.episodeKey = g.episodeKey
+                        AND ep.level = 'episode'))
+             )`;
   if (episodeKey !== null) {
-    sql += ` WHERE g.episodeKey = ?`;
+    sql += ` AND g.episodeKey = ?`;
     args.push(episodeKey);
   }
   sql += ` GROUP BY g.episodeKey
-           HAVING s.covered IS NULL OR MAX(g.createdAt) > s.covered
            ORDER BY startAt ASC, g.episodeKey ASC LIMIT ?`;
   args.push(limit);
   const rows = db.prepare(sql).all(...args) as Array<{
@@ -746,47 +859,101 @@ interface RawEventRow {
   body: string;
   observedAt: string;
   createdAt: string;
+  /** Stored source sensitivity (NULL = legacy/unknown privacy). */
+  privacySensitivity: string | null;
 }
 
+/**
+ * Pending raw events only (no episode_event_done row), in processing order
+ * observedAt ASC then eventId ASC. Creation timestamps never filter events:
+ * observation/creation order divergence and ties cannot hide a failed event.
+ */
 function eventsForEpisode(
   db: DatabaseSync,
   config: AppConfig,
   scope: string,
   kind: EpisodeKind,
   episodeKey: string,
-  coveredThrough: string | null,
 ): RawEventRow[] {
   const offset = episodesBounds(config).utcOffsetMinutes;
   const offsetModifier = `${offset >= 0 ? "+" : ""}${offset} minutes`;
   const predicate =
-    kind === "session" ? "sessionId = ?" : kind === "doc" ? "docId = ?" : "date(observedAt, ?) = ?";
+    kind === "session" ? "e.sessionId = ?" : kind === "doc" ? "e.docId = ?" : "date(e.observedAt, ?) = ?";
   const args: Array<string | number> = [scope];
   if (kind === "day") args.push(offsetModifier);
-  args.push(episodeKey);
-  let sql = `SELECT eventId, body, observedAt, createdAt FROM raw_events
-             WHERE scope = ? AND ${predicate}`;
-  if (coveredThrough !== null) {
-    sql += ` AND createdAt > ?`;
-    args.push(coveredThrough);
-  }
-  sql += ` ORDER BY observedAt ASC, eventId ASC`;
+  args.push(episodeKey, kind, episodeKey);
+  const sql = `SELECT e.eventId AS eventId, e.body AS body,
+                      e.observedAt AS observedAt, e.createdAt AS createdAt,
+                      e.privacySensitivity AS privacySensitivity
+               FROM raw_events e
+               WHERE e.scope = ? AND ${predicate}
+                 AND NOT EXISTS (
+                   SELECT 1 FROM episode_event_done d
+                   WHERE d.scope = e.scope AND d.kind = ? AND d.episodeKey = ?
+                     AND d.eventId = e.eventId)
+               ORDER BY e.observedAt ASC, e.eventId ASC`;
   return db.prepare(sql).all(...args) as unknown as RawEventRow[];
 }
 
-function maxEpisodeCovered(
+/**
+ * `coveredThrough` compatibility field: max observedAt over events whose
+ * done marker exists. It is an observed-time report only; staleness/pending
+ * decisions use the explicit done rows and folded-window marker instead.
+ */
+function maxDoneObservedAt(
   db: DatabaseSync,
   scope: string,
   kind: EpisodeKind,
   episodeKey: string,
 ): string | null {
-  const rows = listEpisodeSummaries(db, scope, kind, episodeKey, "episode");
-  let covered: string | null = null;
-  for (const r of rows) {
-    if (r.coveredThrough !== null && (covered === null || r.coveredThrough > covered)) {
-      covered = r.coveredThrough;
+  const row = db
+    .prepare(
+      `SELECT MAX(e.observedAt) AS covered
+       FROM episode_event_done d
+       JOIN raw_events e ON e.eventId = d.eventId AND e.scope = d.scope
+       WHERE d.scope = ? AND d.kind = ? AND d.episodeKey = ?`,
+    )
+    .get(scope, kind, episodeKey) as { covered: string | null } | undefined;
+  return row?.covered ?? null;
+}
+
+function insertDoneRow(
+  db: DatabaseSync,
+  scope: string,
+  kind: EpisodeKind,
+  episodeKey: string,
+  eventId: string,
+  doneAt: string,
+): void {
+  insertEpisodeEventDone(db, { scope, kind, episodeKey, eventId, doneAt });
+}
+
+/**
+ * Run derived episode writes atomically under the run owner's lease. Reused
+ * for ledger replays and no-window done markers, where there is no canonical
+ * record transaction to piggyback on.
+ */
+function fencedEpisodeWrite(
+  db: DatabaseSync,
+  fence: CanonicalWriteFence,
+  write: (txDb: DatabaseSync) => void,
+): boolean {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (!isCultivationLeaseHeldBy(db, fence.owner, fence.now)) {
+      throw new Error("lease lost");
     }
+    write(db);
+    db.exec("COMMIT");
+    return true;
+  } catch {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    return false;
   }
-  return covered;
 }
 
 interface WindowLedgerHit {
@@ -852,36 +1019,32 @@ interface EpisodeWindow {
   body: string;
   /** Raw code-point slice of the event body for [spanStart, spanEnd). */
   rawText: string;
+  /** Privacy sensitivity of the window's raw event (NULL = unknown). */
+  privacySensitivity: string | null;
   observedAt: string;
   createdAt: string;
 }
 
 interface WindowInputSet {
   windows: EpisodeWindow[];
-  lastEventCreatedAt: string | null;
-  lastEventObservedAt: string | null;
+  /** max observedAt over done events at read time (compatibility report). */
+  coveredThrough: string | null;
 }
 
 /**
  * ALL active window-ledger summaries of the episode, in event/span order.
  * The reduce step rebuilds the episode from these every time (no
  * summary-of-summary folding), so a rejected reduce remains retryable with
- * zero new windows. `lastEventCreatedAt` only advances across a contiguous
- * prefix of fully-windowed events, preserving coveredThrough safety when a
- * later event's window was rejected.
+ * zero new windows. Completion/folding is tracked explicitly (done rows and
+ * the episode row's foldedRecordIds), not by timestamps.
  */
 function windowInputsForEpisode(
   db: DatabaseSync,
-  config: AppConfig,
   scope: string,
   kind: EpisodeKind,
   episodeKey: string,
 ): WindowInputSet {
-  const empty: WindowInputSet = {
-    windows: [],
-    lastEventCreatedAt: null,
-    lastEventObservedAt: null,
-  };
+  const empty: WindowInputSet = { windows: [], coveredThrough: null };
   let rows: Array<{
     recordId: string;
     eventId: string;
@@ -889,6 +1052,7 @@ function windowInputsForEpisode(
     spanEnd: number;
     body: string;
     eventBody: string;
+    privacySensitivity: string | null;
     createdAt: string;
     observedAt: string;
   }>;
@@ -898,6 +1062,7 @@ function windowInputsForEpisode(
         `SELECT s.recordId AS recordId, s.eventId AS eventId,
                 s.spanStart AS spanStart, s.spanEnd AS spanEnd,
                 r.body AS body, e.body AS eventBody,
+                e.privacySensitivity AS privacySensitivity,
                 e.createdAt AS createdAt, e.observedAt AS observedAt
          FROM episode_summaries s
          JOIN records r ON r.id = s.recordId AND r.status = 'active' AND r.scope = s.scope
@@ -928,39 +1093,25 @@ function windowInputsForEpisode(
     spanEnd: row.spanEnd,
     body: row.body,
     rawText: Array.from(row.eventBody).slice(row.spanStart, row.spanEnd).join(""),
+    privacySensitivity: row.privacySensitivity,
     observedAt: row.observedAt,
     createdAt: row.createdAt,
   }));
 
-  const windowMaxCp = episodesBounds(config).windowMaxCp;
-  const out: WindowInputSet = { windows, lastEventCreatedAt: null, lastEventObservedAt: null };
-  let i = 0;
-  while (i < deduped.length) {
-    const eventId = deduped[i]!.eventId;
-    const group: typeof rows = [];
-    while (i < deduped.length && deduped[i]!.eventId === eventId) {
-      group.push(deduped[i]!);
-      i++;
-    }
-    const first = group[0]!;
-    const expected = splitTextRanges(first.eventBody, windowMaxCp).filter((r) =>
-      /\S/u.test(Array.from(first.eventBody).slice(r.start, r.end).join("")),
-    );
-    const bySpan = new Map<string, (typeof rows)[number]>();
-    for (const row of group) {
-      const spanKey = `${row.spanStart}:${row.spanEnd}`;
-      if (!bySpan.has(spanKey)) bySpan.set(spanKey, row);
-    }
-    let complete = true;
-    for (const range of expected) {
-      if (!bySpan.has(`${range.start}:${range.end}`)) {
-        complete = false;
-        break;
-      }
-    }
-    if (!complete) break;
-    out.lastEventCreatedAt = first.createdAt;
-    out.lastEventObservedAt = first.observedAt;
+  return {
+    windows,
+    coveredThrough: maxDoneObservedAt(db, scope, kind, episodeKey),
+  };
+}
+
+/** Unique window record ids across the episode's accepted windows. */
+function foldedWindowIds(windows: EpisodeWindow[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const w of windows) {
+    if (seen.has(w.recordId)) continue;
+    seen.add(w.recordId);
+    out.push(w.recordId);
   }
   return out;
 }
@@ -998,9 +1149,11 @@ function verbatimWindowBody(text: string, bodyMaxCp: number): string {
 }
 
 /**
- * Write one window canonical record plus its level='window' ledger row.
- * Returns the record id, or null when either write fails. Shared by model
- * summaries and verbatim fallbacks so both have identical span provenance.
+ * Write one window canonical record plus its level='window' ledger row (and,
+ * when this completes the event, its done marker) atomically under the run
+ * owner's lease. Returns the record id, or null when the fence is lost or any
+ * write fails. Shared by model summaries and verbatim fallbacks so both have
+ * identical span provenance.
  */
 function writeWindowRecord(
   db: DatabaseSync,
@@ -1013,33 +1166,16 @@ function writeWindowRecord(
   spanEnd: number,
   body: string,
   tags: string[],
+  privacy: PrivacyMetadata | null,
   now: string,
+  fence: CanonicalWriteFence,
+  markEventDone: boolean,
 ): string | null {
   const windowKey = `epw-${shaHex(
     [scope, kind, episodeKey, event.eventId, spanStart, spanEnd, body].join("\u0000"),
   ).slice(0, 48)}`;
-  const wr = rememberRecord(
-    db,
-    config,
-    {
-      body,
-      kind: "summary",
-      provenance: { source: EPISODE_SUMMARY_SOURCE, observedAt: event.observedAt },
-      scope,
-      tags,
-      links: [],
-      sourceRefs: [{ eventId: event.eventId, start: spanStart, end: spanEnd }],
-    },
-    windowKey,
-    now,
-  );
-  const recordId = wr.ok
-    ? ((wr.data as { record?: { id?: unknown } } | null)?.record?.id as string | undefined)
-    : undefined;
-  if (!wr.ok || typeof recordId !== "string") return null;
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    insertEpisodeSummary(db, {
+  const addLedgerRows = (txDb: DatabaseSync, recordId: string): void => {
+    insertEpisodeSummary(txDb, {
       scope,
       kind,
       episodeKey,
@@ -1051,14 +1187,41 @@ function writeWindowRecord(
       coveredThrough: null,
       createdAt: now,
     });
-    db.exec("COMMIT");
-  } catch {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      /* ignore */
+    if (markEventDone) {
+      insertDoneRow(txDb, scope, kind, episodeKey, event.eventId, now);
     }
-    return null;
+  };
+  const wr = rememberRecord(
+    db,
+    config,
+    {
+      body,
+      kind: "summary",
+      provenance: { source: EPISODE_SUMMARY_SOURCE, observedAt: event.observedAt },
+      scope,
+      tags,
+      links: [],
+      sourceRefs: [{ eventId: event.eventId, start: spanStart, end: spanEnd }],
+      ...(privacy !== null ? { privacy } : {}),
+    },
+    windowKey,
+    now,
+    {
+      owner: fence.owner,
+      now: fence.now,
+      afterInsert: (txDb, recordId) => addLedgerRows(txDb, recordId),
+    },
+  );
+  const recordId = wr.ok
+    ? ((wr.data as { record?: { id?: unknown } } | null)?.record?.id as string | undefined)
+    : undefined;
+  if (!wr.ok || typeof recordId !== "string") return null;
+  if (wr.deduplicated) {
+    // Crash repair / replay: the canonical record already exists, so mirror
+    // the missing ledger (and done) rows in one fenced transaction.
+    if (!fencedEpisodeWrite(db, fence, (txDb) => addLedgerRows(txDb, recordId as string))) {
+      return null;
+    }
   }
   return recordId;
 }
@@ -1203,7 +1366,7 @@ export async function maintainEpisodes(
 
       const existingCovered = (() => {
         try {
-          return maxEpisodeCovered(db, p.scope, p.kind, ep.episodeKey);
+          return maxDoneObservedAt(db, p.scope, p.kind, ep.episodeKey);
         } catch {
           return null;
         }
@@ -1211,7 +1374,7 @@ export async function maintainEpisodes(
 
       let events: RawEventRow[];
       try {
-        events = eventsForEpisode(db, config, p.scope, p.kind, ep.episodeKey, existingCovered);
+        events = eventsForEpisode(db, config, p.scope, p.kind, ep.episodeKey);
       } catch {
         results.push({
           kind: p.kind,
@@ -1233,6 +1396,18 @@ export async function maintainEpisodes(
           (r) => /\S/u.test(Array.from(ev.body).slice(r.start, r.end).join("")),
         );
         let eventOk = true;
+        let eventDone = false;
+
+        // Window-level privacy is exactly its raw event's privacy (origin is
+        // always self_activity for derived content). With requirePrivacy, an
+        // unknown source cannot be written through the canonical store: keep
+        // the event pending (same non-content skip semantics as a null
+        // privacy in deriveConsolidationPrivacy) instead of inventing one.
+        const eventPrivacy = deriveConsolidationPrivacy([ev.privacySensitivity]);
+        if (requirePrivacyEnabled(config) && eventPrivacy === null) {
+          eventOk = false;
+          break;
+        }
 
         for (const range of ranges) {
           // A retry after a partial event must not re-run an already accepted
@@ -1298,22 +1473,31 @@ export async function maintainEpisodes(
               aborted = true;
               break;
             }
-            let rawVerify: string | null = null;
-            try {
-              rawVerify = await generate(
-                buildEpisodeVerifyPrompt(windowText, summaryBody as string, maxPromptChars),
-                Math.min(maxNewTokens, 16),
-              );
-            } catch {
-              rawVerify = null;
+            const verifyPrompt = buildEpisodeVerifyPrompt(
+              windowText,
+              summaryBody as string,
+              maxPromptChars,
+            );
+            if (verifyPrompt === null) {
+              // The full candidate cannot be shown with enough source to
+              // verify it: this is a content rejection (verbatim fallback),
+              // never a YES on a truncated candidate.
+              contentRejected = true;
+            } else {
+              let rawVerify: string | null = null;
+              try {
+                rawVerify = await generate(verifyPrompt, Math.min(maxNewTokens, 16));
+              } catch {
+                rawVerify = null;
+              }
+              if (rawVerify === null) {
+                // Timeout / model failure while verifying: no write.
+                windowsRejected++;
+                eventOk = false;
+                break;
+              }
+              if (!parseEpisodeYes(rawVerify)) contentRejected = true;
             }
-            if (rawVerify === null) {
-              // Timeout / model failure while verifying: no write.
-              windowsRejected++;
-              eventOk = false;
-              break;
-            }
-            if (!parseEpisodeYes(rawVerify)) contentRejected = true;
           }
 
           let windowBody: string;
@@ -1331,6 +1515,20 @@ export async function maintainEpisodes(
             break;
           }
 
+          const completesEvent = ranges.every(
+            (r) =>
+              (r.start === range.start && r.end === range.end) ||
+              existingWindow(
+                db,
+                p.scope,
+                p.kind,
+                ep.episodeKey,
+                ev.eventId,
+                r.start,
+                r.end,
+              ) !== null,
+          );
+          const writeFenceNow = renewNow();
           const recordId = writeWindowRecord(
             db,
             config,
@@ -1342,13 +1540,17 @@ export async function maintainEpisodes(
             range.end,
             windowBody,
             windowTags,
+            eventPrivacy,
             nowValid,
+            { owner: execOwner, now: writeFenceNow },
+            completesEvent,
           );
           if (recordId === null) {
             eventOk = false;
             aborted = true;
             break;
           }
+          if (completesEvent) eventDone = true;
           if (contentRejected) windowsVerbatim++;
           else windowsWritten++;
           applied++;
@@ -1356,6 +1558,21 @@ export async function maintainEpisodes(
 
         if (aborted) break;
         if (!eventOk) break;
+        if (!eventDone) {
+          // All windows were already present (retry/repair): mark the event
+          // done now, under the same lease fence.
+          const doneFenceNow = renewNow();
+          if (
+            !fencedEpisodeWrite(
+              db,
+              { owner: execOwner, now: doneFenceNow },
+              (txDb) => insertDoneRow(txDb, p.scope, p.kind, ep.episodeKey, ev.eventId, nowValid),
+            )
+          ) {
+            aborted = true;
+            break;
+          }
+        }
         if (overDeadline()) {
           aborted = true;
           break;
@@ -1367,15 +1584,14 @@ export async function maintainEpisodes(
       // episode body back in, which caused summary-of-summary drift). Each
       // sentence must cite in-range windows, pass the deterministic raw-anchor
       // guard, and then pass a strict YES/NO against the cited RAW text.
-      const windowInputs = windowInputsForEpisode(db, config, p.scope, p.kind, ep.episodeKey);
+      const windowInputs = windowInputsForEpisode(db, p.scope, p.kind, ep.episodeKey);
       const allWindows = windowInputs.windows;
       let episodeRecordId: string | null = null;
-      let resultCovered = existingCovered;
       let sentencesKept = 0;
       let sentencesDropped = 0;
       let extractive = false;
 
-      if (allWindows.length > 0) {
+      if (!aborted && allWindows.length > 0) {
         const priorActive = activeEpisodeRecord(db, p.scope, p.kind, ep.episodeKey);
         const bodyMaxCp = config.limits.bodyMaxCp;
         const kept: Array<{ text: string; windows: EpisodeWindow[] }> = [];
@@ -1427,12 +1643,20 @@ export async function maintainEpisodes(
               reduceOk = false;
               break;
             }
+            const claimPrompt = buildEpisodeClaimPrompt(
+              citedRaw,
+              sentence.text,
+              maxPromptChars,
+            );
+            if (claimPrompt === null) {
+              // Unverifiable without truncating the claim: drop the sentence
+              // (extractive fallback handles a wholly unverifiable reduce).
+              sentencesDropped++;
+              continue;
+            }
             let rawVerify: string | null = null;
             try {
-              rawVerify = await generate(
-                buildEpisodeClaimPrompt(citedRaw, sentence.text, maxPromptChars),
-                Math.min(maxNewTokens, 16),
-              );
+              rawVerify = await generate(claimPrompt, Math.min(maxNewTokens, 16));
             } catch {
               rawVerify = null;
             }
@@ -1487,13 +1711,51 @@ export async function maintainEpisodes(
           }
         }
 
-        if (reduceOk && !aborted && finalSummary !== null && cpLen(finalSummary) > 0) {
-          const effectiveCovered = windowInputs.lastEventCreatedAt ?? existingCovered;
+        // Episode-level sources are the raw events of the windows the episode
+        // actually cites (or, in the extractive fallback, every folded
+        // window). Origin is self_activity; sensitivity follows the same
+        // helper as maintain.distill's summary consolidation (sensitive wins,
+        // all-known => normal, else null).
+        const episodePrivacy = deriveConsolidationPrivacy(
+          citedWindows.map((w) => w.privacySensitivity),
+        );
+        const strictPrivacyBlocked =
+          requirePrivacyEnabled(config) && episodePrivacy === null;
+
+        if (
+          reduceOk &&
+          !aborted &&
+          !strictPrivacyBlocked &&
+          finalSummary !== null &&
+          cpLen(finalSummary) > 0
+        ) {
+          // foldedRecordIds is the explicit "already reduced" marker: every
+          // active window this reduce considered. It is written with the
+          // episode ledger row in the canonical record's transaction.
+          const folded = foldedWindowIds(allWindows);
+          const privacyParam = episodePrivacy !== null ? { privacy: episodePrivacy } : {};
+          const effectiveCovered = maxDoneObservedAt(db, p.scope, p.kind, ep.episodeKey);
+          const ledgerRow = (recordId: string) => ({
+            scope: p.scope,
+            kind: p.kind,
+            episodeKey: ep.episodeKey,
+            level: "episode" as const,
+            recordId,
+            eventId: null,
+            spanStart: null,
+            spanEnd: null,
+            coveredThrough: effectiveCovered,
+            foldedRecordIds: folded,
+            createdAt: nowValid,
+          });
+          const writeLedger = (txDb: DatabaseSync, recordId: string): void => {
+            insertEpisodeSummary(txDb, ledgerRow(recordId));
+          };
           const links = episodeLinks(citedWindows, config.limits.linksMax);
           const sourceRefs = episodeSourceRefs(citedWindows, config.limits.sourceRefsMax);
           const provenance = {
             source: EPISODE_SUMMARY_SOURCE,
-            observedAt: windowInputs.lastEventObservedAt ?? nowValid,
+            observedAt: windowInputs.coveredThrough ?? nowValid,
           };
           let newRecordId: string | null = null;
           if (priorActive) {
@@ -1511,46 +1773,97 @@ export async function maintainEpisodes(
                 scope: p.scope,
                 links,
                 sourceRefs,
+                ...privacyParam,
               },
               correctKey,
               nowValid,
+              {
+                owner: execOwner,
+                now: renewNow(),
+                afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
+              },
             );
             if (cr.ok) {
               newRecordId =
                 ((cr.data as { record?: { id?: unknown } } | null)?.record?.id as string | undefined) ??
                 null;
+              if (newRecordId !== null && cr.deduplicated) {
+                // Replayed canonical write: mirror the derived ledger row.
+                if (
+                  !fencedEpisodeWrite(
+                    db,
+                    { owner: execOwner, now: renewNow() },
+                    (txDb) => writeLedger(txDb, newRecordId as string),
+                  )
+                ) {
+                  aborted = true;
+                  newRecordId = null;
+                }
+              }
             } else if (cr.code === "CONFLICT") {
-              // Fallback consistent with existing rules: remember the new
-              // summary and archive the old one as OBSOLETE (no deletes).
-              const rememberKey = `eper-${shaHex(
-                [p.scope, p.kind, ep.episodeKey, finalSummary].join("\u0000"),
-              ).slice(0, 48)}`;
-              const rr = rememberRecord(
-                db,
-                config,
-                {
-                  body: finalSummary,
-                  kind: "summary",
-                  provenance,
-                  scope: p.scope,
-                  tags: [EPISODE_TAG],
-                  links,
-                  sourceRefs,
-                },
-                rememberKey,
-                nowValid,
-              );
-              if (rr.ok) {
-                newRecordId =
-                  ((rr.data as { record?: { id?: unknown } } | null)?.record?.id as string | undefined) ??
-                  null;
-                archiveRecord(
+              // A CONFLICT caused by a stolen/expired lease must not fall back
+              // to another write: stop the episode with no partial state.
+              if (!isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
+                aborted = true;
+              } else {
+                // Fallback consistent with existing rules: remember the new
+                // summary and archive the old one as OBSOLETE (no deletes).
+                const rememberKey = `eper-${shaHex(
+                  [p.scope, p.kind, ep.episodeKey, finalSummary].join("\u0000"),
+                ).slice(0, 48)}`;
+                const rr = rememberRecord(
                   db,
                   config,
-                  { id: priorActive.recordId, scope: p.scope, reasonCode: "OBSOLETE" },
-                  `epa-${shaHex([p.scope, ep.episodeKey, priorActive.recordId].join("\u0000")).slice(0, 48)}`,
+                  {
+                    body: finalSummary,
+                    kind: "summary",
+                    provenance,
+                    scope: p.scope,
+                    tags: [EPISODE_TAG],
+                    links,
+                    sourceRefs,
+                    ...privacyParam,
+                  },
+                  rememberKey,
                   nowValid,
+                  {
+                    owner: execOwner,
+                    now: renewNow(),
+                    afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
+                  },
                 );
+                if (rr.ok) {
+                  newRecordId =
+                    ((rr.data as { record?: { id?: unknown } } | null)?.record?.id as string | undefined) ??
+                    null;
+                  if (newRecordId !== null && rr.deduplicated) {
+                    if (
+                      !fencedEpisodeWrite(
+                        db,
+                        { owner: execOwner, now: renewNow() },
+                        (txDb) => writeLedger(txDb, newRecordId as string),
+                      )
+                    ) {
+                      aborted = true;
+                      newRecordId = null;
+                    }
+                  }
+                  if (newRecordId !== null) {
+                    const ar = archiveRecord(
+                      db,
+                      config,
+                      { id: priorActive.recordId, scope: p.scope, reasonCode: "OBSOLETE" },
+                      `epa-${shaHex([p.scope, ep.episodeKey, priorActive.recordId].join("\u0000")).slice(0, 48)}`,
+                      nowValid,
+                      { owner: execOwner, now: renewNow() },
+                    );
+                    if (!ar.ok && !isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
+                      aborted = true;
+                    }
+                  }
+                } else if (!isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
+                  aborted = true;
+                }
               }
             }
           } else {
@@ -1568,46 +1881,51 @@ export async function maintainEpisodes(
                 tags: [EPISODE_TAG],
                 links,
                 sourceRefs,
+                ...privacyParam,
               },
               rememberKey,
               nowValid,
+              {
+                owner: execOwner,
+                now: renewNow(),
+                afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
+              },
             );
             if (rr.ok) {
               newRecordId =
                 ((rr.data as { record?: { id?: unknown } } | null)?.record?.id as string | undefined) ??
                 null;
+              if (newRecordId !== null && rr.deduplicated) {
+                if (
+                  !fencedEpisodeWrite(
+                    db,
+                    { owner: execOwner, now: renewNow() },
+                    (txDb) => writeLedger(txDb, newRecordId as string),
+                  )
+                ) {
+                  aborted = true;
+                  newRecordId = null;
+                }
+              }
+            } else if (!isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
+              aborted = true;
             }
           }
 
-          if (newRecordId !== null) {
-            try {
-              db.exec("BEGIN IMMEDIATE");
-              insertEpisodeSummary(db, {
-                scope: p.scope,
-                kind: p.kind,
-                episodeKey: ep.episodeKey,
-                level: "episode",
-                recordId: newRecordId,
-                eventId: null,
-                spanStart: null,
-                spanEnd: null,
-                coveredThrough: effectiveCovered,
-                createdAt: nowValid,
-              });
-              db.exec("COMMIT");
-              episodeRecordId = newRecordId;
-              resultCovered = effectiveCovered;
-              applied++;
-            } catch {
-              try {
-                db.exec("ROLLBACK");
-              } catch {
-                /* ignore */
-              }
-            }
+          if (newRecordId !== null && !aborted) {
+            episodeRecordId = newRecordId;
+            applied++;
           }
         }
       }
+
+      const finalCovered = (() => {
+        try {
+          return maxDoneObservedAt(db, p.scope, p.kind, ep.episodeKey);
+        } catch {
+          return existingCovered;
+        }
+      })();
 
       results.push({
         kind: p.kind,
@@ -1616,7 +1934,7 @@ export async function maintainEpisodes(
         windowsVerbatim,
         windowsRejected,
         episodeRecordId,
-        coveredThrough: resultCovered,
+        coveredThrough: finalCovered,
         sentencesKept,
         sentencesDropped,
         extractive,
