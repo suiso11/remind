@@ -15,7 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 import { countCp, type AppConfig, type EpisodesConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
 import { normalizeBody } from "../src/normalize.js";
-import { correctRecord, eventAppend, getRecord, recordSources } from "../src/store.js";
+import { correctRecord, eventAppend, getRecord, recordSources, retireRecord } from "../src/store.js";
 import { listEpisodes } from "../src/store.js";
 import {
   EPISODE_FOLD_MAX,
@@ -253,6 +253,8 @@ interface WindowsItem {
   recordId: string;
   eventId: string;
   span: { start: number; end: number };
+  /** Explicit ledger marker; tags may be absent when tagsMax is small. */
+  verbatim?: boolean;
   snippet: string;
   truncated: boolean;
 }
@@ -1702,6 +1704,158 @@ describe("maintain.episodes privacy propagation and verification budgets", () =>
         .get() as unknown as { n: number };
       assert.equal(done.n, 0);
       assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, true);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("PR #26 round 5 follow-ups", () => {
+  it("falls back to a verbatim window when normalization exceeds bodyMaxCp", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds({ windowMaxCp: 1200 });
+      ctx.config.limits.bodyMaxCp = 200;
+      const body = "…".repeat(100); // raw 100cp, normalizeBody -> 300cp
+      append(ctx, { eventId: "ev-normalize-overflow", body, observedAt: T0, createdAt: T0 });
+
+      const run = episodeData(
+        await maintain(
+          ctx,
+          "ep-normalize-overflow-1",
+          makeGen({ windowText: "…".repeat(100) }),
+          RUN1,
+        ),
+      );
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsWritten, 0);
+      assert.equal(ep.windowsVerbatim, 1);
+      assert.equal(ep.windowsRejected, 1);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const rows = windowRows(ctx);
+      assert.equal(rows.length, 1);
+      assert.deepEqual([rows[0]!.spanStart, rows[0]!.spanEnd], [0, 100]);
+      const w = rec(ctx, rows[0]!.recordId);
+      assert.notEqual(w.body, "…".repeat(100));
+      assert.ok(w.tags.includes(EPISODE_WINDOW_VERBATIM_TAG));
+      assert.ok(countCp(w.body) <= 200);
+      assert.ok(countCp(normalizeBody(w.body)) <= 200);
+      const ledger = ctx.db
+        .prepare(`SELECT verbatim FROM episode_summaries WHERE recordId = ?`)
+        .get(rows[0]!.recordId) as { verbatim: number };
+      assert.equal(ledger.verbatim, 1);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("bounds window tags by tagsMax 1 and identifies verbatim from the ledger", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      ctx.config.limits.tagsMax = 1;
+      append(ctx, {
+        eventId: "ev-tags-one",
+        body: "Tanaka repaired the table.",
+        observedAt: T0,
+        createdAt: T0,
+      });
+
+      const run = episodeData(
+        await maintain(ctx, "ep-tags-one", makeGen({ rejectText: "Tanaka" }), RUN1),
+      );
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsVerbatim, 1);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const row = windowRows(ctx)[0]!;
+      const w = rec(ctx, row.recordId);
+      assert.deepEqual(w.tags, [EPISODE_WINDOW_TAG]);
+      assert.deepEqual(rec(ctx, ep.episodeRecordId as string).tags, ["episode"]);
+
+      // episode.windows carries the explicit ledger marker even though the
+      // verbatim tag was dropped by the tag budget.
+      const listed = windows(ctx, { scope: SCOPE, kind: "session", episodeKey: "s1" });
+      assert.equal(listed.items.length, 1);
+      assert.equal(listed.items[0]!.recordId, row.recordId);
+      assert.equal(listed.items[0]!.verbatim, true);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("writes windows and episode records with no tags when tagsMax is 0", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      ctx.config.limits.tagsMax = 0;
+      append(ctx, { eventId: "ev-tags-zero", body: "alpha one", observedAt: T0, createdAt: T0 });
+
+      const run = episodeData(await maintain(ctx, "ep-tags-zero", makeGen(), RUN1));
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsWritten, 1);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const row = windowRows(ctx)[0]!;
+      assert.deepEqual(rec(ctx, row.recordId).tags, []);
+      assert.deepEqual(rec(ctx, ep.episodeRecordId as string).tags, []);
+      const listed = windows(ctx, { scope: SCOPE, kind: "session", episodeKey: "s1" });
+      assert.equal(listed.items.length, 1);
+      assert.equal(listed.items[0]!.recordId, row.recordId);
+      assert.equal(listed.items[0]!.verbatim, false);
+      const listData = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.equal(listData.items[0]!.stale, false);
+      assert.deepEqual(listData.items[0]!.summaryRecordIds, [ep.episodeRecordId]);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("creates a new episode generation after the prior summary was retired", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      append(ctx, { eventId: "ev-gen-1", body: "alpha one", observedAt: T0, createdAt: T0 });
+
+      const run1 = episodeData(await maintain(ctx, "ep-gen-1", makeGen(), RUN1));
+      const firstId = run1.episodes[0]!.episodeRecordId as string;
+      assert.notEqual(firstId, null);
+
+      const retired = retireRecord(
+        ctx.db,
+        ctx.config,
+        { id: firstId, scope: SCOPE, reasonCode: "OUTDATED" },
+        "retire-ep-gen-1",
+        RUN1,
+      );
+      assert.equal(retired.ok, true, JSON.stringify(retired));
+      assert.equal(rec(ctx, firstId).status, "retired");
+
+      append(ctx, { eventId: "ev-gen-2", body: "beta two", observedAt: T1, createdAt: T1 });
+      const run2 = episodeData(await maintain(ctx, "ep-gen-2", makeGen(), RUN2));
+      const secondId = run2.episodes[0]!.episodeRecordId as string;
+      assert.notEqual(secondId, null);
+      assert.notEqual(secondId, firstId);
+      assert.equal(rec(ctx, secondId).status, "active");
+      assert.equal(rec(ctx, firstId).status, "retired");
+
+      const listed = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.equal(listed.items[0]!.stale, false);
+      assert.deepEqual(listed.items[0]!.summaryRecordIds, [secondId]);
+
+      // Retrying the same (already folded) generation adds nothing.
+      const before = stateCounts(ctx);
+      const run3 = episodeData(await maintain(ctx, "ep-gen-3", makeGen(), RUN2));
+      assert.deepEqual(run3.episodes, []);
+      assert.equal(run3.applied, 0);
+      assert.deepEqual(stateCounts(ctx), before);
+      assert.deepEqual(
+        list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.summaryRecordIds,
+        [secondId],
+      );
     } finally {
       ctx.cleanup();
     }

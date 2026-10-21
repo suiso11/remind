@@ -11,11 +11,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { Worker } from "node:worker_threads";
 import type { AppConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
 import { requestHashFor } from "../src/normalize.js";
 import type { ResponseEnvelope } from "../src/protocol.js";
 import {
+  ensureM1Schema,
   eventAppend,
   getEvent,
   rangeEvents,
@@ -730,6 +732,107 @@ describe("legacy raw_events / record_source_refs migration", () => {
         db.close();
       }
     } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates legacy spans under a write transaction and second opener no-ops", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raw-read-legacy-race-"));
+    const { config } = baseConfig(dir, [OTHER]);
+    let a: DatabaseSync | null = null;
+    let worker: Worker | null = null;
+    try {
+      // Pre-span schema: PRIMARY KEY(recordId,eventId), no span columns.
+      const legacy = new DatabaseSync(config.dbPath);
+      try {
+        legacy.exec(`CREATE TABLE record_source_refs(
+          recordId TEXT NOT NULL, eventId TEXT NOT NULL,
+          PRIMARY KEY(recordId, eventId))`);
+        legacy
+          .prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES ('rec_legacy', 'e_legacy')`)
+          .run();
+      } finally {
+        legacy.close();
+      }
+
+      // Connection A acquires the write lock BEFORE any schema inspection and
+      // migrates + inserts a span row, holding the lock while B starts.
+      a = new DatabaseSync(config.dbPath);
+      a.exec(`PRAGMA busy_timeout = 5000`);
+      a.exec("BEGIN IMMEDIATE");
+      ensureM1Schema(a); // savepoint-based: composes with A's transaction
+      a.prepare(
+        `INSERT INTO record_source_refs(recordId, eventId, spanStart, spanEnd)
+         VALUES ('rec_a', 'e_a', 0, 4)`,
+      ).run();
+
+      interface WorkerResult {
+        ok: boolean;
+        error?: string;
+        elapsedMs: number;
+        cols: string[];
+        rows: Array<{
+          recordId: string;
+          eventId: string;
+          spanStart: number | null;
+          spanEnd: number | null;
+        }>;
+        index: string | null;
+      }
+      worker = new Worker(path.join(__dirname, "fixtures", "legacy-schema-worker.js"), {
+        workerData: { dbPath: config.dbPath, busyMs: 5000 },
+      });
+      const ready = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("worker ready timeout")), 10000);
+        worker!.once("message", (msg: { type?: string }) => {
+          clearTimeout(timer);
+          if (msg.type === "ready") resolve();
+          else reject(new Error(`unexpected worker message ${JSON.stringify(msg)}`));
+        });
+        worker!.once("error", reject);
+      });
+      const resultPromise = new Promise<WorkerResult>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("worker result timeout")), 10000);
+        const onMessage = (msg: { type?: string; result?: unknown }): void => {
+          if (msg.type !== "result") return; // ready is handled separately
+          clearTimeout(timer);
+          worker!.off("message", onMessage);
+          resolve(msg.result as WorkerResult);
+        };
+        worker!.on("message", onMessage);
+        worker!.once("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      });
+      await ready;
+      // Let B reach BEGIN IMMEDIATE and wait on A's lock.
+      await new Promise((r) => setTimeout(r, 100));
+      a.exec("COMMIT");
+
+      const result = await resultPromise;
+      assert.equal(result.ok, true, result.error);
+      assert.ok(result.elapsedMs >= 50, `worker did not wait for the lock: ${result.elapsedMs}ms`);
+      assert.ok(result.cols.includes("spanStart"));
+      assert.ok(result.cols.includes("spanEnd"));
+      assert.equal(result.index, "idx_source_refs_unique");
+      assert.deepEqual(result.rows, [
+        { recordId: "rec_a", eventId: "e_a", spanStart: 0, spanEnd: 4 },
+        { recordId: "rec_legacy", eventId: "e_legacy", spanStart: null, spanEnd: null },
+      ]);
+      // NULL spans stay unique: re-inserting the legacy ref must be rejected.
+      assert.throws(() =>
+        a!
+          .prepare(`INSERT INTO record_source_refs(recordId, eventId) VALUES ('rec_legacy', 'e_legacy')`)
+          .run(),
+      );
+    } finally {
+      if (worker) await worker.terminate();
+      try {
+        a?.close();
+      } catch {
+        /* ignore */
+      }
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -268,41 +268,76 @@ function ensureRawChunkColumns(db: DatabaseSync): void {
  * different span. Rebuild once (every row copied; legacy spans stay NULL)
  * with a unique expression index so NULL spans remain unique like before
  * while distinct spans coexist. Fresh tables skip the rebuild.
+ *
+ * The schema inspection, copy+swap, and index creation all run inside one
+ * write transaction (BEGIN IMMEDIATE, or a savepoint when the caller already
+ * owns a transaction such as initDb's fresh-schema transaction). A second
+ * process opening the same pre-span file therefore waits on the write lock
+ * (busy_timeout) and re-inspects the already-migrated schema instead of
+ * copying spans as NULL from a stale snapshot.
  */
 function ensureSourceRefSpans(db: DatabaseSync): void {
-  let cols: Array<{ name: string; pk: number }>;
-  try {
-    cols = db.prepare(`PRAGMA table_info(record_source_refs)`).all() as Array<{
-      name: string;
-      pk: number;
-    }>;
-  } catch {
-    return;
-  }
-  if (cols.length === 0) return;
-  const hasSpans = cols.some((c) => c.name === "spanStart") && cols.some((c) => c.name === "spanEnd");
-  const hasLegacyPk = cols.some((c) => c.pk > 0);
-  if (!hasSpans || hasLegacyPk) {
-    db.exec(`SAVEPOINT ensure_source_ref_spans`);
-    try {
-      db.exec(`CREATE TABLE record_source_refs_new(
-        recordId TEXT NOT NULL, eventId TEXT NOT NULL,
-        spanStart INTEGER NULL, spanEnd INTEGER NULL,
-        CHECK((spanStart IS NULL AND spanEnd IS NULL) OR
-              (spanStart IS NOT NULL AND spanEnd IS NOT NULL AND spanStart >= 0 AND spanEnd > spanStart)))`);
-      db.exec(`INSERT INTO record_source_refs_new(recordId, eventId, spanStart, spanEnd)
-        SELECT recordId, eventId, ${hasSpans ? "spanStart, spanEnd" : "NULL, NULL"} FROM record_source_refs`);
-      db.exec(`DROP TABLE record_source_refs`);
-      db.exec(`ALTER TABLE record_source_refs_new RENAME TO record_source_refs`);
-      db.exec(`RELEASE SAVEPOINT ensure_source_ref_spans`);
-    } catch (e) {
-      try { db.exec(`ROLLBACK TO SAVEPOINT ensure_source_ref_spans`); } catch { /* preserve error */ }
-      try { db.exec(`RELEASE SAVEPOINT ensure_source_ref_spans`); } catch { /* preserve error */ }
-      throw e;
+  const ownTransaction = !db.isTransaction;
+  if (ownTransaction) db.exec("BEGIN IMMEDIATE");
+  else db.exec(`SAVEPOINT ensure_source_ref_spans_txn`);
+  const commitTxn = (): void => {
+    if (ownTransaction) db.exec("COMMIT");
+    else db.exec(`RELEASE SAVEPOINT ensure_source_ref_spans_txn`);
+  };
+  const rollbackTxn = (): void => {
+    if (ownTransaction) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve error */ }
+    } else {
+      try { db.exec(`ROLLBACK TO SAVEPOINT ensure_source_ref_spans_txn`); } catch { /* preserve error */ }
+      try { db.exec(`RELEASE SAVEPOINT ensure_source_ref_spans_txn`); } catch { /* preserve error */ }
     }
+  };
+  try {
+    let cols: Array<{ name: string; pk: number }>;
+    try {
+      cols = db.prepare(`PRAGMA table_info(record_source_refs)`).all() as Array<{
+        name: string;
+        pk: number;
+      }>;
+    } catch {
+      commitTxn();
+      return;
+    }
+    if (cols.length === 0) {
+      commitTxn();
+      return;
+    }
+    const hasSpans = cols.some((c) => c.name === "spanStart") && cols.some((c) => c.name === "spanEnd");
+    const hasLegacyPk = cols.some((c) => c.pk > 0);
+    if (!hasSpans || hasLegacyPk) {
+      db.exec(`SAVEPOINT ensure_source_ref_spans`);
+      try {
+        db.exec(`CREATE TABLE record_source_refs_new(
+          recordId TEXT NOT NULL, eventId TEXT NOT NULL,
+          spanStart INTEGER NULL, spanEnd INTEGER NULL,
+          CHECK((spanStart IS NULL AND spanEnd IS NULL) OR
+                (spanStart IS NOT NULL AND spanEnd IS NOT NULL AND spanStart >= 0 AND spanEnd > spanStart)))`);
+        db.exec(`INSERT INTO record_source_refs_new(recordId, eventId, spanStart, spanEnd)
+          SELECT recordId, eventId, ${hasSpans ? "spanStart, spanEnd" : "NULL, NULL"} FROM record_source_refs`);
+        db.exec(`DROP TABLE record_source_refs`);
+        db.exec(`ALTER TABLE record_source_refs_new RENAME TO record_source_refs`);
+        db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_refs_unique
+          ON record_source_refs(recordId, eventId, COALESCE(spanStart, -1), COALESCE(spanEnd, -1))`);
+        db.exec(`RELEASE SAVEPOINT ensure_source_ref_spans`);
+      } catch (e) {
+        try { db.exec(`ROLLBACK TO SAVEPOINT ensure_source_ref_spans`); } catch { /* preserve error */ }
+        try { db.exec(`RELEASE SAVEPOINT ensure_source_ref_spans`); } catch { /* preserve error */ }
+        throw e;
+      }
+    } else {
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_refs_unique
+        ON record_source_refs(recordId, eventId, COALESCE(spanStart, -1), COALESCE(spanEnd, -1))`);
+    }
+    commitTxn();
+  } catch (e) {
+    rollbackTxn();
+    throw e;
   }
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_refs_unique
-    ON record_source_refs(recordId, eventId, COALESCE(spanStart, -1), COALESCE(spanEnd, -1))`);
 }
 
 export function ensureM1Schema(db: DatabaseSync): void {
@@ -371,6 +406,7 @@ export function ensureM1Schema(db: DatabaseSync): void {
     spanEnd INTEGER NULL,
     coveredThrough TEXT NULL,
     foldedRecordIds TEXT NULL,
+    verbatim INTEGER NOT NULL DEFAULT 0 CHECK(verbatim IN (0,1)),
     createdAt TEXT,
     PRIMARY KEY(scope, kind, episodeKey, recordId))`);
   // Additive column for databases created before the fold marker existed.
@@ -381,6 +417,12 @@ export function ensureM1Schema(db: DatabaseSync): void {
   }>;
   if (!episodeColumns.some((c) => c.name === "foldedRecordIds")) {
     db.exec(`ALTER TABLE episode_summaries ADD COLUMN foldedRecordIds TEXT NULL`);
+  }
+  // Explicit verbatim marker for window rows: tags are caller-bounded by
+  // tagsMax (and may be dropped entirely), so readers must not infer
+  // verbatim mode from tags alone.
+  if (!episodeColumns.some((c) => c.name === "verbatim")) {
+    db.exec(`ALTER TABLE episode_summaries ADD COLUMN verbatim INTEGER NOT NULL DEFAULT 0 CHECK(verbatim IN (0,1))`);
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_episode
     ON episode_summaries(scope, kind, episodeKey, level)`);
@@ -2474,6 +2516,12 @@ export interface EpisodeSummaryInput {
    * level='window'.
    */
   foldedRecordIds?: string[] | null;
+  /**
+   * Window rows only: true when the body is the raw verbatim fallback rather
+   * than a model summary. Explicit ledger field because tags are bounded by
+   * tagsMax and the verbatim tag can be dropped.
+   */
+  verbatim?: boolean;
   createdAt: string;
 }
 
@@ -2489,6 +2537,7 @@ export interface EpisodeSummaryRow {
   spanEnd: number | null;
   coveredThrough: string | null;
   foldedRecordIds: string[];
+  verbatim: boolean;
   createdAt: string;
 }
 
@@ -2522,8 +2571,8 @@ export function insertEpisodeSummary(db: DatabaseSync, row: EpisodeSummaryInput)
   db.prepare(
     `INSERT OR REPLACE INTO episode_summaries(
        scope, kind, episodeKey, level, recordId, eventId,
-       spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       spanStart, spanEnd, coveredThrough, foldedRecordIds, verbatim, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     row.scope,
     row.kind,
@@ -2537,6 +2586,7 @@ export function insertEpisodeSummary(db: DatabaseSync, row: EpisodeSummaryInput)
     row.foldedRecordIds === undefined || row.foldedRecordIds === null
       ? null
       : JSON.stringify(row.foldedRecordIds),
+    row.verbatim === true ? 1 : 0,
     row.createdAt,
   );
 }
@@ -2561,7 +2611,7 @@ export function listEpisodeSummaries(
   level?: EpisodeLevel,
 ): EpisodeSummaryRow[] {
   let sql = `SELECT scope, kind, episodeKey, level, recordId, eventId,
-                    spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt
+                    spanStart, spanEnd, coveredThrough, foldedRecordIds, verbatim, createdAt
              FROM episode_summaries
              WHERE scope = ? AND kind = ? AND episodeKey = ?`;
   const args: Array<string> = [scope, kind, episodeKey];
@@ -2571,11 +2621,15 @@ export function listEpisodeSummaries(
   }
   sql += ` ORDER BY createdAt DESC, recordId ASC`;
   const rows = db.prepare(sql).all(...args) as unknown as Array<
-    Omit<EpisodeSummaryRow, "foldedRecordIds"> & { foldedRecordIds: string | null }
+    Omit<EpisodeSummaryRow, "foldedRecordIds" | "verbatim"> & {
+      foldedRecordIds: string | null;
+      verbatim: number | null;
+    }
   >;
   return rows.map((row) => ({
     ...row,
     foldedRecordIds: parseFoldedRecordIds(row.foldedRecordIds),
+    verbatim: row.verbatim === 1,
   }));
 }
 
@@ -3485,6 +3539,7 @@ interface CarriedEpisodeSummaryRow {
   spanEnd: number | null;
   coveredThrough: string | null;
   foldedRecordIds: string | null;
+  verbatim: number;
 }
 
 /**
@@ -3506,7 +3561,7 @@ function carryForwardEpisodeSummaries(
     rows = db
       .prepare(
         `SELECT scope, kind, episodeKey, level, eventId, spanStart, spanEnd,
-                coveredThrough, foldedRecordIds
+                coveredThrough, foldedRecordIds, verbatim
          FROM episode_summaries WHERE recordId = ?`,
       )
       .all(oldId) as unknown as CarriedEpisodeSummaryRow[];
@@ -3516,8 +3571,8 @@ function carryForwardEpisodeSummaries(
   const insert = db.prepare(
     `INSERT OR IGNORE INTO episode_summaries(
        scope, kind, episodeKey, level, recordId, eventId,
-       spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       spanStart, spanEnd, coveredThrough, foldedRecordIds, verbatim, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const row of rows) {
     insert.run(
@@ -3531,6 +3586,7 @@ function carryForwardEpisodeSummaries(
       row.spanEnd,
       row.coveredThrough,
       row.foldedRecordIds,
+      row.verbatim,
       now,
     );
   }
@@ -3542,7 +3598,7 @@ function carryForwardEpisodeSummaries(
     foldedRows = db
       .prepare(
         `SELECT scope, kind, episodeKey, level, recordId, eventId, spanStart,
-                spanEnd, coveredThrough, foldedRecordIds, createdAt
+                spanEnd, coveredThrough, foldedRecordIds, verbatim, createdAt
          FROM episode_summaries ep
          WHERE ep.level = 'episode'
            AND EXISTS (
@@ -3568,6 +3624,7 @@ function carryForwardEpisodeSummaries(
       spanEnd: row.spanEnd,
       coveredThrough: row.coveredThrough,
       foldedRecordIds: [...new Set(ids)],
+      verbatim: row.verbatim === 1,
       createdAt: row.createdAt,
     });
   }
