@@ -124,6 +124,19 @@ export function sliceRange(text: string, range: TextRange): string {
  * Display bodies use this while the raw span remains the ground truth.
  */
 export function clipTextToNormalizedCp(text: string, maxCp: number): string {
-  const first = splitTextRanges(text, maxCp)[0];
-  return first === undefined ? "" : sliceRange(text, first);
+  const cap = Number.isFinite(maxCp) ? Math.max(1, Math.floor(maxCp)) : 1;
+  const cps = Array.from(text);
+  let end = splitTextRanges(text, cap)[0]?.end ?? 0;
+  // splitTextRanges already bounds raw ranges, but this function is the last
+  // line of defense for display bodies: NEVER return a prefix whose raw OR
+  // normalized length exceeds maxCp. Shrink only if a future splitter change
+  // ever violates the raw bound (normal case returns immediately).
+  while (end > 0) {
+    const clipped = cps.slice(0, end).join("");
+    if (countCp(clipped) <= cap && countCp(normalizeBody(clipped)) <= cap) {
+      return clipped;
+    }
+    end--;
+  }
+  return "";
 }

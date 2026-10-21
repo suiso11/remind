@@ -84,6 +84,16 @@ import {
   vectorsEnabled,
 } from "./vectors.js";
 
+/**
+ * Current additive schema generation, stamped into PRAGMA user_version only
+ * after every migration and index in ensureM1Schema has succeeded. Version 2
+ * was the original M1 stamp; 3 marks the serialized, span/episode-complete
+ * schema. Older 2-stamped files are migrated in place (never refused).
+ */
+export const SCHEMA_VERSION = 3;
+/** Original M1 stamp; still accepted and upgraded on open. */
+export const LEGACY_M1_USER_VERSION = 2;
+
 export const RECORD_KINDS = [
   "user_fact",
   "model_inference",
@@ -340,7 +350,19 @@ function ensureSourceRefSpans(db: DatabaseSync): void {
   }
 }
 
-export function ensureM1Schema(db: DatabaseSync): void {
+function readSchemaVersion(db: DatabaseSync): number {
+  const row = db.prepare(`PRAGMA user_version`).get() as
+    | { user_version: number }
+    | undefined;
+  return row?.user_version ?? 0;
+}
+
+/**
+ * Whole additive-migration sequence. Callers must already hold the single
+ * write lock (ensureM1Schema acquires it, or an outer transaction owns it).
+ * Nested helpers use savepoints so one failure rolls back only its own step.
+ */
+function runM1SchemaMigrations(db: DatabaseSync): void {
   // M3 additive migration first: pre-M3 files keep every canonical row.
   migrateRecordsStatusForRetired(db);
   db.exec(`CREATE TABLE IF NOT EXISTS raw_events(
@@ -422,7 +444,23 @@ export function ensureM1Schema(db: DatabaseSync): void {
   // tagsMax (and may be dropped entirely), so readers must not infer
   // verbatim mode from tags alone.
   if (!episodeColumns.some((c) => c.name === "verbatim")) {
-    db.exec(`ALTER TABLE episode_summaries ADD COLUMN verbatim INTEGER NOT NULL DEFAULT 0 CHECK(verbatim IN (0,1))`);
+    // Add the explicit marker and backfill it from the legacy fallback tag in
+    // the SAME savepoint: rows written before the column existed identify
+    // verbatim windows only by EPISODE_WINDOW_VERBATIM_TAG. Literal matches
+    // episodes.ts to avoid a store <-> episodes import cycle.
+    db.exec(`SAVEPOINT ensure_episode_verbatim_column`);
+    try {
+      db.exec(`ALTER TABLE episode_summaries ADD COLUMN verbatim INTEGER NOT NULL DEFAULT 0 CHECK(verbatim IN (0,1))`);
+      db.exec(`UPDATE episode_summaries SET verbatim = 1
+        WHERE recordId IN (
+          SELECT recordId FROM record_tags WHERE tag = 'episode-window-verbatim'
+        )`);
+      db.exec(`RELEASE SAVEPOINT ensure_episode_verbatim_column`);
+    } catch (e) {
+      try { db.exec(`ROLLBACK TO SAVEPOINT ensure_episode_verbatim_column`); } catch { /* preserve error */ }
+      try { db.exec(`RELEASE SAVEPOINT ensure_episode_verbatim_column`); } catch { /* preserve error */ }
+      throw e;
+    }
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_episode
     ON episode_summaries(scope, kind, episodeKey, level)`);
@@ -479,6 +517,49 @@ export function ensureM1Schema(db: DatabaseSync): void {
   // never throws, never touches canonical rows; recall's bodyNorm fallback
   // covers reads even when repair fails.
   maybeRebuildDerivedIndexes(db);
+}
+
+/**
+ * Serialized schema initialization. The ENTIRE additive sequence above runs
+ * under one write lock: BEGIN IMMEDIATE is acquired before any PRAGMA
+ * table_info inspection and held through every ALTER/TABLE rebuild and index
+ * creation. A concurrent opener therefore waits (busy_timeout) and re-inspects
+ * the committed schema instead of racing a stale snapshot into a "duplicate
+ * column" failure. When an outer transaction already owns the lock (initDb),
+ * the sequence composes as a savepoint.
+ *
+ * Fast path: a completed init stamps PRAGMA user_version=SCHEMA_VERSION, so an
+ * already-current file takes no write lock at all.
+ */
+export function ensureM1Schema(db: DatabaseSync): void {
+  if (readSchemaVersion(db) === SCHEMA_VERSION) return;
+  const ownTransaction = !db.isTransaction;
+  if (ownTransaction) db.exec("BEGIN IMMEDIATE");
+  else db.exec(`SAVEPOINT ensure_m1_schema_txn`);
+  const commit = (): void => {
+    if (ownTransaction) db.exec("COMMIT");
+    else db.exec(`RELEASE SAVEPOINT ensure_m1_schema_txn`);
+  };
+  const rollback = (): void => {
+    if (ownTransaction) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve error */ }
+    } else {
+      try { db.exec(`ROLLBACK TO SAVEPOINT ensure_m1_schema_txn`); } catch { /* preserve error */ }
+      try { db.exec(`RELEASE SAVEPOINT ensure_m1_schema_txn`); } catch { /* preserve error */ }
+    }
+  };
+  try {
+    // Re-check after acquiring the lock: another opener may have completed
+    // the sequence while this connection was waiting on busy_timeout.
+    if (readSchemaVersion(db) !== SCHEMA_VERSION) {
+      runM1SchemaMigrations(db);
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    }
+    commit();
+  } catch (e) {
+    rollback();
+    throw e;
+  }
 }
 
 /**
@@ -834,7 +915,11 @@ export function rebuildDerivedIndexes(db: DatabaseSync): { notes: number; raw: n
   const rawRows = db
     .prepare(`SELECT eventId, bodyNorm FROM raw_events ORDER BY createdAt ASC, eventId ASC`)
     .all() as Array<{ eventId: string; bodyNorm: string }>;
-  db.exec("BEGIN IMMEDIATE");
+  // Compose with ensureM1Schema's outer write transaction (savepoint) as well
+  // as standalone callers (own BEGIN IMMEDIATE).
+  const ownTransaction = !db.isTransaction;
+  if (ownTransaction) db.exec("BEGIN IMMEDIATE");
+  else db.exec(`SAVEPOINT rebuild_derived_indexes`);
   try {
     db.exec(`DELETE FROM fts_notes`);
     db.exec(`DELETE FROM fts_raw`);
@@ -877,13 +962,15 @@ export function rebuildDerivedIndexes(db: DatabaseSync): { notes: number; raw: n
         }
       }
     }
-    db.exec("COMMIT");
+    if (ownTransaction) db.exec("COMMIT");
+    else db.exec(`RELEASE SAVEPOINT rebuild_derived_indexes`);
     return { notes: noteRows.length, raw: rawRows.length, bigrams };
   } catch (e) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      /* ignore */
+    if (ownTransaction) {
+      try { db.exec("ROLLBACK"); } catch { /* ignore */ }
+    } else {
+      try { db.exec(`ROLLBACK TO SAVEPOINT rebuild_derived_indexes`); } catch { /* ignore */ }
+      try { db.exec(`RELEASE SAVEPOINT rebuild_derived_indexes`); } catch { /* ignore */ }
     }
     throw e;
   }

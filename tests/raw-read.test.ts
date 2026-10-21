@@ -836,4 +836,104 @@ describe("legacy raw_events / record_source_refs migration", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("serializes the whole schema upgrade so a second initDb never races a duplicate column", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raw-read-init-race-"));
+    const { config, configPath } = baseConfig(dir, [OTHER]);
+    let a: DatabaseSync | null = null;
+    let worker: Worker | null = null;
+    try {
+      // Legacy M1-v2 file with the pre-privacy/pre-chunk/pre-span shape.
+      const legacy = new DatabaseSync(config.dbPath);
+      try {
+        legacy.exec(`CREATE TABLE scopes(scope TEXT PRIMARY KEY)`);
+        legacy.prepare(`INSERT INTO scopes(scope) VALUES (?)`).run(SCOPE);
+        legacy.exec(`CREATE TABLE raw_events(
+          eventId TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT NOT NULL,
+          body TEXT NOT NULL, bodyNorm TEXT NOT NULL,
+          source TEXT NOT NULL, observedAt TEXT NOT NULL,
+          scope TEXT NOT NULL, runId TEXT NULL, createdAt TEXT NOT NULL)`);
+        legacy.exec(`CREATE TABLE records(
+          id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyNorm TEXT NOT NULL, bodyHash TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','summary','correction')),
+          source TEXT NOT NULL, observedAt TEXT NOT NULL, scope TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('active','superseded','archived','retired')),
+          supersedes TEXT NULL, revision INTEGER NOT NULL, createdAt TEXT NOT NULL)`);
+        legacy.exec(`CREATE TABLE record_source_refs(
+          recordId TEXT NOT NULL, eventId TEXT NOT NULL,
+          PRIMARY KEY(recordId, eventId))`);
+        legacy.exec(`PRAGMA journal_mode = WAL`);
+        legacy.exec(`PRAGMA user_version = 2`);
+      } finally {
+        legacy.close();
+      }
+
+      // First connection inspects and runs the ENTIRE additive sequence under
+      // its write lock, but does not commit yet.
+      a = new DatabaseSync(config.dbPath);
+      a.exec(`PRAGMA busy_timeout = 5000`);
+      a.exec("BEGIN IMMEDIATE");
+      ensureM1Schema(a);
+
+      interface InitResult {
+        ok: boolean;
+        error?: string;
+        userVersion?: number;
+      }
+      worker = new Worker(path.join(__dirname, "fixtures", "legacy-init-worker.js"), {
+        workerData: { dbPath: config.dbPath, configPath, config, busyMs: 5000 },
+      });
+      const ready = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("worker ready timeout")), 10000);
+        worker!.once("message", (msg: { type?: string }) => {
+          clearTimeout(timer);
+          if (msg.type === "ready") resolve();
+          else reject(new Error(`unexpected worker message ${JSON.stringify(msg)}`));
+        });
+        worker!.once("error", reject);
+      });
+      const resultPromise = new Promise<InitResult>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("worker result timeout")), 10000);
+        const onMessage = (msg: { type?: string; result?: unknown }): void => {
+          if (msg.type !== "result") return;
+          clearTimeout(timer);
+          worker!.off("message", onMessage);
+          resolve(msg.result as InitResult);
+        };
+        worker!.on("message", onMessage);
+        worker!.once("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      });
+      await ready;
+      // Let the second opener reach BEGIN IMMEDIATE and wait on the first.
+      await new Promise((r) => setTimeout(r, 100));
+      a.exec("COMMIT");
+
+      const result = await resultPromise;
+      assert.equal(result.ok, true, result.error);
+      assert.equal(result.userVersion, 3);
+      // Both connections see the fully migrated, committed schema.
+      for (const table of ["raw_events", "records"]) {
+        const cols = (
+          a!.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+        ).map((c) => c.name);
+        assert.ok(cols.includes("privacySensitivity"), `${table}.privacySensitivity`);
+      }
+      const refCols = (
+        a!.prepare(`PRAGMA table_info(record_source_refs)`).all() as Array<{ name: string }>
+      ).map((c) => c.name);
+      assert.ok(refCols.includes("spanStart"));
+      assert.ok(refCols.includes("spanEnd"));
+    } finally {
+      if (worker) await worker.terminate();
+      try {
+        a?.close();
+      } catch {
+        /* ignore */
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

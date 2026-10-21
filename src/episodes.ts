@@ -1728,24 +1728,43 @@ export async function maintainEpisodes(
         let finalSummary: string | null = null;
         let citedWindows: EpisodeWindow[] = [];
         if (reduceOk && !aborted) {
+          // The joined body must satisfy BOTH the raw code-point budget and
+          // the normalized body budget, separators included: NFKC can compose
+          // decomposed input (e + U+0301 -> é), so normalized length alone can
+          // hide a raw body that rememberRecord/correctRecord reject.
+          const addPart = (
+            parts: string[],
+            budgets: { raw: number; norm: number },
+            text: string,
+          ): boolean => {
+            const sep = parts.length === 0 ? 0 : 1;
+            const rawCp = countCp(text);
+            const normCp = countCp(normalizeBody(text));
+            if (
+              budgets.raw + sep + rawCp > bodyMaxCp ||
+              budgets.norm + sep + normCp > bodyMaxCp
+            ) {
+              return false;
+            }
+            parts.push(text);
+            budgets.raw += sep + rawCp;
+            budgets.norm += sep + normCp;
+            return true;
+          };
           if (kept.length > 0) {
             const parts: string[] = [];
-            let used = 0;
+            const budgets = { raw: 0, norm: 0 };
             let included = 0;
             for (const k of kept) {
-              // Bound the exact normalized body rememberRecord/correctRecord
-              // will validate, not only the raw code-point length.
+              // Bound the exact raw and normalized body rememberRecord /
+              // correctRecord will validate.
               const text = clipTextToNormalizedCp(k.text, bodyMaxCp);
-              const sep = parts.length === 0 ? 0 : 1;
-              const textCp = countCp(normalizeBody(text));
               // Stop at the first sentence that would push the episode body
-              // over bodyMaxCp instead of skipping ahead out of order.
-              if (used + sep + textCp > bodyMaxCp) {
+              // over either budget instead of skipping ahead out of order.
+              if (!addPart(parts, budgets, text)) {
                 sentencesDropped += kept.length - included;
                 break;
               }
-              parts.push(text);
-              used += sep + textCp;
               citedWindows.push(...k.windows);
               included++;
             }
@@ -1756,14 +1775,10 @@ export async function maintainEpisodes(
             // window summaries in order. This still counts as a successful
             // reduce, so the episode is no longer stale.
             const parts: string[] = [];
-            let used = 0;
+            const budgets = { raw: 0, norm: 0 };
             for (const w of allWindows) {
               const text = clipTextToNormalizedCp(w.body, bodyMaxCp);
-              const sep = parts.length === 0 ? 0 : 1;
-              const textCp = countCp(normalizeBody(text));
-              if (parts.length > 0 && used + sep + textCp > bodyMaxCp) break;
-              parts.push(text);
-              used += sep + textCp;
+              if (!addPart(parts, budgets, text)) break;
             }
             finalSummary = parts.join(" ");
             citedWindows = allWindows;
