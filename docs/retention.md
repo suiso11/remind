@@ -24,6 +24,18 @@
 - 台帳 (`operations / audit / exposures / usage / note_heat`) は運用に必要な範囲で保持する。`exposures` は上限 1000 件で古い行から刈り込む。刈り込み失敗は `record.recall` 全体を `STORE_UNAVAILABLE` で巻き戻し、上限超過の成功を作らない (新規露出+監査の原子性)。監査の失敗は操作全体を巻き戻す (監査なしの成功を作らない)。
 - `note_heat.usedCount` は `record.feedback` の検証通過分のみ加算する累積値であり、mere recall・露出のみでは加算しない。
 
+## 外部記憶化（2026-10-21 決定・実装済み）
+
+- 決定 (2026-10-21・決定者 haruka): raw 現物は全文保持し、明示的に取り出せる。raw の取出しは `event.get` / `event.range` / `record.sources` による。
+- record は raw へのポインタである。`sourceRefs` は同一 scope の raw event を指し、任意で code point の `{eventId, start, end}` span を持つ。record 本文は raw の複製ではない。
+- 忘却は索引からの除去 (`retire` 等) であり、raw は削除しない。通常想起から外れた後も raw は保持され、明示的な raw 取出しで読める。物理削除・消去 API は依然ない。
+- 長文は `npm run ingest` で `rawBodyMaxCp` 以下のチャンクとして raw に全文入る。`event.get` は raw を頁で返し、`event.range` は範囲・session・doc で列挙する。
+- エピソード要約は派生索引である。window 要約は raw span を `sourceRefs` に持ち、CJK 文書では日本語プロンプト + assistant prefill `要約：` で生成する。生成文は `要約：` 除去・整形の後、固有名詞や数字などの anchor token が window raw に存在するかの決定的ガードと、window raw に対する厳密 YES/NO 検証を通す。内容拒否 (parse 失敗・anchor 不在・NO) の window は、その raw window 文を span 付き `summary` record として保存し `episode-window-verbatim` tag を付ける (record を書かないのではなく、episode を前進させる)。timeout・モデル失敗時は何も書かず再試行可能に止める。
+- episode 級要約は cited reduce で作る。最大 5 window ずつ、各文に引用番号 `[1][3]` を要求し、各文を引用した window の raw span に対する anchor ガードと文単位の厳密 YES/NO に通す。全文が落ちた場合は検証済み window 要約を連結する extractive fallback とし、episode record は前進する (`sentencesKept: 0`)。以前の自由文 reduce は「Elena and her husband」という幻覚を受理したが、引用付き・raw 検証付き reduce に置換した。episode 級要約は道案内であり ground truth ではないため、事実確認は `episode.windows` → `record.sources` → `event.get` の raw span で行う。
+- 増分更新では新規 window だけを書き、episode 級要約は `record.correct` で旧版を `superseded` にして履歴を保持する (競合時は新 summary + 旧版 `archived (OBSOLETE)`、削除なし)。
+- 実測 (実 Qwen2.5-1.5B CPU、`npm run smoke:episodes`): smoke OK、合計 202.9s。doc episode は model window 2 / verbatim 3、session `s-ep` は model window 1 / verbatim 2。両 episode body は extractive fallback (`sentencesKept: 0`) で、model が書いた window 要約に raw に無い固有名詞は無かった。
+- 既知の制約: 漢字複合語の anchor (raw `金曜` に対する `金曜日` など) は偽陽性拒否となり verbatim に落ちる。verbatim window は後から再要約しない。`record_source_refs` の移行は copy+swap で表を再構築する (初回 open 時に本番 DB のバックアップを取る)。raw 取出し・chunk・span の追加は `raw_events` の ALTER のみで行う。
+
 ## 可逆引退・蒸留・統合（M3 で実装済み）
 
 - 状態・スキーマ表現は `records.status` の第 4 値 `retired` に確定した（既存行を保持する savepoint 再構築で移行し、`user_version` は不変のまま `2`）。
