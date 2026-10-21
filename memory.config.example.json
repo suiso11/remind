@@ -16,7 +16,9 @@
     "responseMaxBytes": 8192,
     "rawBodyMaxCp": 8000,
     "rawPageMaxCp": 2000,
-    "rangeLimitMax": 50
+    "rangeLimitMax": 50,
+    "graphResponseMaxBytes": 65536,
+    "graphLimitMax": 50
   },
   "timeouts": {
     "cliMs": 5000,

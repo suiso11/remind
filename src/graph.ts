@@ -36,6 +36,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { canonicalTime, countCp, hasControl } from "./normalize.js";
+import { ok } from "./protocol.js";
 
 export const GRAPH_DEFAULT_MAX_NODES = 300;
 export const GRAPH_DEFAULT_MAX_EDGES = 800;
@@ -98,6 +99,14 @@ export class GraphLimitError extends Error {
   constructor(message = "graph over bound") {
     super(message);
     this.name = "GraphLimitError";
+  }
+}
+
+/** Centre record exists but belongs to a different scope (no detail leaked). */
+export class GraphLocalScopeError extends Error {
+  constructor() {
+    super("scope mismatch");
+    this.name = "GraphLocalScopeError";
   }
 }
 
@@ -493,6 +502,326 @@ export function buildGraphPage(db: GraphDb, opts: GraphPageOptions): GraphPageDa
       ? encodeGraphPageCursor({ createdAt: str(last["createdAt"]), id: str(last["id"]) })
       : null;
   return { nodes, nextCursor };
+}
+
+/* ------------------------------------------------------------------ */
+/* graph.local / graph.version: Obsidian-like local graph + freshness  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Mutation ops that write an audit row with the affected scope. Only these
+ * rows feed the per-scope version: graph/read audit rows (graph.page,
+ * record.get, recall, search, ...) must never change a version because
+ * version reads must stay stable across pure reads.
+ */
+const GRAPH_AUDIT_WRITE_OPS = [
+  "event.append",
+  "record.remember",
+  "record.feedback",
+  "record.correct",
+  "record.archive",
+  "record.retire",
+  "record.reactivate",
+  "maintain.distill",
+  "maintain.episodes",
+  "maintain.cultivate",
+] as const;
+
+function scalarRow(db: GraphDb, sql: string, ...args: Array<string | number>): Record<string, unknown> {
+  const rows = db.prepare(sql).all(...args) as Array<Record<string, unknown>>;
+  return rows[0] ?? {};
+}
+
+/**
+ * Opaque, cheap per-scope version. It changes whenever a relevant canonical
+ * or derived row is written:
+ * - operations rowid (every mutation path writes one; global because the
+ *   ledger has no scope column),
+ * - records MAX(rowid)/COUNT for the scope (remember/correct/cultivate),
+ * - scoped write-audit MAX(rowid) (status transitions retire/reactivate/
+ *   archive, replay/state changes),
+ * - episode_summaries MAX(rowid)/COUNT/MAX(createdAt) for the scope
+ *   (maintain.episodes and direct ledger writes).
+ * Reads never insert into any of these sources.
+ */
+export function buildGraphVersion(db: GraphDb, scope: string): string {
+  const ops = scalarRow(db, `SELECT COALESCE(MAX(rowid), 0) AS m FROM operations`);
+  const rec = scalarRow(
+    db,
+    `SELECT COALESCE(MAX(rowid), 0) AS m, COUNT(*) AS c FROM records WHERE scope = ?`,
+    scope,
+  );
+  const aud = scalarRow(
+    db,
+    `SELECT COALESCE(MAX(rowid), 0) AS m FROM audit
+     WHERE scope = ? AND op IN (${GRAPH_AUDIT_WRITE_OPS.map(() => "?").join(",")})`,
+    scope,
+    ...GRAPH_AUDIT_WRITE_OPS,
+  );
+  const ep = scalarRow(
+    db,
+    `SELECT COALESCE(MAX(rowid), 0) AS m, COUNT(*) AS c,
+            COALESCE(MAX(createdAt), '') AS t
+     FROM episode_summaries WHERE scope = ?`,
+    scope,
+  );
+  return `o${num(ops["m"])}:r${num(rec["m"])}.${num(rec["c"])}:a${num(aud["m"])}:e${num(ep["m"])}.${num(ep["c"])}.${str(ep["t"])}`;
+}
+
+export interface GraphLocalNode {
+  id: string;
+  status: string;
+  kind: string;
+  /** First snippetMaxCp code points of whitespace-collapsed body. */
+  label: string;
+  tags: string[];
+  createdAt: string;
+  episode: GraphPageEpisode | null;
+  /** 0 for the centre, 1..depth for BFS hops. */
+  hop: number;
+}
+
+export interface GraphLocalEdge {
+  from: string;
+  to: string;
+  kind: "related" | "consolidation";
+}
+
+export interface GraphLocalData {
+  center: string;
+  nodes: GraphLocalNode[];
+  edges: GraphLocalEdge[];
+  truncated: boolean;
+  version: string;
+}
+
+export interface GraphLocalOptions {
+  scope: string;
+  id: string;
+  depth: 1 | 2;
+  includeRetired: boolean;
+  limit: number;
+  snippetMaxCp: number;
+  /** Byte budget for the whole encoded OK envelope (graphResponseMaxBytes). */
+  maxBytes: number;
+}
+
+interface LocalRow {
+  id: string;
+  body: string;
+  kind: string;
+  status: string;
+  createdAt: string;
+  hop: number;
+}
+
+function selectLocalRow(r: Record<string, unknown>, hop: number): LocalRow {
+  return {
+    id: str(r["id"]),
+    body: str(r["body"]),
+    kind: str(r["kind"]),
+    status: str(r["status"]),
+    createdAt: str(r["createdAt"]),
+    hop,
+  };
+}
+
+/**
+ * Neighbours of `frontier` over undirected record links (outbound AND
+ * inbound/backlinks), restricted to the same scope and included statuses.
+ * Consolidation links are ordinary record_links rows here; their kind is
+ * derived from the source record when edges are emitted. Bounded by
+ * `cap` rows per direction (LIMIT), chunked to stay under SQLite's
+ * parameter limit.
+ */
+function readLocalNeighbors(
+  db: GraphDb,
+  scope: string,
+  statuses: string[],
+  frontier: string[],
+  cap: number,
+): Array<Record<string, unknown>> {
+  if (frontier.length === 0 || cap < 1) return [];
+  const statusList = statuses.map(() => "?").join(",");
+  const out: Array<Record<string, unknown>> = [];
+  const chunk = 400;
+  for (let i = 0; i < frontier.length; i += chunk) {
+    const part = frontier.slice(i, i + chunk);
+    const idList = part.map(() => "?").join(",");
+    const baseArgs = [...part, scope, ...statuses, cap];
+    const outbound = db
+      .prepare(
+        `SELECT r.id, r.body, r.kind, r.status, r.createdAt
+         FROM record_links l JOIN records r ON r.id = l.toRef
+         WHERE l.fromId IN (${idList}) AND r.scope = ? AND r.status IN (${statusList})
+         ORDER BY r.createdAt DESC, r.id ASC LIMIT ?`,
+      )
+      .all(...baseArgs) as Array<Record<string, unknown>>;
+    const inbound = db
+      .prepare(
+        `SELECT r.id, r.body, r.kind, r.status, r.createdAt
+         FROM record_links l JOIN records r ON r.id = l.fromId
+         WHERE l.toRef IN (${idList}) AND r.scope = ? AND r.status IN (${statusList})
+         ORDER BY r.createdAt DESC, r.id ASC LIMIT ?`,
+      )
+      .all(...baseArgs) as Array<Record<string, unknown>>;
+    out.push(...outbound, ...inbound);
+  }
+  return out;
+}
+
+/**
+ * Build an Obsidian-like local graph around one record. The centre is
+ * returned regardless of status; every other node must be in the included
+ * statuses (active, plus retired with includeRetired), and every node must
+ * be in the same scope. Order: centre, then hop ascending, then
+ * createdAt DESC, id ASC. Bounded by `limit` and by `maxBytes`; shrinking
+ * drops the farthest/latest tail deterministically and sets truncated.
+ * Returns null when the centre id does not exist; throws
+ * GraphLocalScopeError when it exists in another scope.
+ */
+export function buildGraphLocal(
+  db: GraphDb,
+  opts: GraphLocalOptions,
+): GraphLocalData | null {
+  const centerRows = db
+    .prepare(`SELECT id, body, kind, status, createdAt, scope FROM records WHERE id = ?`)
+    .all(opts.id) as Array<Record<string, unknown>>;
+  if (centerRows.length === 0) return null;
+  if (str(centerRows[0]["scope"]) !== opts.scope) throw new GraphLocalScopeError();
+  const center = selectLocalRow(centerRows[0], 0);
+  const statuses = graphStatuses(opts.includeRetired, false);
+  const selected: LocalRow[] = [center];
+  const visited = new Set<string>([center.id]);
+  let frontier = [center.id];
+  let truncated = false;
+
+  for (let hop = 1; hop <= opts.depth; hop++) {
+    const slots = opts.limit - selected.length;
+    const rows = readLocalNeighbors(
+      db,
+      opts.scope,
+      statuses,
+      frontier,
+      Math.max(1, slots + 1),
+    );
+    const seen = new Set<string>();
+    const candidates: LocalRow[] = [];
+    for (const r of rows) {
+      const row = selectLocalRow(r, hop);
+      if (visited.has(row.id) || seen.has(row.id)) continue;
+      seen.add(row.id);
+      candidates.push(row);
+    }
+    candidates.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    if (candidates.length > slots) truncated = true;
+    if (slots <= 0) {
+      if (candidates.length > 0) truncated = true;
+      break;
+    }
+    const take = candidates.slice(0, slots);
+    for (const row of take) {
+      visited.add(row.id);
+      selected.push(row);
+    }
+    frontier = take.map((r) => r.id);
+    if (take.length === 0) break;
+    if (selected.length >= opts.limit) {
+      // The limit is exhausted; probe the next hop so truncated reflects
+      // real omitted neighbours without reading a whole extra layer.
+      if (hop < opts.depth) {
+        const more = readLocalNeighbors(db, opts.scope, statuses, frontier, 1);
+        if (more.some((r) => !visited.has(str(r["id"])))) truncated = true;
+      }
+      break;
+    }
+  }
+
+  const ids = selected.map((r) => r.id);
+  const tagsById = readGraphTags(db, ids);
+  const episodes = readPageEpisodes(db, opts.scope, ids);
+  const nodes: GraphLocalNode[] = selected.map((r) => ({
+    id: r.id,
+    status: r.status,
+    kind: r.kind,
+    label: pageLabel(r.body, opts.snippetMaxCp),
+    tags: tagsById.get(r.id) ?? [],
+    createdAt: r.createdAt,
+    episode: episodes.get(r.id) ?? null,
+    hop: r.hop,
+  }));
+
+  const idSet = new Set(ids);
+  const kindById = new Map(selected.map((r) => [r.id, r.kind] as [string, string]));
+  const edgeSeen = new Set<string>();
+  const allEdges: GraphLocalEdge[] = [];
+  if (ids.length > 0) {
+    const chunk = 400;
+    for (let i = 0; i < ids.length; i += chunk) {
+      const part = ids.slice(i, i + chunk);
+      const idList = part.map(() => "?").join(",");
+      const rows = db
+        .prepare(`SELECT fromId, toRef FROM record_links WHERE fromId IN (${idList})`)
+        .all(...part) as Array<Record<string, unknown>>;
+      for (const r of rows) {
+        const from = str(r["fromId"]);
+        const to = str(r["toRef"]);
+        if (!idSet.has(from) || !idSet.has(to)) continue;
+        const key = `${from}\u0000${to}`;
+        if (edgeSeen.has(key)) continue;
+        edgeSeen.add(key);
+        allEdges.push({ from, to, kind: edgeKindForKind(kindById.get(from) ?? "") });
+      }
+    }
+  }
+  allEdges.sort((a, b) => {
+    if (a.from !== b.from) return a.from < b.from ? -1 : 1;
+    if (a.to !== b.to) return a.to < b.to ? -1 : 1;
+    return a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0;
+  });
+
+  const version = buildGraphVersion(db, opts.scope);
+  const assemble = (n: number): { data: GraphLocalData; bytes: number } => {
+    const kept = nodes.slice(0, n);
+    const keptIds = new Set(kept.map((node) => node.id));
+    const data: GraphLocalData = {
+      center: center.id,
+      nodes: kept,
+      edges: allEdges.filter((e) => keptIds.has(e.from) && keptIds.has(e.to)),
+      truncated: truncated || n < nodes.length,
+      version,
+    };
+    const envelope = ok({
+      center: data.center,
+      nodes: data.nodes,
+      edges: data.edges,
+      truncated: data.truncated,
+      version: data.version,
+    });
+    return { data, bytes: Buffer.byteLength(JSON.stringify(envelope), "utf8") };
+  };
+
+  // Monotone shrink: prefixes only, so a binary search finds the largest
+  // prefix whose whole envelope fits. The centre alone must fit.
+  const whole = assemble(nodes.length);
+  if (whole.bytes <= opts.maxBytes) return whole.data;
+  let lo = 1;
+  let hi = nodes.length;
+  let best = -1;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (assemble(mid).bytes <= opts.maxBytes) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (best < 1) throw new GraphLimitError();
+  return assemble(best).data;
 }
 
 /** Serialize embedded JSON so `</script>`/event-handler breakouts cannot escape. */

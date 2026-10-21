@@ -18,6 +18,14 @@ export interface LimitsConfig {
   rawBodyMaxCp?: number;
   rawPageMaxCp?: number;
   rangeLimitMax?: number;
+  /**
+   * Graph read bounds (optional). graphResponseMaxBytes defaults to
+   * responseMaxBytes; graphLimitMax defaults to rangeLimitMax. They apply to
+   * graph.page / graph.local only, so an operator can fetch a whole graph
+   * without widening every other op.
+   */
+  graphResponseMaxBytes?: number;
+  graphLimitMax?: number;
 }
 
 export interface TimeoutsConfig {
@@ -131,6 +139,8 @@ const LIMIT_KEYS = [
   "rawBodyMaxCp",
   "rawPageMaxCp",
   "rangeLimitMax",
+  "graphResponseMaxBytes",
+  "graphLimitMax",
 ] as const;
 const TIMEOUT_KEYS = ["cliMs", "busyMs"] as const;
 
@@ -274,6 +284,24 @@ export function loadConfig(configPath: string): AppConfig {
   if (hasRangeLimitMax && limitDefault > rangeLimitMax) {
     throw new Error("limits.limitDefault must be <= limits.rangeLimitMax");
   }
+  // Graph-only bounds (optional): larger response budget and node cap so
+  // Companion can pull a whole graph in one call without changing any other
+  // op's limits. Defaults preserve graph.page's previous behavior.
+  const responseMaxBytes = lim["responseMaxBytes"] as number;
+  const graphResponseMaxBytesRaw =
+    lim["graphResponseMaxBytes"] ?? responseMaxBytes;
+  const eGrb = checkRange(
+    "limits.graphResponseMaxBytes",
+    graphResponseMaxBytesRaw,
+    responseMaxBytes,
+    1048576,
+  );
+  if (eGrb) throw new Error(eGrb);
+  const graphResponseMaxBytes = graphResponseMaxBytesRaw as number;
+  const graphLimitMaxRaw = lim["graphLimitMax"] ?? rangeLimitMax;
+  const eGlm = checkRange("limits.graphLimitMax", graphLimitMaxRaw, 1, 2000);
+  if (eGlm) throw new Error(eGlm);
+  const graphLimitMax = graphLimitMaxRaw as number;
 
   if (!isPlainObject(timeouts)) throw new Error("timeouts must be an object");
   for (const k of Object.keys(timeouts)) {
@@ -449,6 +477,8 @@ export function loadConfig(configPath: string): AppConfig {
       rawBodyMaxCp,
       rawPageMaxCp,
       rangeLimitMax,
+      graphResponseMaxBytes,
+      graphLimitMax,
     },
     timeouts: {
       cliMs: to["cliMs"] as number,
@@ -481,6 +511,16 @@ export function rangeLimitMax(config: AppConfig): number {
     config.limits.rangeLimitMax ??
     Math.max(RANGE_LIMIT_MAX_DEFAULT, config.limits.limitDefault)
   );
+}
+
+/** Graph-only byte budget (graph.page / graph.local). */
+export function graphResponseMaxBytes(config: AppConfig): number {
+  return config.limits.graphResponseMaxBytes ?? config.limits.responseMaxBytes;
+}
+
+/** Graph-only node limit cap (graph.page / graph.local). */
+export function graphLimitMax(config: AppConfig): number {
+  return config.limits.graphLimitMax ?? rangeLimitMax(config);
 }
 
 /** M3 local-LLM + maintenance defaults (startup-only; documented in docs/retention.md). */
