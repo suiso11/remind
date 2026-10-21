@@ -49,7 +49,7 @@ import {
 } from "./llm.js";
 import { canonicalTime, countCp, hasControl, requestHashFor } from "./normalize.js";
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
-import { splitTextRanges } from "./split.js";
+import { clipTextToNormalizedCp, splitTextRanges } from "./split.js";
 import type { SourceRef } from "./sourceref.js";
 import {
   archiveRecord,
@@ -1143,9 +1143,15 @@ function episodeLinks(windows: EpisodeWindow[], max: number): string[] {
   return out;
 }
 
-/** Normalized whitespace + bodyMaxCp clip for a verbatim window fallback. */
+/**
+ * Normalized whitespace + bodyMaxCp clip for a verbatim window fallback.
+ * The clip bounds BOTH the raw code points and `normalizeBody` output, because
+ * NFKC can expand code points (e.g. "…" -> "...") and rememberRecord rejects
+ * a body whose normalized length exceeds bodyMaxCp. The span sourceRef still
+ * covers the whole window; this body is only a bounded display prefix.
+ */
 function verbatimWindowBody(text: string, bodyMaxCp: number): string {
-  return clipCp(text.replace(/\s+/g, " ").trim(), bodyMaxCp);
+  return clipTextToNormalizedCp(text.replace(/\s+/g, " ").trim(), bodyMaxCp);
 }
 
 /**

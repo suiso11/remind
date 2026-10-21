@@ -117,3 +117,13 @@ export function sliceRange(text: string, range: TextRange): string {
     .slice(range.start, range.end)
     .join("");
 }
+
+/**
+ * Largest leading code-point range of `text` whose raw and normalized
+ * lengths both stay within `maxCp`. Returns "" when no non-empty prefix fits.
+ * Display bodies use this while the raw span remains the ground truth.
+ */
+export function clipTextToNormalizedCp(text: string, maxCp: number): string {
+  const first = splitTextRanges(text, maxCp)[0];
+  return first === undefined ? "" : sliceRange(text, first);
+}

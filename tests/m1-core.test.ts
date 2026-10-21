@@ -302,6 +302,26 @@ describe("m1 strict startup config", () => {
     }
   });
 
+  it("defaults omitted rangeLimitMax to at least limitDefault", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "m1-cfg-range-"));
+    try {
+      const limits = {
+        ...(validObj()["limits"] as Record<string, unknown>),
+        limitDefault: 80,
+        limitMax: 100,
+      };
+      const cfg = loadConfig(writeConfig(dir, { ...validObj(), limits }));
+      assert.equal(cfg.limits.rangeLimitMax, 80);
+
+      assert.throws(
+        () => loadConfig(writeConfig(dir, { ...validObj(), limits: { ...limits, rangeLimitMax: 50 } })),
+        /limitDefault must be <= limits.rangeLimitMax/,
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("shipped example config loads", () => {
     const cfg = loadConfig(path.join(process.cwd(), "memory.config.example.json"));
     assert.ok(cfg.vaultPath.length > 0);

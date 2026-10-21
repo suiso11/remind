@@ -261,11 +261,17 @@ export function loadConfig(configPath: string): AppConfig {
   const eRp = checkRange("limits.rawPageMaxCp", rawPageMaxCpRaw, 1, 65536);
   if (eRp) throw new Error(eRp);
   const rawPageMaxCp = rawPageMaxCpRaw as number;
-  const rangeLimitMaxRaw = lim["rangeLimitMax"] ?? RANGE_LIMIT_MAX_DEFAULT;
+  // An omitted rangeLimitMax must never make a valid limitDefault (51..100)
+  // fail startup: default it to at least limitDefault. An explicitly set
+  // value keeps the strict cross-check below.
+  const hasRangeLimitMax = lim["rangeLimitMax"] !== undefined;
+  const rangeLimitMaxRaw = hasRangeLimitMax
+    ? lim["rangeLimitMax"]
+    : Math.max(RANGE_LIMIT_MAX_DEFAULT, limitDefault);
   const eRl = checkRange("limits.rangeLimitMax", rangeLimitMaxRaw, 1, 1000);
   if (eRl) throw new Error(eRl);
   const rangeLimitMax = rangeLimitMaxRaw as number;
-  if (limitDefault > rangeLimitMax) {
+  if (hasRangeLimitMax && limitDefault > rangeLimitMax) {
     throw new Error("limits.limitDefault must be <= limits.rangeLimitMax");
   }
 
@@ -471,7 +477,10 @@ export function rawPageMaxCp(config: AppConfig): number {
   return config.limits.rawPageMaxCp ?? RAW_PAGE_MAX_CP_DEFAULT;
 }
 export function rangeLimitMax(config: AppConfig): number {
-  return config.limits.rangeLimitMax ?? RANGE_LIMIT_MAX_DEFAULT;
+  return (
+    config.limits.rangeLimitMax ??
+    Math.max(RANGE_LIMIT_MAX_DEFAULT, config.limits.limitDefault)
+  );
 }
 
 /** M3 local-LLM + maintenance defaults (startup-only; documented in docs/retention.md). */

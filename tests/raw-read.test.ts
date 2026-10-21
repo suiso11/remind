@@ -555,6 +555,65 @@ describe("record.sources spans and excerpts", () => {
     }
   });
 
+  it("shares the excerpt budget across eight long spans so the response fits", () => {
+    const ctx = setup();
+    try {
+      ctx.config.limits.rawPageMaxCp = 2000;
+      const texts: string[] = [];
+      const refs: Array<{ eventId: string; start: number; end: number }> = [];
+      for (let i = 0; i < 8; i++) {
+        const eventId = `e-share-${i}`;
+        const body = String.fromCharCode(65 + i).repeat(1200);
+        appendOk(ctx.db, ctx.config, eventId, OBS, { body });
+        texts.push(body);
+        refs.push({ eventId, start: 0, end: 1200 });
+      }
+      const remembered = remember(ctx.db, ctx.config, "shared-budget", "shared budget note", refs);
+      const id = expectOk<{ record: { id: string } }>(remembered).record.id;
+      const res = recordSources(ctx.db, ctx.config, { id, scope: SCOPE });
+      const data = expectOk<SourcesData>(res);
+      assert.equal(data.sources.length, 8);
+      for (const [i, source] of data.sources.entries()) {
+        assert.equal(source.truncated, true);
+        assert.ok(source.excerpt.length > 0);
+        assert.ok(texts[i]!.startsWith(source.excerpt));
+        assert.ok(source.excerpt.length <= 250, `cap ${source.excerpt.length}`);
+      }
+      assert.ok(Buffer.byteLength(JSON.stringify(res), "utf8") <= ctx.config.limits.responseMaxBytes);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("shrinks shared excerpt caps for multibyte spans until the response fits", () => {
+    const ctx = setup();
+    try {
+      ctx.config.limits.rawPageMaxCp = 2000;
+      const texts: string[] = [];
+      const refs: Array<{ eventId: string; start: number; end: number }> = [];
+      for (let i = 0; i < 8; i++) {
+        const eventId = `e-share-multi-${i}`;
+        const body = "😀".repeat(1200);
+        appendOk(ctx.db, ctx.config, eventId, OBS, { body });
+        texts.push(body);
+        refs.push({ eventId, start: 0, end: 1200 });
+      }
+      const remembered = remember(ctx.db, ctx.config, "shared-budget-multi", "shared budget note", refs);
+      const id = expectOk<{ record: { id: string } }>(remembered).record.id;
+      const res = recordSources(ctx.db, ctx.config, { id, scope: SCOPE });
+      const data = expectOk<SourcesData>(res);
+      assert.equal(data.sources.length, 8);
+      for (const [i, source] of data.sources.entries()) {
+        assert.equal(source.truncated, true);
+        assert.ok(source.excerpt.length > 0);
+        assert.ok(texts[i]!.startsWith(source.excerpt));
+      }
+      assert.ok(Buffer.byteLength(JSON.stringify(res), "utf8") <= ctx.config.limits.responseMaxBytes);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("a dangling ref is reported as missing rather than fabricated", () => {
     const ctx = setup();
     try {

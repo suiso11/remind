@@ -22,9 +22,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { countCp, loadConfig, rawBodyMaxCp } from "../src/config.js";
+import {
+  countCp,
+  loadConfig,
+  rawBodyMaxCp,
+  requirePrivacyEnabled,
+} from "../src/config.js";
 import { initDb } from "../src/db.js";
 import { normalizeBody } from "../src/normalize.js";
+import type { PrivacyMetadata } from "../src/privacy.js";
 import { splitTextRanges } from "../src/split.js";
 import { eventAppend } from "../src/store.js";
 
@@ -75,10 +81,19 @@ async function main(): Promise<void> {
   let docId: string | null = null;
   let session: string | null = null;
   let source: string | null = null;
+  let privacySensitivity: string | null = null;
+  let privacyOrigin: string | null = null;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (
-      (a === "--config" || a === "--scope" || a === "--file" || a === "--doc-id" || a === "--session" || a === "--source") &&
+      (a === "--config" ||
+        a === "--scope" ||
+        a === "--file" ||
+        a === "--doc-id" ||
+        a === "--session" ||
+        a === "--source" ||
+        a === "--privacy-sensitivity" ||
+        a === "--privacy-origin") &&
       i + 1 < args.length
     ) {
       const v = args[++i]!;
@@ -87,10 +102,12 @@ async function main(): Promise<void> {
       else if (a === "--file") filePath = v;
       else if (a === "--doc-id") docId = v;
       else if (a === "--session") session = v;
-      else source = v;
+      else if (a === "--source") source = v;
+      else if (a === "--privacy-sensitivity") privacySensitivity = v;
+      else privacyOrigin = v;
     } else if (a === "--help" || a === "-h") {
       process.stderr.write(
-        "usage: ingest --config <path> --scope <scope> --file <path> --doc-id <id> [--session <sid>] [--source <src>]\n",
+        "usage: ingest --config <path> --scope <scope> --file <path> --doc-id <id> [--session <sid>] [--source <src>] [--privacy-sensitivity <normal|sensitive> --privacy-origin <conversation|self_activity>]\n",
       );
       process.exit(0);
     } else {
@@ -98,6 +115,30 @@ async function main(): Promise<void> {
     }
   }
   if (!configPath || !scope || !filePath || !docId) failArgs();
+  // Both privacy flags or neither; invalid values are usage errors and must
+  // fail before the DB is even opened.
+  if ((privacySensitivity === null) !== (privacyOrigin === null)) failArgs();
+  if (
+    privacySensitivity !== null &&
+    privacySensitivity !== "normal" &&
+    privacySensitivity !== "sensitive"
+  ) {
+    failArgs();
+  }
+  if (
+    privacyOrigin !== null &&
+    privacyOrigin !== "conversation" &&
+    privacyOrigin !== "self_activity"
+  ) {
+    failArgs();
+  }
+  const privacy: PrivacyMetadata | null =
+    privacySensitivity !== null && privacyOrigin !== null
+      ? {
+          sensitivity: privacySensitivity as PrivacyMetadata["sensitivity"],
+          origin: privacyOrigin as PrivacyMetadata["origin"],
+        }
+      : null;
   if (!DOC_ID_RE.test(docId)) failArgs();
   if (session !== null && (countCp(session) < 1 || countCp(session) > 128 || /[\u0000-\u001F\u007F-\u009F]/.test(session))) {
     failArgs();
@@ -108,6 +149,12 @@ async function main(): Promise<void> {
     config = loadConfig(configPath);
   } catch {
     process.stderr.write("error: invalid config\n");
+    process.exit(2);
+  }
+  // A privacy-required store rejects every chunk append, so fail closed with
+  // the fixed ingest error before reading input or opening the store.
+  if (requirePrivacyEnabled(config) && privacy === null) {
+    process.stderr.write("error: ingest failed BAD_REQUEST\n");
     process.exit(2);
   }
 
@@ -179,6 +226,7 @@ async function main(): Promise<void> {
             provenance: { source: effectiveSource, observedAt },
             scope,
             chunk: { docId, seq: d.seq },
+            ...(privacy !== null ? { privacy } : {}),
           },
           d.idempotencyKey,
         );

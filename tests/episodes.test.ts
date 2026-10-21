@@ -12,8 +12,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AppConfig, EpisodesConfig } from "../src/config.js";
+import { countCp, type AppConfig, type EpisodesConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
+import { normalizeBody } from "../src/normalize.js";
 import { correctRecord, eventAppend, getRecord, recordSources } from "../src/store.js";
 import { listEpisodes } from "../src/store.js";
 import {
@@ -566,6 +567,38 @@ describe("maintain.episodes windows, links, and reduce", () => {
         windowRows(ctx).map((r) => r.recordId),
         [row.recordId],
       );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("writes a verbatim window when NFKC expansion would exceed bodyMaxCp", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds({ windowMaxCp: 1200 });
+      ctx.config.limits.bodyMaxCp = 200;
+      const body = "…".repeat(400);
+      append(ctx, { eventId: "ev-verbatim-nfkc", body, observedAt: T0, createdAt: T0 });
+
+      const run = episodeData(
+        await maintain(ctx, "ep-verbatim-nfkc-1", makeGen({ rejectText: "…" }), RUN1),
+      );
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsVerbatim, 1);
+      assert.equal(ep.windowsRejected, 1);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const rows = windowRows(ctx);
+      assert.equal(rows.length, 1);
+      const row = rows[0]!;
+      assert.deepEqual([row.spanStart, row.spanEnd], [0, 400]);
+      const w = rec(ctx, row.recordId);
+      assert.ok(w.tags.includes(EPISODE_WINDOW_VERBATIM_TAG));
+      assert.ok(countCp(w.body) > 0);
+      assert.ok(countCp(w.body) <= 200, `raw ${countCp(w.body)}`);
+      assert.ok(countCp(normalizeBody(w.body)) <= 200, `normalized ${countCp(normalizeBody(w.body))}`);
+      assert.equal(w.body, "…".repeat(countCp(w.body)));
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
     } finally {
       ctx.cleanup();
     }

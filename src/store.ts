@@ -2351,7 +2351,9 @@ export function recordSources(
       } catch {
         throw new Error("read failed");
       }
-      const sources = refs.map((r) => {
+      // Resolve each ref once; excerpt caps are applied later so the whole
+      // response can be kept within responseMaxBytes deterministically.
+      const base = refs.map((r) => {
         let raw:
           | {
               sessionId: string;
@@ -2381,7 +2383,6 @@ export function recordSources(
           r.spanEnd !== null && r.spanEnd !== undefined;
         const start = hasSpan ? Math.min(r.spanStart as number, cps.length) : 0;
         const end = hasSpan ? Math.min(r.spanEnd as number, cps.length) : cps.length;
-        const segment = cps.slice(start, end);
         return {
           eventId: r.eventId,
           sessionId: raw.sessionId,
@@ -2389,25 +2390,56 @@ export function recordSources(
           chunk: chunkFromColumns(raw.docId, raw.chunkSeq),
           totalCp: cps.length,
           span: hasSpan ? { start: r.spanStart as number, end: r.spanEnd as number } : null,
-          excerpt: segment.slice(0, excerptMax).join(""),
-          truncated: segment.length > excerptMax,
+          segment: cps.slice(start, end),
         };
       });
-      const stored = budgeted(ok({ id, sources }), config);
-      if (!stored.ok) throw new Error("response over budget");
-      auditInsert(db, {
-        ts: now,
-        op: "record.sources",
-        targetId: id as string,
-        code: stored.code,
-        scope: nScope,
-        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
-        limitN: null,
-        runId: null,
-        recallId: null,
-        reasonCode: null,
-      });
-      return stored;
+      // Share the excerpt budget across every source instead of giving each
+      // one rawPageMaxCp. If the encoded envelope still does not fit, halve
+      // the (uniform) caps down to a floor. Full text stays available through
+      // event.get with offset=span.start.
+      const sourceCount = base.length;
+      const initialCap =
+        sourceCount === 0 ? excerptMax : Math.max(1, Math.floor(excerptMax / sourceCount));
+      const floor = Math.min(16, initialCap);
+      let caps = base.map(() => initialCap);
+      for (;;) {
+        const sources = base.map((s, i) => {
+          if ("missing" in s) return s;
+          const cap = caps[i] as number;
+          return {
+            eventId: s.eventId,
+            sessionId: s.sessionId,
+            observedAt: s.observedAt,
+            chunk: s.chunk,
+            totalCp: s.totalCp,
+            span: s.span,
+            excerpt: s.segment.slice(0, cap).join(""),
+            truncated: s.segment.length > cap,
+          };
+        });
+        const candidate = ok({ id, sources });
+        if (successFits(candidate, config.limits.responseMaxBytes)) {
+          const stored = budgeted(candidate, config);
+          auditInsert(db, {
+            ts: now,
+            op: "record.sources",
+            targetId: id as string,
+            code: stored.code,
+            scope: nScope,
+            bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+            limitN: null,
+            runId: null,
+            recallId: null,
+            reasonCode: null,
+          });
+          return stored;
+        }
+        const next = caps.map((cap) => Math.max(floor, Math.floor(cap / 2)));
+        if (next.every((cap, i) => cap === caps[i])) {
+          throw new Error("response over budget");
+        }
+        caps = next;
+      }
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

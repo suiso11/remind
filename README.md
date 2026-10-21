@@ -22,7 +22,7 @@ Copy-Item memory.config.example.json memory.config.json
 - `vaultPath`: Markdown 投影先 (必須、欠落は起動失敗)。例 `./vault`
 - `allowedScopes`: 利用可能スコープ。例 `["personal/default"]`
 - `limits`: `bodyMaxCp / queryMaxCp / tagsMax / linksMax / sourceRefsMax / limitDefault / limitMax / snippetMaxCp / responseMaxBytes` (+ `rawBodyMaxCp / rawPageMaxCp / rangeLimitMax`)
-- `bodyMaxCp` は record 本文のみに適用する。raw 本文は `rawBodyMaxCp` (既定 8000、1..65536)、`event.get` の 1 頁は `rawPageMaxCp` (既定 2000、1..65536)、`event.range / episode.list / episode.windows` の `limit` 上限は `rangeLimitMax` (既定 50、1..1000) を使う。
+- `bodyMaxCp` は record 本文のみに適用する。raw 本文は `rawBodyMaxCp` (既定 8000、1..65536)、`event.get` の 1 頁は `rawPageMaxCp` (既定 2000、1..65536)、`event.range / episode.list / episode.windows` の `limit` 上限は `rangeLimitMax` (既定 50、1..1000) を使う。`rangeLimitMax` を省略した場合は `max(50, limitDefault)` が既定になり、`limitDefault` が 51..100 でも起動失敗しない (明示した場合のみ `limitDefault <= rangeLimitMax` を検査する)。
 - `episodes` (任意): `utcOffsetMinutes` (既定 0、-720..840)、`windowMaxCp` (既定 1200、200..4000)、`maxNewTokens` (既定 128、16..256)、`batchMax` (既定 5、1..50)。`utcOffsetMinutes` は `day` の日境界だけをずらし、保存時刻は UTC のまま。
 - `timeouts`: `cliMs` (全体期限)、`busyMs` (SQLite 待機)
 - `dbMaxBytes`: 上限超過の書き込みは `STORE_UNAVAILABLE` で巻き戻し。読み取りは継続する
@@ -79,7 +79,7 @@ npm run build
 npm run ingest -- --config ./memory.config.json --scope personal/default --file ./doc.md --doc-id doc-001
 ```
 
-- `--config / --scope / --file / --doc-id` は必須、`--session / --source` は任意。UTF-8 文書を `rawBodyMaxCp` 以下のチャンクに分割する。境界は段落 (`\n\n` / CRLF) → 行 (`\n`) → code point 強制切断の順で、surrogate pair を割らず、空白のみのチャンクは作らない。NFKC 正規化は code point を増やし得る (例: `…` → `...`) ため、各チャンクは raw 長と `normalizeBody` 後長の両方で `rawBodyMaxCp` 以下になるよう境界を選ぶ。
+- `--config / --scope / --file / --doc-id` は必須、`--session / --source` は任意。`--privacy-sensitivity <normal|sensitive>` と `--privacy-origin <conversation|self_activity>` は両方指定するか両方省略する (片方だけ・不正値は usage error で終了 2)。指定時は全チャンクの `event.append` に `privacy` として渡す。`requirePrivacy: true` の config で両方省略した場合は、DB を開く前に固定の `error: ingest failed BAD_REQUEST` で終了 2 になる。UTF-8 文書を `rawBodyMaxCp` 以下のチャンクに分割する。境界は段落 (`\n\n` / CRLF) → 行 (`\n`) → code point 強制切断の順で、surrogate pair を割らず、空白のみのチャンクは作らない。NFKC 正規化は code point を増やし得る (例: `…` → `...`) ため、各チャンクは raw 長と `normalizeBody` 後長の両方で `rawBodyMaxCp` 以下になるよう境界を選ぶ。
 - 書込み前に全チャンクを検証する: raw 長・正規化後長が上限超過なら `LIMIT_EXCEEDED`、正規化後に空なら `BAD_REQUEST` で、DB を開かず 1 件も追記しない (fail closed)。
 - 各チャンクは冪等な `event.append` になる: `eventId = <docId>-c<seq>`、`idempotencyKey = ingest-<docId>-<seq>`、`turnId = <seq>`、`sessionId` 既定 `doc:<docId>`、`source` 既定 `file:<basename>`、`observedAt` はファイル mtime、`chunk = {docId, seq}`。同じファイルの再実行は `deduplicated` で二重追記しない。
 - 標準出力は 1 行 `{docId, chunks, appended, deduplicated}`。引数・config 不正は stderr + 終了 2、DB 起動失敗は終了 3。同じ `(docId, seq)` を別 `eventId` で追記すると `CONFLICT`。
