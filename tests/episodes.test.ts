@@ -604,6 +604,46 @@ describe("maintain.episodes windows, links, and reduce", () => {
     }
   });
 
+  it("writes an extractive episode whose NFKC-expanded body stays within bodyMaxCp", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds({ windowMaxCp: 1200 });
+      ctx.config.limits.bodyMaxCp = 200;
+      // Two 100-code-point raw bodies become 66-cp verbatim windows (198
+      // normalized cp each). Joining both windows fits raw (133) but expands
+      // past 200 after NFKC, so only the first piece may be included.
+      append(ctx, { eventId: "ev-nfkc-body-1", body: "…".repeat(100), observedAt: T0, createdAt: T0 });
+      append(ctx, { eventId: "ev-nfkc-body-2", body: "…".repeat(100), observedAt: T1, createdAt: T1 });
+
+      // Content-rejected windows, and every cited sentence fails verification
+      // so the reduce falls back to the extractive window concatenation.
+      const run = episodeData(
+        await maintain(
+          ctx,
+          "ep-nfkc-body-1",
+          makeGen({ rejectText: "…", claimVerify: "NO" }),
+          RUN1,
+        ),
+      );
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsVerbatim, 2);
+      assert.equal(ep.windowsRejected, 2);
+      assert.equal(ep.extractive, true);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const body = rec(ctx, ep.episodeRecordId as string).body;
+      assert.ok(countCp(body) > 0);
+      assert.ok(countCp(body) <= 200, `raw ${countCp(body)}`);
+      assert.ok(
+        countCp(normalizeBody(body)) <= 200,
+        `normalized ${countCp(normalizeBody(body))}`,
+      );
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("writes verbatim windows for a failed verification at event 2 and advances", async () => {
     const ctx = setup();
     try {
@@ -1481,17 +1521,20 @@ describe("episode ledger follows record.correct revisions", () => {
     recordId: string,
     body: string,
     key: string,
+    privacy?: { sensitivity: "normal" | "sensitive"; origin: "conversation" | "self_activity" },
   ): string {
+    const params: Record<string, unknown> = {
+      recordId,
+      body,
+      kind: "correction",
+      provenance: { source: "session:s1:turn:1", observedAt: T1 },
+      scope: SCOPE,
+    };
+    if (privacy !== undefined) params["privacy"] = privacy;
     const res = correctRecord(
       ctx.db,
       ctx.config,
-      {
-        recordId,
-        body,
-        kind: "correction",
-        provenance: { source: "session:s1:turn:1", observedAt: T1 },
-        scope: SCOPE,
-      },
+      params,
       key,
       RUN2,
     );
@@ -1580,6 +1623,55 @@ describe("episode ledger follows record.correct revisions", () => {
       assert.deepEqual(run2.episodes, []);
       assert.equal(run2.applied, 0);
       assert.deepEqual(stateCounts(ctx), before);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("propagates a stricter privacy from a corrected window record to the episode", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      append(ctx, {
+        eventId: "ev-cor-priv",
+        body: longWords("omega", 60),
+        observedAt: T0,
+        createdAt: T0,
+        privacy: { sensitivity: "normal", origin: "conversation" },
+      });
+
+      const run1 = episodeData(await maintain(ctx, "ep-cor-priv-1", makeGen(), RUN1));
+      const ep1 = run1.episodes[0]!;
+      assert.notEqual(ep1.episodeRecordId, null);
+      assert.equal(rec(ctx, ep1.episodeRecordId as string).privacy?.sensitivity, "normal");
+
+      const oldWindowId = windowRows(ctx)[0]!.recordId;
+      const newWindowId = correct(
+        ctx,
+        oldWindowId,
+        "corrected sensitive window",
+        "ep-cor-priv-window",
+        { sensitivity: "sensitive", origin: "conversation" },
+      );
+      assert.notEqual(newWindowId, oldWindowId);
+
+      // A new event makes the episode stale; the reduce then rebuilds from all
+      // current windows, including the corrected (now sensitive) one.
+      append(ctx, {
+        eventId: "ev-cor-priv-2",
+        body: longWords("beta", 60),
+        observedAt: T1,
+        createdAt: T1,
+        privacy: { sensitivity: "normal", origin: "conversation" },
+      });
+      const run2 = episodeData(await maintain(ctx, "ep-cor-priv-2", makeGen(), RUN2));
+      const ep2 = run2.episodes[0]!;
+      assert.notEqual(ep2.episodeRecordId, null);
+      assert.deepEqual(rec(ctx, ep2.episodeRecordId as string).privacy, {
+        sensitivity: "sensitive",
+        origin: "self_activity",
+      });
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
     } finally {
       ctx.cleanup();
     }

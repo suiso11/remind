@@ -36,7 +36,11 @@ import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import { episodesBounds, maintenanceTimeoutMs, requirePrivacyEnabled } from "./config.js";
 import { acquireCultivationLease, isCultivationLeaseHeldBy, releaseCultivationLease } from "./cultivation.js";
-import { deriveConsolidationPrivacy, type PrivacyMetadata } from "./privacy.js";
+import {
+  deriveConsolidationPrivacy,
+  privacyFromColumns,
+  type PrivacyMetadata,
+} from "./privacy.js";
 import {
   generateCompletion,
   llmEnabled,
@@ -47,7 +51,13 @@ import {
   parseSummaryBody,
   resolveLlmDir,
 } from "./llm.js";
-import { canonicalTime, countCp, hasControl, requestHashFor } from "./normalize.js";
+import {
+  canonicalTime,
+  countCp,
+  hasControl,
+  normalizeBody,
+  requestHashFor,
+} from "./normalize.js";
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
 import { clipTextToNormalizedCp, splitTextRanges } from "./split.js";
 import type { SourceRef } from "./sourceref.js";
@@ -99,6 +109,20 @@ function cpLen(s: string): number {
 function clipCp(s: string, maxCp: number): string {
   const cps = [...s];
   return cps.length <= maxCp ? s : cps.slice(0, Math.max(0, maxCp)).join("");
+}
+
+/**
+ * True when appending `text` to `parts` keeps BOTH the raw and NFKC-normalized
+ * joined body within bodyMaxCp. Counting raw code points alone is not enough
+ * because NFKC can expand them (e.g. "…" -> "..."), and rememberRecord rejects
+ * a body whose normalized length exceeds the limit.
+ */
+function bodyPieceFits(parts: string[], text: string, bodyMaxCp: number): boolean {
+  const joined = parts.length === 0 ? text : `${parts.join(" ")} ${text}`;
+  return (
+    countCp(joined) <= bodyMaxCp &&
+    countCp(normalizeBody(joined)) <= bodyMaxCp
+  );
 }
 
 /** Preserve the instruction/assistant tail; never sever it from the front. */
@@ -1021,6 +1045,12 @@ interface EpisodeWindow {
   rawText: string;
   /** Privacy sensitivity of the window's raw event (NULL = unknown). */
   privacySensitivity: string | null;
+  /**
+   * Privacy sensitivity of the window's own current active record (NULL =
+   * unknown/legacy). A record.correct can tighten this independently of the
+   * raw event, so episode-level derivation must consider both.
+   */
+  recordPrivacySensitivity: string | null;
   observedAt: string;
   createdAt: string;
 }
@@ -1053,6 +1083,8 @@ function windowInputsForEpisode(
     body: string;
     eventBody: string;
     privacySensitivity: string | null;
+    recordPrivacySensitivity: string | null;
+    recordPrivacyOrigin: string | null;
     createdAt: string;
     observedAt: string;
   }>;
@@ -1063,6 +1095,8 @@ function windowInputsForEpisode(
                 s.spanStart AS spanStart, s.spanEnd AS spanEnd,
                 r.body AS body, e.body AS eventBody,
                 e.privacySensitivity AS privacySensitivity,
+                r.privacySensitivity AS recordPrivacySensitivity,
+                r.privacyOrigin AS recordPrivacyOrigin,
                 e.createdAt AS createdAt, e.observedAt AS observedAt
          FROM episode_summaries s
          JOIN records r ON r.id = s.recordId AND r.status = 'active' AND r.scope = s.scope
@@ -1094,6 +1128,9 @@ function windowInputsForEpisode(
     body: row.body,
     rawText: Array.from(row.eventBody).slice(row.spanStart, row.spanEnd).join(""),
     privacySensitivity: row.privacySensitivity,
+    recordPrivacySensitivity:
+      privacyFromColumns(row.recordPrivacySensitivity, row.recordPrivacyOrigin)
+        ?.sensitivity ?? null,
     observedAt: row.observedAt,
     createdAt: row.createdAt,
   }));
@@ -1705,19 +1742,25 @@ export async function maintainEpisodes(
         if (reduceOk && !aborted) {
           if (kept.length > 0) {
             const parts: string[] = [];
-            let used = 0;
             let included = 0;
             for (const k of kept) {
-              const text = clipCp(k.text, bodyMaxCp);
-              const sep = parts.length === 0 ? 0 : 1;
-              // Stop at the first sentence that would push the episode body
-              // over bodyMaxCp instead of skipping ahead out of order.
-              if (used + sep + cpLen(text) > bodyMaxCp) {
+              let text = clipCp(k.text, bodyMaxCp);
+              if (parts.length === 0) {
+                // Even a lone piece must satisfy the normalized bound; clip it
+                // rather than emit a body that rememberRecord rejects forever.
+                text = clipTextToNormalizedCp(text, bodyMaxCp);
+                if (text.length === 0) {
+                  sentencesDropped += kept.length - included;
+                  break;
+                }
+              } else if (!bodyPieceFits(parts, text, bodyMaxCp)) {
+                // Stop at the first sentence that would push the episode body
+                // over bodyMaxCp (raw or normalized) instead of skipping
+                // ahead out of order.
                 sentencesDropped += kept.length - included;
                 break;
               }
               parts.push(text);
-              used += sep + cpLen(text);
               citedWindows.push(...k.windows);
               included++;
             }
@@ -1728,13 +1771,15 @@ export async function maintainEpisodes(
             // window summaries in order. This still counts as a successful
             // reduce, so the episode is no longer stale.
             const parts: string[] = [];
-            let used = 0;
             for (const w of allWindows) {
-              const text = clipCp(w.body, bodyMaxCp);
-              const sep = parts.length === 0 ? 0 : 1;
-              if (parts.length > 0 && used + sep + cpLen(text) > bodyMaxCp) break;
+              let text = clipCp(w.body, bodyMaxCp);
+              if (parts.length === 0) {
+                text = clipTextToNormalizedCp(text, bodyMaxCp);
+                if (text.length === 0) break;
+              } else if (!bodyPieceFits(parts, text, bodyMaxCp)) {
+                break;
+              }
               parts.push(text);
-              used += sep + cpLen(text);
             }
             finalSummary = parts.join(" ");
             citedWindows = allWindows;
@@ -1744,11 +1789,16 @@ export async function maintainEpisodes(
 
         // Episode-level sources are the raw events of the windows the episode
         // actually cites (or, in the extractive fallback, every folded
-        // window). Origin is self_activity; sensitivity follows the same
-        // helper as maintain.distill's summary consolidation (sensitive wins,
-        // all-known => normal, else null).
+        // window), plus each cited window record's CURRENT privacy: a
+        // record.correct may have tightened a window to sensitive without
+        // changing its raw event. Origin is self_activity; sensitivity follows
+        // the same helper as maintain.distill's summary consolidation
+        // (sensitive wins, all-known => normal, else null).
         const episodePrivacy = deriveConsolidationPrivacy(
-          citedWindows.map((w) => w.privacySensitivity),
+          citedWindows.flatMap((w) => [
+            w.privacySensitivity,
+            w.recordPrivacySensitivity,
+          ]),
         );
         const strictPrivacyBlocked =
           requirePrivacyEnabled(config) && episodePrivacy === null;
