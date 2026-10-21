@@ -48,6 +48,7 @@ npm run build
 ```powershell
 '{"v":1,"op":"record.get","params":{"id":"<recordId>","scope":"personal/default"}}' | node dist/src/cli.js --config ./memory.config.json
 '{"v":1,"op":"record.list","params":{"scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
+'{"v":1,"op":"graph.page","params":{"scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
 '{"v":1,"op":"record.feedback","idempotencyKey":"fb-001","params":{"recallId":"<recallId>","recordIds":["<recordId>"],"scope":"personal/default"}}' | node dist/src/cli.js --config ./memory.config.json
 '{"v":1,"op":"record.correct","idempotencyKey":"corr-001","params":{"recordId":"<recordId>","body":"revised orchard memo","kind":"correction","provenance":{"source":"session:s1:turn:9","observedAt":"2026-09-02T00:00:00.000Z"},"scope":"personal/default","sourceRefs":["e-001"]}}' | node dist/src/cli.js --config ./memory.config.json
 '{"v":1,"op":"record.archive","idempotencyKey":"arc-001","params":{"id":"<recordId>","scope":"personal/default","reasonCode":"USER_ARCHIVED"}}' | node dist/src/cli.js --config ./memory.config.json
@@ -58,6 +59,7 @@ npm run build
 - `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。
 - `record.archive` は `active -> archived` の終端遷移 (復帰なし)。`reasonCode` は `USER_ARCHIVED / OBSOLETE / DUPLICATE` の固定コードのみ。行は保持され、削除ではない。
 - `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード)。`record.list` に `status:"retired"` を指定すると引退済みを一覧できる。`record.search` は active + retired の明示的検索。
+- `graph.page` は同一 scope の active (+任意 `includeRetired`) を `createdAt DESC, id ASC` で不透明 cursor 頁送りし、`nodes[{id, status, kind, label, tags, createdAt, episode, out, danglingOut}] + nextCursor` を返す。`label` は空白畳み後の先頭 `snippetMaxCp` code point、`out` は同一 scope で status が対象に含まれる node のみ (それ以外は `danglingOut` 件数)。`limit` 既定は `limitDefault`、`limit < 1` は `BAD_REQUEST`、`limit > rangeLimitMax` は `LIMIT_EXCEEDED`、不正 cursor は `BAD_REQUEST`。応答が `responseMaxBytes` を超える場合は頁を縮め、1 件も収まらない場合のみ `LIMIT_EXCEEDED`。heat/exposure/usage は増やさない。
 - `bodyMaxCp` は record 本文のみの上限である。`event.append` の raw 本文は `rawBodyMaxCp` で受ける (record の上限を raw に流用しない)。
 
 ## raw 取出し (event.get / event.range / record.sources)

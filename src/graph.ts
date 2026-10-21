@@ -35,6 +35,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { canonicalTime, countCp, hasControl } from "./normalize.js";
 
 export const GRAPH_DEFAULT_MAX_NODES = 300;
 export const GRAPH_DEFAULT_MAX_EDGES = 800;
@@ -132,6 +133,58 @@ function snippetFor(body: string, maxCp: number): { snippet: string; truncated: 
   return { snippet: cps.slice(0, maxCp).join(""), truncated: true };
 }
 
+/** Statuses selected by the viewer/page. History is excluded from graph.page. */
+export function graphStatuses(includeRetired: boolean, includeHistory: boolean): string[] {
+  const statuses = ["active"];
+  if (includeRetired) statuses.push("retired");
+  if (includeHistory) statuses.push("superseded", "archived");
+  return statuses;
+}
+
+/** Shared outbound-edge classification (graph view and graph.page agree). */
+function edgeKindForKind(kind: string): "related" | "consolidation" {
+  return kind === "summary" || kind === "correction" ? "consolidation" : "related";
+}
+
+function readGraphTags(db: GraphDb, ids: string[]): Map<string, string[]> {
+  const tagsById = new Map<string, string[]>();
+  for (const id of ids) tagsById.set(id, []);
+  if (ids.length === 0) return tagsById;
+  const idList = ids.map(() => "?").join(",");
+  const tagRows = db
+    .prepare(`SELECT recordId, tag FROM record_tags WHERE recordId IN (${idList}) ORDER BY recordId ASC, tag ASC`)
+    .all(...ids) as Array<Record<string, unknown>>;
+  for (const r of tagRows) {
+    const list = tagsById.get(str(r["recordId"]));
+    if (list && list.length < 64) list.push(str(r["tag"]));
+  }
+  return tagsById;
+}
+
+/**
+ * Read raw outbound refs for the given records. Returns overflow=true when
+ * the LIMIT+1 edge bound is exceeded (caller maps it to the graph bound).
+ */
+function readGraphLinks(
+  db: GraphDb,
+  ids: string[],
+  maxEdges: number,
+): { linksById: Map<string, string[]>; overflow: boolean } {
+  const linksById = new Map<string, string[]>();
+  for (const id of ids) linksById.set(id, []);
+  if (ids.length === 0) return { linksById, overflow: false };
+  const idList = ids.map(() => "?").join(",");
+  const linkRows = db
+    .prepare(`SELECT fromId, toRef FROM record_links WHERE fromId IN (${idList}) ORDER BY fromId ASC, toRef ASC LIMIT ?`)
+    .all(...ids, maxEdges + 1) as Array<Record<string, unknown>>;
+  if (linkRows.length > maxEdges) return { linksById, overflow: true };
+  for (const r of linkRows) {
+    const list = linksById.get(str(r["fromId"]));
+    if (list) list.push(str(r["toRef"]));
+  }
+  return { linksById, overflow: false };
+}
+
 /**
  * Build the graph model with bounded SELECT-only reads. Never writes,
  * never audits, never heats. Throws GraphLimitError when explicit bounds
@@ -143,9 +196,7 @@ export function buildGraphData(
   opts: GraphBuildOptions,
   vaultDir?: string,
 ): GraphData {
-  const statuses = ["active"];
-  if (opts.includeRetired) statuses.push("retired");
-  if (opts.includeHistory) statuses.push("superseded", "archived");
+  const statuses = graphStatuses(opts.includeRetired, opts.includeHistory);
   const inList = statuses.map(() => "?").join(",");
   const snippetMax = opts.snippetMaxCp ?? GRAPH_SNIPPET_CP;
 
@@ -160,23 +211,11 @@ export function buildGraphData(
   const ids = recRows.map((r) => str(r["id"]));
   const idSet = new Set(ids);
 
-  const tagsById = new Map<string, string[]>();
+  const tagsById = readGraphTags(db, ids);
   const refsById = new Map<string, string[]>();
-  const linksById = new Map<string, string[]>();
-  for (const id of ids) {
-    tagsById.set(id, []);
-    refsById.set(id, []);
-    linksById.set(id, []);
-  }
+  for (const id of ids) refsById.set(id, []);
   if (ids.length > 0) {
     const idList = ids.map(() => "?").join(",");
-    const tagRows = db
-      .prepare(`SELECT recordId, tag FROM record_tags WHERE recordId IN (${idList}) ORDER BY recordId ASC, tag ASC`)
-      .all(...ids) as Array<Record<string, unknown>>;
-    for (const r of tagRows) {
-      const list = tagsById.get(str(r["recordId"]));
-      if (list && list.length < 64) list.push(str(r["tag"]));
-    }
     const refRows = db
       .prepare(`SELECT recordId, eventId FROM record_source_refs WHERE recordId IN (${idList}) ORDER BY recordId ASC, eventId ASC`)
       .all(...ids) as Array<Record<string, unknown>>;
@@ -184,15 +223,9 @@ export function buildGraphData(
       const list = refsById.get(str(r["recordId"]));
       if (list && list.length < 64) list.push(str(r["eventId"]));
     }
-    const linkRows = db
-      .prepare(`SELECT fromId, toRef FROM record_links WHERE fromId IN (${idList}) ORDER BY fromId ASC, toRef ASC LIMIT ?`)
-      .all(...ids, opts.maxEdges + 1) as Array<Record<string, unknown>>;
-    if (linkRows.length > opts.maxEdges) throw new GraphLimitError();
-    for (const r of linkRows) {
-      const list = linksById.get(str(r["fromId"]));
-      if (list) list.push(str(r["toRef"]));
-    }
   }
+  const { linksById, overflow } = readGraphLinks(db, ids, opts.maxEdges);
+  if (overflow) throw new GraphLimitError();
 
   const unresolvedSet = new Set<string>();
   const edges: GraphEdge[] = [];
@@ -202,9 +235,7 @@ export function buildGraphData(
   for (const [from, refs] of linksById) {
     for (const to of refs) {
       if (idSet.has(to)) {
-        const fromKind = kindById.get(from) ?? "";
-        const kind: GraphEdgeKind =
-          fromKind === "summary" || fromKind === "correction" ? "consolidation" : "related";
+        const kind: GraphEdgeKind = edgeKindForKind(kindById.get(from) ?? "");
         edges.push({ from, to, kind });
         backlinksById.get(to)?.push(from);
       } else {
@@ -271,6 +302,197 @@ export function buildGraphData(
     unresolved: [...unresolvedSet].sort().slice(0, 256),
     counts,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* graph.page: bounded, cursor-paged linked-memory graph for Companion */
+/* ------------------------------------------------------------------ */
+
+export interface GraphPageCursor {
+  createdAt: string;
+  id: string;
+}
+
+export function encodeGraphPageCursor(cursor: GraphPageCursor): string {
+  return Buffer.from(JSON.stringify({ c: cursor.createdAt, i: cursor.id }), "utf8").toString("base64url");
+}
+
+export function decodeGraphPageCursor(v: unknown): GraphPageCursor | null {
+  if (typeof v !== "string" || v.length === 0 || !/^[A-Za-z0-9_-]+$/.test(v)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(v, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length !== 2 || !keys.includes("c") || !keys.includes("i")) return null;
+  const createdAt = canonicalTime(obj["c"]);
+  const id = obj["i"];
+  if (createdAt === null) return null;
+  if (typeof id !== "string" || id.length === 0 || countCp(id) > 256 || hasControl(id)) return null;
+  return { createdAt, id };
+}
+
+export interface GraphPageEpisode {
+  kind: string;
+  episodeKey: string;
+  level: "window" | "episode";
+}
+
+export interface GraphPageNode {
+  id: string;
+  status: string;
+  kind: string;
+  /** First snippetMaxCp code points of whitespace-collapsed body (never full body). */
+  label: string;
+  tags: string[];
+  createdAt: string;
+  episode: GraphPageEpisode | null;
+  out: Array<{ to: string; kind: "related" | "consolidation" }>;
+  /** Outbound refs omitted because they are dangling or out of the filter. */
+  danglingOut: number;
+}
+
+export interface GraphPageOptions {
+  scope: string;
+  includeRetired: boolean;
+  cursor: GraphPageCursor | null;
+  limit: number;
+  snippetMaxCp: number;
+  /** LIMIT+1 edge bound for this page (caller derives it from limits). */
+  maxEdges: number;
+}
+
+export interface GraphPageData {
+  nodes: GraphPageNode[];
+  nextCursor: string | null;
+}
+
+function pageLabel(body: string, maxCp: number): string {
+  const collapsed = body.replace(/\s+/gu, " ").trim();
+  const cps = [...collapsed];
+  return cps.length <= maxCp ? collapsed : cps.slice(0, maxCp).join("");
+}
+
+function readIncludedTargetIds(
+  db: GraphDb,
+  scope: string,
+  statuses: string[],
+  candidates: string[],
+): Set<string> {
+  const included = new Set<string>();
+  const unique = [...new Set(candidates)];
+  if (unique.length === 0) return included;
+  const statusList = statuses.map(() => "?").join(",");
+  const chunk = 400;
+  for (let i = 0; i < unique.length; i += chunk) {
+    const part = unique.slice(i, i + chunk);
+    const idList = part.map(() => "?").join(",");
+    const rows = db
+      .prepare(
+        `SELECT id FROM records WHERE scope = ? AND status IN (${statusList}) AND id IN (${idList})`,
+      )
+      .all(scope, ...statuses, ...part) as Array<Record<string, unknown>>;
+    for (const r of rows) included.add(str(r["id"]));
+  }
+  return included;
+}
+
+function readPageEpisodes(
+  db: GraphDb,
+  scope: string,
+  ids: string[],
+): Map<string, GraphPageEpisode> {
+  const episodes = new Map<string, GraphPageEpisode>();
+  if (ids.length === 0) return episodes;
+  const idList = ids.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT recordId, kind, episodeKey, level
+       FROM episode_summaries
+       WHERE scope = ? AND recordId IN (${idList}) AND level IN ('episode','window')
+       ORDER BY recordId ASC,
+                CASE level WHEN 'episode' THEN 0 ELSE 1 END,
+                createdAt DESC, kind ASC, episodeKey ASC`,
+    )
+    .all(scope, ...ids) as Array<Record<string, unknown>>;
+  for (const r of rows) {
+    const recordId = str(r["recordId"]);
+    if (episodes.has(recordId)) continue;
+    const level = r["level"];
+    if (level !== "episode" && level !== "window") continue;
+    episodes.set(recordId, {
+      kind: str(r["kind"]),
+      episodeKey: str(r["episodeKey"]),
+      level,
+    });
+  }
+  return episodes;
+}
+
+/**
+ * Build one bounded page of the linked-memory graph. Reads only canonical
+ * records/links/tags plus the derived episode ledger. Outbound edges resolve
+ * against the whole included (scope+status) set, not just this page, so a
+ * paged consumer never sees a false dangling edge; refs outside that set are
+ * counted in danglingOut and omitted. Supersedes history is not returned.
+ */
+export function buildGraphPage(db: GraphDb, opts: GraphPageOptions): GraphPageData {
+  const statuses = graphStatuses(opts.includeRetired, false);
+  const inList = statuses.map(() => "?").join(",");
+  let sql = `SELECT id, body, kind, status, createdAt
+             FROM records WHERE scope = ? AND status IN (${inList})`;
+  const args: Array<string | number> = [opts.scope, ...statuses];
+  if (opts.cursor !== null) {
+    sql += ` AND (createdAt < ? OR (createdAt = ? AND id > ?))`;
+    args.push(opts.cursor.createdAt, opts.cursor.createdAt, opts.cursor.id);
+  }
+  sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
+  args.push(opts.limit + 1);
+  const recRows = db.prepare(sql).all(...args) as Array<Record<string, unknown>>;
+  const shown = recRows.slice(0, opts.limit);
+  const ids = shown.map((r) => str(r["id"]));
+
+  const tagsById = readGraphTags(db, ids);
+  const { linksById, overflow } = readGraphLinks(db, ids, opts.maxEdges);
+  if (overflow) throw new GraphLimitError();
+
+  const allRefs: string[] = [];
+  for (const refs of linksById.values()) allRefs.push(...refs);
+  const includedTargets = readIncludedTargetIds(db, opts.scope, statuses, allRefs);
+  const episodes = readPageEpisodes(db, opts.scope, ids);
+
+  const nodes: GraphPageNode[] = shown.map((r) => {
+    const id = str(r["id"]);
+    const outKind = edgeKindForKind(str(r["kind"]));
+    const out: GraphPageNode["out"] = [];
+    let danglingOut = 0;
+    for (const to of linksById.get(id) ?? []) {
+      if (includedTargets.has(to)) out.push({ to, kind: outKind });
+      else danglingOut++;
+    }
+    return {
+      id,
+      status: str(r["status"]),
+      kind: str(r["kind"]),
+      label: pageLabel(str(r["body"]), opts.snippetMaxCp),
+      tags: tagsById.get(id) ?? [],
+      createdAt: str(r["createdAt"]),
+      episode: episodes.get(id) ?? null,
+      out,
+      danglingOut,
+    };
+  });
+
+  const last = shown.length > 0 ? shown[shown.length - 1] : null;
+  const nextCursor =
+    recRows.length > shown.length && last
+      ? encodeGraphPageCursor({ createdAt: str(last["createdAt"]), id: str(last["id"]) })
+      : null;
+  return { nodes, nextCursor };
 }
 
 /** Serialize embedded JSON so `</script>`/event-handler breakouts cannot escape. */

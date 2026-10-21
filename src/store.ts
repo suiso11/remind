@@ -83,6 +83,11 @@ import {
   serializeVec,
   vectorsEnabled,
 } from "./vectors.js";
+import {
+  GraphLimitError,
+  buildGraphPage,
+  decodeGraphPageCursor,
+} from "./graph.js";
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -1998,6 +2003,106 @@ export function listRecords(
     const msg = e instanceof Error ? e.message : String(e);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* graph.page: bounded linked-memory graph for Companion              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Page the canonical linked-memory graph (active + optionally retired) by
+ * `createdAt DESC, id ASC` with an opaque cursor. Each page is shrunk
+ * deterministically when the configured response budget cannot hold the
+ * requested number of nodes, so a consumer can always follow nextCursor.
+ * Read-only: links/tags/episode ledger only; no heat/exposure/usage writes.
+ */
+export function graphPage(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["scope", "includeRetired", "cursor", "limit"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { scope, includeRetired, cursor, limit } = params;
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  let nIncludeRetired = false;
+  if (includeRetired !== undefined) {
+    if (typeof includeRetired !== "boolean") return budgeted(bad(), config);
+    nIncludeRetired = includeRetired;
+  }
+  let nCursor: { createdAt: string; id: string } | null = null;
+  if (cursor !== undefined && cursor !== null) {
+    nCursor = decodeGraphPageCursor(cursor);
+    if (nCursor === null) return budgeted(bad(), config);
+  }
+  const maxLimit = rangeLimitMax(config);
+  let nLimit = config.limits.limitDefault;
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
+    if (limit < 1) return budgeted(bad(), config);
+    if (limit > maxLimit) return budgeted(limitExceeded(), config);
+    nLimit = limit;
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      // Largest page size whose encoded envelope fits the byte budget.
+      // Sizes grow monotonically with node count (extra node + possible
+      // cursor), so a deterministic binary search finds the max that fits.
+      let best: { nodes: ReturnType<typeof buildGraphPage>["nodes"]; nextCursor: string | null } | null = null;
+      let lo = 1;
+      let hi = nLimit;
+      const maxBytes = config.limits.responseMaxBytes;
+      const edgeBudget = (n: number): number => Math.max(1, n * config.limits.linksMax);
+      while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const page = buildGraphPage(db, {
+          scope: nScope,
+          includeRetired: nIncludeRetired,
+          cursor: nCursor,
+          limit: mid,
+          snippetMaxCp: config.limits.snippetMaxCp,
+          maxEdges: edgeBudget(mid),
+        });
+        const probe = ok({ nodes: page.nodes, nextCursor: page.nextCursor });
+        if (Buffer.byteLength(JSON.stringify(probe), "utf8") <= maxBytes) {
+          best = page;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      if (best === null) throw new Error("response over budget");
+      const stored = ok({ nodes: best.nodes, nextCursor: best.nextCursor });
+      auditInsert(db, {
+        ts: now,
+        op: "graph.page",
+        targetId: null,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: nLimit,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(limitExceeded(), config);
+    if (e instanceof GraphLimitError) return budgeted(limitExceeded(), config);
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }

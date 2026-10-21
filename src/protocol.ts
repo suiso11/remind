@@ -93,6 +93,7 @@ export const READ_OPS = new Set([
   "event.range",
   "episode.list",
   "episode.windows",
+  "graph.page",
 ]);
 
 export interface ValidRequest {

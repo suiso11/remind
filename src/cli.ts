@@ -56,6 +56,7 @@ import {
   feedbackRecords,
   getEvent,
   getRecord,
+  graphPage,
   listEpisodes,
   listRecords,
   rangeEvents,
@@ -310,6 +311,8 @@ export function handleValidatedRequest(
       return listEpisodes(db, config, params);
     case "episode.windows":
       return episodeWindows(db, config, params);
+    case "graph.page":
+      return graphPage(db, config, params);
     case "record.recall":
       return recallRecords(db, config, params);
     case "record.feedback":
@@ -361,6 +364,7 @@ const STORE_OPS = new Set([
   "event.range",
   "episode.list",
   "episode.windows",
+  "graph.page",
   "record.feedback",
   "record.correct",
   "record.archive",
