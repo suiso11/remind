@@ -1249,6 +1249,12 @@ interface EpisodeResult {
   sentencesDropped: number;
   /** True when no cited sentence survived and verified window summaries were used. */
   extractive: boolean;
+  /**
+   * True when a transient model failure (null/timeout/throw) prevented the
+   * reduce step from completing. No episode-level record or ledger/fold change
+   * is written; the episode stays stale and is retried on a later pass.
+   */
+  reduceDeferred: boolean;
 }
 
 /**
@@ -1387,6 +1393,7 @@ export async function maintainEpisodes(
           sentencesKept: 0,
           sentencesDropped: 0,
           extractive: false,
+          reduceDeferred: false,
         });
         continue;
       }
@@ -1590,6 +1597,7 @@ export async function maintainEpisodes(
       let sentencesKept = 0;
       let sentencesDropped = 0;
       let extractive = false;
+      let reduceDeferred = false;
 
       if (!aborted && allWindows.length > 0) {
         const priorActive = activeEpisodeRecord(db, p.scope, p.kind, ep.episodeKey);
@@ -1618,12 +1626,22 @@ export async function maintainEpisodes(
           } catch {
             rawMerge = null;
           }
-          if (rawMerge !== null && promptLanguageFor(group.map((w) => w.rawText).join("\n")) === "cjk") {
+          if (rawMerge === null) {
+            // Transient generation failure (timeout / throw / unavailable
+            // model): defer the whole reduce. Unlike a content rejection this
+            // must not fall back to an extractive episode, otherwise the failed
+            // reduce would be marked folded and never retried.
+            reduceDeferred = true;
+            reduceOk = false;
+            break;
+          }
+          if (promptLanguageFor(group.map((w) => w.rawText).join("\n")) === "cjk") {
             rawMerge = stripSummaryCue(rawMerge);
           }
           const mergeBody = parseSummaryBody(rawMerge, bodyMaxCp);
           if (mergeBody === null) {
-            // Model/parse failure: write nothing for this episode (retry later).
+            // Unparseable model output (content rejection): write nothing for
+            // this episode and retry it later (no transient-failure marker).
             reduceOk = false;
             break;
           }
@@ -1659,6 +1677,13 @@ export async function maintainEpisodes(
               rawVerify = await generate(claimPrompt, Math.min(maxNewTokens, 16));
             } catch {
               rawVerify = null;
+            }
+            if (rawVerify === null) {
+              // Transient verification failure: defer the reduce instead of
+              // treating the claim as a content rejection.
+              reduceDeferred = true;
+              reduceOk = false;
+              break;
             }
             if (!parseEpisodeYes(rawVerify)) {
               sentencesDropped++;
@@ -1938,6 +1963,7 @@ export async function maintainEpisodes(
         sentencesKept,
         sentencesDropped,
         extractive,
+        reduceDeferred,
       });
 
       if (aborted) {

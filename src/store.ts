@@ -3443,6 +3443,104 @@ export function feedbackRecords(
 /* record.correct (atomic revision + supersede)                        */
 /* ------------------------------------------------------------------ */
 
+interface CarriedEpisodeSummaryRow {
+  scope: string;
+  kind: EpisodeKind;
+  episodeKey: string;
+  level: EpisodeLevel;
+  eventId: string | null;
+  spanStart: number | null;
+  spanEnd: number | null;
+  coveredThrough: string | null;
+  foldedRecordIds: string | null;
+}
+
+/**
+ * Keep the derived episode ledger consistent with a canonical correction.
+ * A new revision changes the record id; without carrying rows forward,
+ * episode.list would drop an episode summary whose old id was superseded, and
+ * a corrected window would look unfolded. Runs inside the correction txn and
+ * before any caller `afterInsert` (which uses INSERT OR REPLACE) so the
+ * maintainer's fresh ledger data wins for the new id.
+ */
+function carryForwardEpisodeSummaries(
+  db: DatabaseSync,
+  oldId: string,
+  newId: string,
+  now: string,
+): void {
+  let rows: CarriedEpisodeSummaryRow[];
+  try {
+    rows = db
+      .prepare(
+        `SELECT scope, kind, episodeKey, level, eventId, spanStart, spanEnd,
+                coveredThrough, foldedRecordIds
+         FROM episode_summaries WHERE recordId = ?`,
+      )
+      .all(oldId) as unknown as CarriedEpisodeSummaryRow[];
+  } catch {
+    return;
+  }
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO episode_summaries(
+       scope, kind, episodeKey, level, recordId, eventId,
+       spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const row of rows) {
+    insert.run(
+      row.scope,
+      row.kind,
+      row.episodeKey,
+      row.level,
+      newId,
+      row.eventId,
+      row.spanStart,
+      row.spanEnd,
+      row.coveredThrough,
+      row.foldedRecordIds,
+      now,
+    );
+  }
+  // Episode-level fold markers may still name the old window id. Rewrite them
+  // to the new revision so the corrected window stays folded and the episode
+  // is not reported stale again.
+  let foldedRows: Array<CarriedEpisodeSummaryRow & { recordId: string; createdAt: string }>;
+  try {
+    foldedRows = db
+      .prepare(
+        `SELECT scope, kind, episodeKey, level, recordId, eventId, spanStart,
+                spanEnd, coveredThrough, foldedRecordIds, createdAt
+         FROM episode_summaries ep
+         WHERE ep.level = 'episode'
+           AND EXISTS (
+             SELECT 1 FROM json_each(COALESCE(ep.foldedRecordIds, '[]')) j
+             WHERE j.value = ?)`,
+      )
+      .all(oldId) as unknown as typeof foldedRows;
+  } catch {
+    return;
+  }
+  for (const row of foldedRows) {
+    const ids = parseFoldedRecordIds(row.foldedRecordIds).map((id) =>
+      id === oldId ? newId : id,
+    );
+    insertEpisodeSummary(db, {
+      scope: row.scope,
+      kind: row.kind,
+      episodeKey: row.episodeKey,
+      level: row.level,
+      recordId: row.recordId,
+      eventId: row.eventId,
+      spanStart: row.spanStart,
+      spanEnd: row.spanEnd,
+      coveredThrough: row.coveredThrough,
+      foldedRecordIds: [...new Set(ids)],
+      createdAt: row.createdAt,
+    });
+  }
+}
+
 export function correctRecord(
   db: DatabaseSync,
   config: AppConfig,
@@ -3589,6 +3687,9 @@ export function correctRecord(
       }
       insertSourceRefs(db, newId, nRefs);
       db.prepare(`INSERT OR IGNORE INTO note_heat(recordId, usedCount, lastUsedAt) VALUES (?, 0, ?)`).run(newId, now);
+      // Carry the derived ledger first; a caller's afterInsert may then
+      // replace the new-id row with its fresh fold/coverage data.
+      carryForwardEpisodeSummaries(db, recordId, newId, now);
       fence?.afterInsert?.(db, newId);
       const stored = budgeted(probe, config);
       db.prepare(

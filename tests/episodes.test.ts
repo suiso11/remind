@@ -14,7 +14,7 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AppConfig, EpisodesConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
-import { eventAppend, getRecord, recordSources } from "../src/store.js";
+import { correctRecord, eventAppend, getRecord, recordSources } from "../src/store.js";
 import { listEpisodes } from "../src/store.js";
 import {
   EPISODE_FOLD_MAX,
@@ -183,10 +183,14 @@ function makeGen(
     mergeText?: string | null;
     reduceText?: string | null;
     windowText?: string | null;
+    claimVerify?: "YES" | "NO" | null;
   } = {},
 ): EpisodesGenerate {
   return async (prompt: string): Promise<string | null> => {
-    if (/You verify a claim|主張を検証/.test(prompt)) return "YES";
+    if (/You verify a claim|主張を検証/.test(prompt)) {
+      if (opts.claimVerify === null) return null;
+      return opts.claimVerify ?? "YES";
+    }
     if (/You verify a summary|要約を検証/.test(prompt)) {
       if (opts.rejectText !== undefined && prompt.includes(opts.rejectText)) return "NO";
       return "YES";
@@ -223,6 +227,7 @@ interface EpisodeResult {
   sentencesKept: number;
   sentencesDropped: number;
   extractive: boolean;
+  reduceDeferred: boolean;
 }
 interface EpisodesData {
   episodes: EpisodeResult[];
@@ -635,6 +640,7 @@ describe("maintain.episodes windows, links, and reduce", () => {
       const ep = run.episodes[0]!;
       assert.ok(ep.windowsWritten > 0);
       assert.equal(ep.episodeRecordId, null);
+      assert.equal(ep.reduceDeferred, true);
       assert.equal(ep.coveredThrough, T0); // event is done even though reduce failed
       assert.ok(windowRows(ctx, "ev-r").length > 0);
       assert.equal(episodeRows(ctx).length, 0);
@@ -1079,6 +1085,54 @@ describe("maintain.episodes rerun, degradation, and idempotency", () => {
     }
   });
 
+  it("defers the reduce when claim verification returns null instead of writing an extractive episode", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      append(ctx, {
+        eventId: "ev-claim-null",
+        body: longWords("sigma", 60),
+        observedAt: T0,
+        createdAt: T0,
+      });
+
+      const run1 = episodeData(
+        await maintain(
+          ctx,
+          "ep-claim-null-1",
+          makeGen({ claimVerify: null }),
+          RUN1,
+        ),
+      );
+      const ep1 = run1.episodes[0]!;
+      assert.ok(ep1.windowsWritten > 0);
+      assert.equal(ep1.windowsRejected, 0);
+      assert.equal(ep1.episodeRecordId, null);
+      assert.equal(ep1.reduceDeferred, true);
+      assert.equal(episodeRows(ctx).length, 0);
+      const rowsAfter1 = windowRows(ctx);
+      assert.equal(rowsAfter1.length, ep1.windowsWritten);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, true);
+
+      // A later pass retries the same reduce (windows are not rewritten) and
+      // only then writes the episode-level record.
+      const run2 = episodeData(await maintain(ctx, "ep-claim-null-2", makeGen(), RUN2));
+      const ep2 = run2.episodes[0]!;
+      assert.equal(ep2.windowsWritten, 0);
+      assert.equal(ep2.reduceDeferred, false);
+      assert.notEqual(ep2.episodeRecordId, null);
+      assert.deepEqual(
+        windowRows(ctx).map((r) => r.recordId),
+        rowsAfter1.map((r) => r.recordId),
+      );
+      const listed = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.equal(listed.items[0]!.stale, false);
+      assert.deepEqual(listed.items[0]!.summaryRecordIds, [ep2.episodeRecordId]);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("degrades with an explicitly disabled llm section without changing state", async () => {
     const ctx = setup();
     try {
@@ -1382,6 +1436,117 @@ describe("maintain.episodes rerun, degradation, and idempotency", () => {
       assert.ok(paged.items.every((i) => i.truncated === false));
       // episode.windows returns summary snippets; spans above are the raw tiles.
       assert.ok(paged.items.every((i) => i.snippet === "window summary"));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("episode ledger follows record.correct revisions", () => {
+  function correct(
+    ctx: Ctx,
+    recordId: string,
+    body: string,
+    key: string,
+  ): string {
+    const res = correctRecord(
+      ctx.db,
+      ctx.config,
+      {
+        recordId,
+        body,
+        kind: "correction",
+        provenance: { source: "session:s1:turn:1", observedAt: T1 },
+        scope: SCOPE,
+      },
+      key,
+      RUN2,
+    );
+    assert.equal(res.ok, true, JSON.stringify(res));
+    return (res.data as { record: { id: string } }).record.id;
+  }
+
+  it("carries an episode summary ledger row to the corrected revision", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      append(ctx, {
+        eventId: "ev-ep-correct",
+        body: longWords("omega", 60),
+        observedAt: T0,
+        createdAt: T0,
+      });
+      const run1 = episodeData(await maintain(ctx, "ep-correct-1", makeGen(), RUN1));
+      const oldEpisodeId = run1.episodes[0]!.episodeRecordId as string;
+      assert.notEqual(oldEpisodeId, null);
+
+      const newEpisodeId = correct(
+        ctx,
+        oldEpisodeId,
+        "corrected episode summary",
+        "ep-correct-summary",
+      );
+
+      const listed = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.deepEqual(listed.items[0]!.summaryRecordIds, [newEpisodeId]);
+      assert.equal(listed.items[0]!.stale, false);
+
+      // The corrected episode is still fully folded: no new events and no
+      // unfolded windows means maintenance has nothing to write.
+      const before = stateCounts(ctx);
+      const run2 = episodeData(await maintain(ctx, "ep-correct-2", makeGen(), RUN2));
+      assert.deepEqual(run2.episodes, []);
+      assert.equal(run2.applied, 0);
+      assert.deepEqual(stateCounts(ctx), before);
+      assert.deepEqual(
+        list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.summaryRecordIds,
+        [newEpisodeId],
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("carries a window ledger row to the corrected revision without re-staling the episode", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      append(ctx, {
+        eventId: "ev-win-correct",
+        body: longWords("pi", 60),
+        observedAt: T0,
+        createdAt: T0,
+      });
+      const run1 = episodeData(await maintain(ctx, "ep-win-correct-1", makeGen(), RUN1));
+      const episodeId = run1.episodes[0]!.episodeRecordId as string;
+      const oldWindowId = windowRows(ctx)[0]!.recordId;
+
+      const newWindowId = correct(
+        ctx,
+        oldWindowId,
+        "corrected window summary",
+        "ep-correct-window",
+      );
+      assert.notEqual(newWindowId, oldWindowId);
+
+      const listedWindows = windows(ctx, {
+        scope: SCOPE,
+        kind: "session",
+        episodeKey: "s1",
+      });
+      const ids = listedWindows.items.map((i) => i.recordId);
+      assert.ok(ids.includes(newWindowId), JSON.stringify(ids));
+      assert.ok(!ids.includes(oldWindowId), JSON.stringify(ids));
+
+      const listed = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.equal(listed.items[0]!.stale, false);
+      assert.deepEqual(listed.items[0]!.summaryRecordIds, [episodeId]);
+
+      const before = stateCounts(ctx);
+      const run2 = episodeData(await maintain(ctx, "ep-win-correct-2", makeGen(), RUN2));
+      assert.deepEqual(run2.episodes, []);
+      assert.equal(run2.applied, 0);
+      assert.deepEqual(stateCounts(ctx), before);
     } finally {
       ctx.cleanup();
     }
