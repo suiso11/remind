@@ -30,6 +30,8 @@ import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import {
   episodesBounds,
+  graphLimitMax,
+  graphResponseMaxBytes,
   rangeLimitMax,
   rawBodyMaxCp,
   rawPageMaxCp,
@@ -83,6 +85,14 @@ import {
   serializeVec,
   vectorsEnabled,
 } from "./vectors.js";
+import {
+  GraphLimitError,
+  GraphLocalScopeError,
+  buildGraphLocal,
+  buildGraphPage,
+  buildGraphVersion,
+  decodeGraphPageCursor,
+} from "./graph.js";
 
 /**
  * Current additive schema generation, stamped into PRAGMA user_version only
@@ -2127,6 +2137,234 @@ export function listRecords(
     const msg = e instanceof Error ? e.message : String(e);
     if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
     if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* graph.page: bounded linked-memory graph for Companion              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Page the canonical linked-memory graph (active + optionally retired) by
+ * `createdAt DESC, id ASC` with an opaque cursor. Each page is shrunk
+ * deterministically when the configured response budget cannot hold the
+ * requested number of nodes, so a consumer can always follow nextCursor.
+ * Read-only: links/tags/episode ledger only; no heat/exposure/usage writes.
+ */
+export function graphPage(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["scope", "includeRetired", "cursor", "limit"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { scope, includeRetired, cursor, limit } = params;
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  let nIncludeRetired = false;
+  if (includeRetired !== undefined) {
+    if (typeof includeRetired !== "boolean") return budgeted(bad(), config);
+    nIncludeRetired = includeRetired;
+  }
+  let nCursor: { createdAt: string; id: string } | null = null;
+  if (cursor !== undefined && cursor !== null) {
+    nCursor = decodeGraphPageCursor(cursor);
+    if (nCursor === null) return budgeted(bad(), config);
+  }
+  const maxLimit = graphLimitMax(config);
+  // An omitted limit must still respect graphLimitMax even when the general
+  // limitDefault is larger; otherwise an omitted limit bypasses the graph cap.
+  let nLimit = Math.min(config.limits.limitDefault, maxLimit);
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
+    if (limit < 1) return budgeted(bad(), config);
+    if (limit > maxLimit) return budgeted(limitExceeded(), config);
+    nLimit = limit;
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      // Largest page size whose encoded envelope fits the byte budget.
+      // Sizes grow monotonically with node count (extra node + possible
+      // cursor), so a deterministic binary search finds the max that fits.
+      const version = buildGraphVersion(db, nScope);
+      let best: { nodes: ReturnType<typeof buildGraphPage>["nodes"]; nextCursor: string | null } | null = null;
+      let lo = 1;
+      let hi = nLimit;
+      const maxBytes = graphResponseMaxBytes(config);
+      while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const page = buildGraphPage(db, {
+          scope: nScope,
+          includeRetired: nIncludeRetired,
+          cursor: nCursor,
+          limit: mid,
+          snippetMaxCp: config.limits.snippetMaxCp,
+        });
+        const probe = ok({ nodes: page.nodes, nextCursor: page.nextCursor, version });
+        if (Buffer.byteLength(JSON.stringify(probe), "utf8") <= maxBytes) {
+          best = page;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      if (best === null) throw new Error("response over budget");
+      const stored = ok({ nodes: best.nodes, nextCursor: best.nextCursor, version });
+      auditInsert(db, {
+        ts: now,
+        op: "graph.page",
+        targetId: null,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: nLimit,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(limitExceeded(), config);
+    if (e instanceof GraphLimitError) return budgeted(limitExceeded(), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* graph.local / graph.version: local graph + freshness token          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Obsidian-like LOCAL graph around one record. The centre may be in any
+ * status; neighbours follow the includeRetired filter and must be in the
+ * same scope. Traversal is undirected over record_links (outbound plus
+ * backlinks); consolidation edges are the summary/correction outbound rows.
+ * Nodes are ordered centre, hop, createdAt DESC, id ASC, then shrunk
+ * deterministically to the graph byte budget. Read-only: no
+ * heat/exposure/usage writes (audit row only).
+ */
+export function graphLocal(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["scope", "id", "depth", "includeRetired", "limit"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const { scope, id, depth, includeRetired, limit } = params;
+  const nScope = parseScope(scope);
+  if (!nScope) return budgeted(bad(), config);
+  if (
+    typeof id !== "string" ||
+    checkLenCp(id, 1, 256) !== "ok" ||
+    hasControl(id)
+  ) {
+    return budgeted(bad(), config);
+  }
+  let nDepth: 1 | 2 = 1;
+  if (depth !== undefined) {
+    if (typeof depth !== "number" || !Number.isInteger(depth)) return budgeted(bad(), config);
+    if (depth !== 1 && depth !== 2) return budgeted(bad(), config);
+    nDepth = depth;
+  }
+  let nIncludeRetired = false;
+  if (includeRetired !== undefined) {
+    if (typeof includeRetired !== "boolean") return budgeted(bad(), config);
+    nIncludeRetired = includeRetired;
+  }
+  const maxLimit = graphLimitMax(config);
+  // Same rule as graph.page: the effective default never exceeds the cap.
+  let nLimit = Math.min(config.limits.limitDefault, maxLimit);
+  if (limit !== undefined) {
+    if (typeof limit !== "number" || !Number.isInteger(limit)) return budgeted(bad(), config);
+    if (limit < 1) return budgeted(bad(), config);
+    if (limit > maxLimit) return budgeted(limitExceeded(), config);
+    nLimit = limit;
+  }
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      const data = buildGraphLocal(db, {
+        scope: nScope,
+        id,
+        depth: nDepth,
+        includeRetired: nIncludeRetired,
+        limit: nLimit,
+        snippetMaxCp: config.limits.snippetMaxCp,
+        maxBytes: graphResponseMaxBytes(config),
+      });
+      if (data === null) return budgeted(fail("NOT_FOUND"), config);
+      const stored = ok({
+        center: data.center,
+        nodes: data.nodes,
+        edges: data.edges,
+        truncated: data.truncated,
+        version: data.version,
+      });
+      auditInsert(db, {
+        ts: now,
+        op: "graph.local",
+        targetId: data.center,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: nLimit,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      return stored;
+    });
+  } catch (e) {
+    if (e instanceof GraphLocalScopeError) return budgeted(fail("FORBIDDEN_SCOPE"), config);
+    if (e instanceof GraphLimitError) return budgeted(limitExceeded(), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/**
+ * Tiny freshness token for the GLOBAL graph (graph.page). Returns an opaque
+ * string that changes on relevant writes and stays stable across pure reads;
+ * it is derived from the same sources as graph.local's version field.
+ */
+export function graphVersion(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  const allowed = new Set(["scope"]);
+  for (const k of Object.keys(params)) {
+    if (!allowed.has(k)) return budgeted(bad(), config);
+  }
+  const nScope = parseScope(params["scope"]);
+  if (!nScope) return budgeted(bad(), config);
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  try {
+    return ok({ version: buildGraphVersion(db, nScope) });
+  } catch {
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
 }

@@ -20,6 +20,9 @@ import {
   feedbackRecords,
   getEvent,
   getRecord,
+  graphLocal,
+  graphPage,
+  graphVersion,
   listEpisodes,
   listRecords,
   rangeEvents,
@@ -107,6 +110,12 @@ function runOpSync(db: DatabaseSync, req: Req, vector?: RecallVectorInput) {
       return listEpisodes(db, cfg, req.params);
     case "episode.windows":
       return episodeWindows(db, cfg, req.params);
+    case "graph.page":
+      return graphPage(db, cfg, req.params);
+    case "graph.local":
+      return graphLocal(db, cfg, req.params);
+    case "graph.version":
+      return graphVersion(db, cfg, req.params);
     case "record.recall":
       return recallRecords(db, cfg, req.params, undefined, vector);
     case "record.search":

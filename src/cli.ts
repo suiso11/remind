@@ -56,6 +56,9 @@ import {
   feedbackRecords,
   getEvent,
   getRecord,
+  graphLocal,
+  graphPage,
+  graphVersion,
   listEpisodes,
   listRecords,
   rangeEvents,
@@ -310,6 +313,12 @@ export function handleValidatedRequest(
       return listEpisodes(db, config, params);
     case "episode.windows":
       return episodeWindows(db, config, params);
+    case "graph.page":
+      return graphPage(db, config, params);
+    case "graph.local":
+      return graphLocal(db, config, params);
+    case "graph.version":
+      return graphVersion(db, config, params);
     case "record.recall":
       return recallRecords(db, config, params);
     case "record.feedback":
@@ -361,6 +370,9 @@ const STORE_OPS = new Set([
   "event.range",
   "episode.list",
   "episode.windows",
+  "graph.page",
+  "graph.local",
+  "graph.version",
   "record.feedback",
   "record.correct",
   "record.archive",
