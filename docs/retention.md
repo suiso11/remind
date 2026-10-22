@@ -73,6 +73,7 @@
 
 - 正本は単一 SQLite のみ。`vaultPath` への Markdown 投影 (`<id>.md`、`[[ref]]`、backlink 節) は派生であり、消失・陳腐化時は正本から再構築できる。再構築で正本内容は変わらない。
 - FTS5・char-bigram 転置索引・backlink ビューも派生物であり、欠落・再構築は正本に影響しない。投影キューは失敗行を保持し、有界リトライで再試行する。成功時のみ取り除く。
+- 連想の派生層 (`record_topics` / `similar_edges` / `associate_state` / `vec_notes`) も再構築可能な派生物である。`maintain.associate` または `topic.set` で作り直せ、欠落・陳腐化しても正本の記録・`record_links` は変わらない。canonical link は呼出者が書く `record_links` のままであり、派生層は追加・削除しない。
 
 ## 監査はメタデータのみ
 

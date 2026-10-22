@@ -98,11 +98,14 @@ import {
  * Current additive schema generation, stamped into PRAGMA user_version only
  * after every migration and index in ensureM1Schema has succeeded. Version 2
  * was the original M1 stamp; 3 marks the serialized, span/episode-complete
- * schema. Older 2-stamped files are migrated in place (never refused).
+ * schema; 4 adds record_topics.origin (tag/external/llm precedence). Older
+ * 2- and 3-stamped files are migrated in place (never refused).
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
+/** Pre-topic-origin schema stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_3 = 3;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -125,6 +128,13 @@ export const GRAPH_DEPTH_MAX = 2;
 export const GRAPH_EXPAND_MAX = 40;
 export const RAW_DESCENT_MAX = 3;
 export const FUSION_CANDIDATE_MAX = 60;
+/** Topics shorter than this (after NFKC/lowercase) never seed a recall. */
+const TOPIC_SEED_MIN_CP = 2;
+/**
+ * Similar-edge contribution = SIMILAR_FUSION_WEIGHT * score / hop. At hop 1
+ * with score 1 this is 0.5, below an explicit-link graph node (1.0 at depth 1).
+ */
+const SIMILAR_FUSION_WEIGHT = 0.5;
 /** Vector candidates cap (bounded; M2 default topK=20, hard cap 60 like fusion). */
 export const VECTOR_CANDIDATE_MAX = 20;
 /** Fixed vector fusion weight: 4/(1+rank), above lexical 3/(1+rank) so true
@@ -368,6 +378,58 @@ function readSchemaVersion(db: DatabaseSync): number {
 }
 
 /**
+ * P3 derived association layer (rebuildable; never canonical).
+ *
+ * similar_edges stores the top-K semantic neighbours of each record. The
+ * unordered pair is canonicalized by CHECK(a < b), so a bidirectional match
+ * is one row. associate_state records which bodyHash was last scanned for a
+ * record; a missing/mismatched row means "dirty" and the next maintain.associate
+ * recomputes that record's incident edges. Both tables can be dropped at any
+ * time; canonical `record_links` remain caller-authored and untouched.
+ *
+ * Idempotent and safe to call on every open (tables already present => no-op).
+ */
+export function ensureAssociateSchema(db: DatabaseSync): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS similar_edges(
+    scope TEXT NOT NULL,
+    a TEXT NOT NULL,
+    b TEXT NOT NULL,
+    score REAL NOT NULL,
+    computedAt TEXT NOT NULL,
+    PRIMARY KEY(scope, a, b),
+    CHECK(a < b))`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_similar_edges_b ON similar_edges(scope, b)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS associate_state(
+    recordId TEXT PRIMARY KEY,
+    bodyHash TEXT NOT NULL,
+    scannedAt TEXT NOT NULL)`);
+  // Topics for the current record body. Derived and rebuildable; a row's
+  // bodyHash must match records.bodyHash to be considered current. Origin
+  // records precedence metadata: canonical tags > external (topic.set) > llm.
+  // PK(recordId, topic) keeps one row per topic.
+  db.exec(`CREATE TABLE IF NOT EXISTS record_topics(
+    recordId TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    bodyHash TEXT NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'llm' CHECK(origin IN ('tag','external','llm')),
+    PRIMARY KEY(recordId, topic))`);
+  // Additive migration for pre-origin tables (version 3). Default 'llm'
+  // preserves prior rows, which were all SLM-extracted. Runs under the
+  // caller's schema-init transaction when a version upgrade is in progress.
+  let hasOrigin = false;
+  try {
+    const cols = db.prepare(`PRAGMA table_info(record_topics)`).all() as Array<{ name: string }>;
+    hasOrigin = cols.some((c) => c.name === "origin");
+  } catch {
+    hasOrigin = false;
+  }
+  if (!hasOrigin) {
+    db.exec(`ALTER TABLE record_topics ADD COLUMN origin TEXT NOT NULL DEFAULT 'llm' CHECK(origin IN ('tag','external','llm'))`);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_record_topics_topic ON record_topics(topic)`);
+}
+
+/**
  * Whole additive-migration sequence. Callers must already hold the single
  * write lock (ensureM1Schema acquires it, or an outer transaction owns it).
  * Nested helpers use savepoints so one failure rolls back only its own step.
@@ -491,6 +553,7 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   // Missing rows, dim mismatches, and non-finite/zero vectors are ignored by
   // recall (offline lexical+graph fallback, §8). Rebuilt by scripts/rebuild-vectors.
   db.exec(`CREATE TABLE IF NOT EXISTS vec_notes(recordId TEXT PRIMARY KEY, dim INTEGER NOT NULL, vec BLOB NOT NULL, bodyHash TEXT NOT NULL, updatedAt TEXT NOT NULL)`);
+  ensureAssociateSchema(db);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_records_scope_status_created_id ON records(scope, status, createdAt, id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_record_tags_tag_record ON record_tags(tag, recordId)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_record_links_toref_from ON record_links(toRef, fromId)`);
@@ -542,7 +605,12 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
  * already-current file takes no write lock at all.
  */
 export function ensureM1Schema(db: DatabaseSync): void {
-  if (readSchemaVersion(db) === SCHEMA_VERSION) return;
+  if (readSchemaVersion(db) === SCHEMA_VERSION) {
+    // Derived association tables were added without a version bump; keep
+    // already-current databases self-healing without rewriting canonical rows.
+    ensureAssociateSchema(db);
+    return;
+  }
   const ownTransaction = !db.isTransaction;
   if (ownTransaction) db.exec("BEGIN IMMEDIATE");
   else db.exec(`SAVEPOINT ensure_m1_schema_txn`);
@@ -3289,6 +3357,145 @@ function tagSeedIds(
   }
 }
 
+/**
+ * Derived topic seeds: any current record_topics value (bodyHash matches the
+ * record) that occurs inside the normalized query and is at least two code
+ * points long seeds every matching record. Topic rows are derived, so an
+ * empty table preserves the pre-association candidate set exactly.
+ */
+function topicSeedIds(
+  db: DatabaseSync,
+  scope: string,
+  query: string,
+  statuses: string[],
+  since: string | null,
+  until: string | null,
+): string[] {
+  const nq = normalizeBody(query);
+  if (countCp(nq) < TOPIC_SEED_MIN_CP) return [];
+  const statusList = statuses.map(() => "?").join(",");
+  let topicRows: Array<{ topic: string }>;
+  try {
+    topicRows = db
+      .prepare(
+        `SELECT DISTINCT t.topic AS topic
+         FROM record_topics t JOIN records r ON r.id = t.recordId
+         WHERE r.scope = ? AND r.status IN (${statusList}) AND t.bodyHash = r.bodyHash
+         ORDER BY t.topic ASC`,
+      )
+      .all(scope, ...statuses) as Array<{ topic: string }>;
+  } catch {
+    return [];
+  }
+  const matched: string[] = [];
+  for (const row of topicRows) {
+    const key = normalizeBody(row.topic);
+    if (countCp(key) >= TOPIC_SEED_MIN_CP && nq.includes(key)) matched.push(row.topic);
+  }
+  if (matched.length === 0) return [];
+
+  const windowFrag = `${since === null ? "" : " AND r.createdAt >= ?"}${
+    until === null ? "" : " AND r.createdAt < ?"
+  }`;
+  const windowArgs: Array<string | number> = [];
+  if (since !== null) windowArgs.push(since);
+  if (until !== null) windowArgs.push(until);
+  const seeds = new Map<string, string>();
+  const chunk = 400;
+  try {
+    for (let i = 0; i < matched.length; i += chunk) {
+      const part = matched.slice(i, i + chunk);
+      const topicList = part.map(() => "?").join(",");
+      const rows = db
+        .prepare(
+          `SELECT DISTINCT r.id AS id, r.createdAt AS createdAt
+           FROM records r JOIN record_topics t ON t.recordId = r.id
+           WHERE r.scope = ? AND r.status IN (${statusList}) AND t.bodyHash = r.bodyHash
+             AND t.topic IN (${topicList})${windowFrag}
+           ORDER BY r.createdAt DESC, r.id ASC`,
+        )
+        .all(scope, ...statuses, ...part, ...windowArgs) as Array<{ id: string; createdAt: string }>;
+      for (const row of rows) seeds.set(row.id, row.createdAt);
+    }
+  } catch {
+    return [];
+  }
+  return [...seeds.entries()]
+    .sort((a, b) =>
+      a[1] !== b[1] ? (a[1] < b[1] ? 1 : -1) : a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
+    )
+    .slice(0, FUSION_CANDIDATE_MAX)
+    .map(([id]) => id);
+}
+
+/**
+ * Bounded depth-2 traversal of the derived similar_edges layer (undirected).
+ * Each reached record carries `SIMILAR_FUSION_WEIGHT * edgeScore / hop`, so a
+ * high-confidence similar neighbour stays below an explicit link at the same
+ * hop. Empty table => empty map => score/ranking byte-identical to lexical +
+ * canonical-link graph recall.
+ */
+function expandSimilarEdges(
+  db: DatabaseSync,
+  scope: string,
+  frontier0: string[],
+  since: string | null,
+  until: string | null,
+): Map<string, number> {
+  const contributions = new Map<string, number>();
+  const visited = new Set<string>(frontier0);
+  let frontier = [...frontier0];
+  for (let hop = 1; hop <= GRAPH_DEPTH_MAX && frontier.length > 0; hop++) {
+    const rawScore = new Map<string, number>();
+    for (const id of frontier) {
+      try {
+        const rows = db
+          .prepare(`SELECT a, b, score FROM similar_edges WHERE scope = ? AND (a = ? OR b = ?)`)
+          .all(scope, id, id) as Array<{ a: string; b: string; score: number }>;
+        for (const row of rows) {
+          const nb = row.a === id ? row.b : row.a;
+          if (visited.has(nb)) continue;
+          const s = typeof row.score === "number" && Number.isFinite(row.score) ? row.score : 0;
+          if (s <= 0) continue;
+          const prev = rawScore.get(nb);
+          if (prev === undefined || s > prev) rawScore.set(nb, s);
+        }
+      } catch {
+        /* skip this frontier member */
+      }
+    }
+    const resolved: Array<{ id: string; createdAt: string; contribution: number }> = [];
+    for (const [id, score] of rawScore) {
+      try {
+        const row = db
+          .prepare(`SELECT id, createdAt FROM records WHERE id = ? AND scope = ? AND status = 'active'`)
+          .get(id, scope) as { id: string; createdAt: string } | undefined;
+        if (!row) continue;
+        if (since !== null && row.createdAt < since) continue;
+        if (until !== null && row.createdAt >= until) continue;
+        resolved.push({ id, createdAt: row.createdAt, contribution: (SIMILAR_FUSION_WEIGHT * score) / hop });
+      } catch {
+        /* dangling/unreadable similar rows are skipped */
+      }
+    }
+    resolved.sort((a, b) =>
+      b.contribution !== a.contribution
+        ? b.contribution - a.contribution
+        : a.createdAt !== b.createdAt
+          ? a.createdAt < b.createdAt ? 1 : -1
+          : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+    );
+    const slots = Math.max(0, GRAPH_EXPAND_MAX - contributions.size);
+    const next = resolved.slice(0, slots);
+    for (const row of next) {
+      visited.add(row.id);
+      contributions.set(row.id, row.contribution);
+    }
+    frontier = next.map((row) => row.id);
+  }
+  return contributions;
+}
+
 /** Bounded depth-2 expansion over resolved active same-scope refs + backlinks. */
 function expandGraph(
   db: DatabaseSync,
@@ -3409,8 +3616,11 @@ export function recallRecords(
       vecHits.forEach((h, i) => {
         if (!vecRank.has(h.id)) vecRank.set(h.id, i);
       });
-      // 3) Exact tag/link seeds.
+      // 3) Exact tag/link seeds + derived topic seeds (same fixed seed weight).
       const seedIds = new Set<string>(tagSeedIds(db, p.scope, p.tags, p.since, p.until));
+      for (const id of topicSeedIds(db, p.scope, p.query, ["active"], p.since, p.until)) {
+        seedIds.add(id);
+      }
       if (p.link !== null) {
         try {
           const target = db
@@ -3545,11 +3755,21 @@ export function recallRecords(
       const vecTopIds = [...vecRank.keys()].slice(0, 10);
       const frontier0 = [...new Set<string>([...seedIds, ...poolIds.slice(0, 10), ...vecTopIds])].slice(0, 20);
       const graphDist = expandGraph(db, p.scope, frontier0, p.since, p.until);
+      // 4b) Derived similar-edge expansion from the same frontier plus the
+      // explicit-link neighbours reached above (undirected, weighted by score
+      // and below explicit links). Empty table => no change.
+      const similarScores = expandSimilarEdges(
+        db,
+        p.scope,
+        [...new Set<string>([...frontier0, ...graphDist.keys()])],
+        p.since,
+        p.until,
+      );
 
       // Heat lookup for the bounded pool only.
       const heat = new Map<string, number>();
-      if (poolIds.length > 0 || graphDist.size > 0) {
-        const allIds = [...new Set<string>([...poolIds, ...graphDist.keys()])];
+      if (poolIds.length > 0 || graphDist.size > 0 || similarScores.size > 0) {
+        const allIds = [...new Set<string>([...poolIds, ...graphDist.keys(), ...similarScores.keys()])];
         try {
           const placeholders = allIds.map(() => "?").join(",");
           const rows = db
@@ -3577,6 +3797,8 @@ export function recallRecords(
         if (seedIds.has(id)) s += 1;
         const d = graphDist.get(id);
         if (d !== undefined && d > 0) s += (GRAPH_DEPTH_MAX + 1 - d) * 0.5;
+        const sw = similarScores.get(id);
+        if (sw !== undefined) s += sw;
         s += Math.min(heat.get(id) ?? 0, 20) * 0.02;
         return s;
       };
@@ -3585,7 +3807,7 @@ export function recallRecords(
       // revision/kind come from the same rows: recall items carry the source
       // record identity (F-I01-01 additions, backward-compatible fields).
       const meta = new Map<string, { createdAt: string; revision: number; kind: string }>();
-      const orderIds = [...new Set<string>([...poolIds, ...graphDist.keys()])];
+      const orderIds = [...new Set<string>([...poolIds, ...graphDist.keys(), ...similarScores.keys()])];
       if (orderIds.length > 0) {
         try {
           const placeholders = orderIds.map(() => "?").join(",");
@@ -4692,7 +4914,7 @@ export function searchRecords(
       } catch {
         /* lexical paths already cover */
       }
-      // Exact tag/link seeds (active+retired, same scope, windowed).
+      // Exact tag/link seeds + derived topic seeds (active+retired, windowed).
       const seedIds = new Set<string>();
       if (nTags.length > 0) {
         try {
@@ -4724,6 +4946,9 @@ export function searchRecords(
         } catch {
           /* ignore */
         }
+      }
+      for (const id of topicSeedIds(db, nScope, nq, ["active", "retired"], nSince, nUntil)) {
+        seedIds.add(id);
       }
 
       const score = (id: string): number => {

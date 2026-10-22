@@ -172,6 +172,30 @@ function readGraphTags(db: GraphDb, ids: string[]): Map<string, string[]> {
 }
 
 /**
+ * Current derived topics for the given records (bodyHash must match the
+ * canonical row). Sorted, at most three per node.
+ */
+function readGraphTopics(db: GraphDb, ids: string[]): Map<string, string[]> {
+  const topicsById = new Map<string, string[]>();
+  for (const id of ids) topicsById.set(id, []);
+  if (ids.length === 0) return topicsById;
+  const idList = ids.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT t.recordId AS recordId, t.topic AS topic
+       FROM record_topics t JOIN records r ON r.id = t.recordId
+       WHERE t.recordId IN (${idList}) AND t.bodyHash = r.bodyHash
+       ORDER BY t.recordId ASC, t.topic ASC`,
+    )
+    .all(...ids) as Array<Record<string, unknown>>;
+  for (const r of rows) {
+    const list = topicsById.get(str(r["recordId"]));
+    if (list && list.length < 3) list.push(str(r["topic"]));
+  }
+  return topicsById;
+}
+
+/**
  * Read all persisted outbound refs for the given records. The number of
  * source records is already bounded by the caller (page/node limit), so this
  * deliberately has no row LIMIT: a historical row may legitimately hold more
@@ -357,9 +381,11 @@ export interface GraphPageNode {
   /** First snippetMaxCp code points of whitespace-collapsed body (never full body). */
   label: string;
   tags: string[];
+  /** Current derived topics (sorted, at most three). */
+  topics: string[];
   createdAt: string;
   episode: GraphPageEpisode | null;
-  out: Array<{ to: string; kind: "related" | "consolidation" }>;
+  out: Array<{ to: string; kind: "related" | "consolidation" | "similar" }>;
   /** Outbound refs omitted because they are dangling or out of the filter. */
   danglingOut: number;
 }
@@ -463,11 +489,31 @@ export function buildGraphPage(db: GraphDb, opts: GraphPageOptions): GraphPageDa
   const ids = shown.map((r) => str(r["id"]));
 
   const tagsById = readGraphTags(db, ids);
+  const topicsById = readGraphTopics(db, ids);
   const linksById = readGraphLinks(db, ids);
 
   const allRefs: string[] = [];
   for (const refs of linksById.values()) allRefs.push(...refs);
-  const includedTargets = readIncludedTargetIds(db, opts.scope, statuses, allRefs);
+  // Similar edges are canonical (a < b) and only the smaller endpoint lists
+  // them in graph.page `out`, so a symmetric pair is never emitted twice.
+  const similarRows: Array<{ a: string; b: string }> = [];
+  if (ids.length > 0) {
+    const idList = ids.map(() => "?").join(",");
+    const rows = db
+      .prepare(`SELECT a, b FROM similar_edges WHERE scope = ? AND a IN (${idList}) ORDER BY a ASC, b ASC`)
+      .all(opts.scope, ...ids) as Array<Record<string, unknown>>;
+    for (const r of rows) similarRows.push({ a: str(r["a"]), b: str(r["b"]) });
+  }
+  const similarByFrom = new Map<string, string[]>();
+  for (const r of similarRows) {
+    const list = similarByFrom.get(r.a);
+    if (list) list.push(r.b);
+    else similarByFrom.set(r.a, [r.b]);
+  }
+  const includedTargets = readIncludedTargetIds(db, opts.scope, statuses, [
+    ...allRefs,
+    ...similarRows.map((r) => r.b),
+  ]);
   const episodes = readPageEpisodes(db, opts.scope, ids);
 
   const nodes: GraphPageNode[] = shown.map((r) => {
@@ -479,12 +525,16 @@ export function buildGraphPage(db: GraphDb, opts: GraphPageOptions): GraphPageDa
       if (includedTargets.has(to)) out.push({ to, kind: outKind });
       else danglingOut++;
     }
+    for (const to of similarByFrom.get(id) ?? []) {
+      if (includedTargets.has(to)) out.push({ to, kind: "similar" });
+    }
     return {
       id,
       status: str(r["status"]),
       kind: str(r["kind"]),
       label: pageLabel(str(r["body"]), opts.snippetMaxCp),
       tags: tagsById.get(id) ?? [],
+      topics: topicsById.get(id) ?? [],
       createdAt: str(r["createdAt"]),
       episode: episodes.get(id) ?? null,
       out,
@@ -537,7 +587,9 @@ function scalarRow(db: GraphDb, sql: string, ...args: Array<string | number>): R
  * - scoped write-audit MAX(rowid) (status transitions retire/reactivate/
  *   archive, replay/state changes),
  * - episode_summaries MAX(rowid)/COUNT/MAX(createdAt) for the scope
- *   (maintain.episodes and direct ledger writes).
+ *   (maintain.episodes and direct ledger writes),
+ * - record_topics and similar_edges MAX(rowid)/COUNT for the scope
+ *   (maintain.associate / topic.set derived writes).
  * Reads never insert into any of these sources.
  */
 export function buildGraphVersion(db: GraphDb, scope: string): string {
@@ -561,7 +613,18 @@ export function buildGraphVersion(db: GraphDb, scope: string): string {
      FROM episode_summaries WHERE scope = ?`,
     scope,
   );
-  return `o${num(ops["m"])}:r${num(rec["m"])}.${num(rec["c"])}:a${num(aud["m"])}:e${num(ep["m"])}.${num(ep["c"])}.${str(ep["t"])}`;
+  const topics = scalarRow(
+    db,
+    `SELECT COALESCE(MAX(t.rowid), 0) AS m, COUNT(*) AS c
+     FROM record_topics t JOIN records r ON r.id = t.recordId WHERE r.scope = ?`,
+    scope,
+  );
+  const similar = scalarRow(
+    db,
+    `SELECT COALESCE(MAX(rowid), 0) AS m, COUNT(*) AS c FROM similar_edges WHERE scope = ?`,
+    scope,
+  );
+  return `o${num(ops["m"])}:r${num(rec["m"])}.${num(rec["c"])}:a${num(aud["m"])}:e${num(ep["m"])}.${num(ep["c"])}.${str(ep["t"])}:t${num(topics["m"])}.${num(topics["c"])}:s${num(similar["m"])}.${num(similar["c"])}`;
 }
 
 export interface GraphLocalNode {
@@ -571,6 +634,8 @@ export interface GraphLocalNode {
   /** First snippetMaxCp code points of whitespace-collapsed body. */
   label: string;
   tags: string[];
+  /** Current derived topics (sorted, at most three). */
+  topics: string[];
   createdAt: string;
   episode: GraphPageEpisode | null;
   /** 0 for the centre, 1..depth for BFS hops. */
@@ -580,7 +645,7 @@ export interface GraphLocalNode {
 export interface GraphLocalEdge {
   from: string;
   to: string;
-  kind: "related" | "consolidation";
+  kind: "related" | "consolidation" | "similar";
 }
 
 export interface GraphLocalData {
@@ -637,9 +702,9 @@ function notInClauses(ids: string[]): { clauses: string[]; args: string[] } {
 
 /**
  * Neighbours of `frontier` over undirected record links (outbound AND
- * inbound/backlinks), restricted to the same scope and included statuses.
- * Consolidation links are ordinary record_links rows here; their kind is
- * derived from the source record when edges are emitted.
+ * inbound/backlinks) plus derived similar edges, restricted to the same scope
+ * and included statuses. Consolidation links are ordinary record_links rows
+ * here; their kind is derived from the source record when edges are emitted.
  *
  * The SQL set is deduplicated (UNION) and already-visited nodes are excluded
  * BEFORE `LIMIT cap` is applied. Bounding the raw link rows first would let a
@@ -672,10 +737,25 @@ function readLocalNeighbors(
              SELECT l.toRef FROM record_links l WHERE l.fromId IN (${idList})
              UNION
              SELECT l.fromId FROM record_links l WHERE l.toRef IN (${idList})
+             UNION
+             SELECT s.b FROM similar_edges s WHERE s.scope = ? AND s.a IN (${idList})
+             UNION
+             SELECT s.a FROM similar_edges s WHERE s.scope = ? AND s.b IN (${idList})
            )${excludeSql}
          ORDER BY r.createdAt DESC, r.id ASC LIMIT ?`,
       )
-      .all(scope, ...statuses, ...part, ...part, ...excluded.args, cap) as Array<Record<string, unknown>>;
+      .all(
+        scope,
+        ...statuses,
+        ...part,
+        ...part,
+        scope,
+        ...part,
+        scope,
+        ...part,
+        ...excluded.args,
+        cap,
+      ) as Array<Record<string, unknown>>;
     out.push(...rows);
   }
   return out;
@@ -754,6 +834,7 @@ export function buildGraphLocal(
 
   const ids = selected.map((r) => r.id);
   const tagsById = readGraphTags(db, ids);
+  const topicsById = readGraphTopics(db, ids);
   const episodes = readPageEpisodes(db, opts.scope, ids);
   const nodes: GraphLocalNode[] = selected.map((r) => ({
     id: r.id,
@@ -761,6 +842,7 @@ export function buildGraphLocal(
     kind: r.kind,
     label: pageLabel(r.body, opts.snippetMaxCp),
     tags: tagsById.get(r.id) ?? [],
+    topics: topicsById.get(r.id) ?? [],
     createdAt: r.createdAt,
     episode: episodes.get(r.id) ?? null,
     hop: r.hop,
@@ -786,6 +868,29 @@ export function buildGraphLocal(
         if (edgeSeen.has(key)) continue;
         edgeSeen.add(key);
         allEdges.push({ from, to, kind: edgeKindForKind(kindById.get(from) ?? "") });
+      }
+    }
+    // Derived similar edges are symmetric; the canonical (a < b) row is
+    // emitted once with kind 'similar' when both endpoints are in the view.
+    const similarSeen = new Set<string>();
+    for (let i = 0; i < ids.length; i += chunk) {
+      const part = ids.slice(i, i + chunk);
+      const idList = part.map(() => "?").join(",");
+      const rows = db
+        .prepare(
+          `SELECT a, b FROM similar_edges
+           WHERE scope = ? AND (a IN (${idList}) OR b IN (${idList}))
+           ORDER BY a ASC, b ASC`,
+        )
+        .all(opts.scope, ...part, ...part) as Array<Record<string, unknown>>;
+      for (const r of rows) {
+        const a = str(r["a"]);
+        const b = str(r["b"]);
+        if (!idSet.has(a) || !idSet.has(b)) continue;
+        const key = `${a}\u0000${b}`;
+        if (similarSeen.has(key)) continue;
+        similarSeen.add(key);
+        allEdges.push({ from: a, to: b, kind: "similar" });
       }
     }
   }

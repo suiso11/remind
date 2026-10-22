@@ -61,9 +61,9 @@ npm run build
 - `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。
 - `record.archive` は `active -> archived` の終端遷移 (復帰なし)。`reasonCode` は `USER_ARCHIVED / OBSOLETE / DUPLICATE` の固定コードのみ。行は保持され、削除ではない。
 - `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード)。`record.list` に `status:"retired"` を指定すると引退済みを一覧できる。`record.search` は active + retired の明示的検索。
-- `graph.page` は同一 scope の active (+任意 `includeRetired`) を `createdAt DESC, id ASC` で不透明 cursor 頁送りし、`nodes[{id, status, kind, label, tags, createdAt, episode, out, danglingOut}] + nextCursor + version` を返す。`label` は空白畳み後の先頭 `snippetMaxCp` code point、`out` は同一 scope で status が対象に含まれる node のみ (それ以外は `danglingOut` 件数)。`limit` 既定は `limitDefault`、`limit < 1` は `BAD_REQUEST`、`limit > graphLimitMax` は `LIMIT_EXCEEDED`、不正 cursor は `BAD_REQUEST`。応答が `graphResponseMaxBytes` を超える場合は頁を縮め、1 件も収まらない場合のみ `LIMIT_EXCEEDED`。heat/exposure/usage は増やさない。
-- `graph.local` は 1 件を中心とした Obsidian 風ローカルグラフを返す。params は `scope / id` (+任意 `depth` (既定 1、1..2) / `includeRetired` / `limit`)。中心は status 不問、隣接は同一 scope かつ active (+`includeRetired` 時 retired)。辺は `record.links` の outbound と backlink を無向に辿り、`summary / correction` 由来の辺は `consolidation`、それ以外は `related` (格納方向のまま)。応答は `center + nodes[{id, status, kind, label, tags, createdAt, episode, hop}] + edges[{from, to, kind}] + truncated + version`。順序は center → hop → `createdAt DESC, id ASC`。`limit` は `graphLimitMax` まで、応答が `graphResponseMaxBytes` を超える場合は遠い/新しい node から決定的に削り `truncated:true` にする (center 単体が収まらない場合のみ `LIMIT_EXCEEDED`)。中心 id が同一 scope に無い場合は `NOT_FOUND`。heat/exposure/usage は増やさない。
-- `graph.version` は `scope` のみを受け取り、その scope の `{version}` (不透明文字列) を返す。record/link/status/episode ledger の書き込みで変化し、純粋な読み取りでは変化しない (global graph のキャッシュ判定用)。
+- `graph.page` は同一 scope の active (+任意 `includeRetired`) を `createdAt DESC, id ASC` で不透明 cursor 頁送りし、`nodes[{id, status, kind, label, tags, topics, createdAt, episode, out, danglingOut}] + nextCursor + version` を返す。`label` は空白畳み後の先頭 `snippetMaxCp` code point、`topics` は現在の派生 topic (sort 済み・最大 3)、`out` は同一 scope で status が対象に含まれる node のみ (それ以外は `danglingOut` 件数)。`out` の `kind` は `related / consolidation / similar` で、`similar` は派生 similar edge を小さい側の endpoint からのみ列挙する (対称な二重辺なし)。`limit` 既定は `limitDefault`、`limit < 1` は `BAD_REQUEST`、`limit > graphLimitMax` は `LIMIT_EXCEEDED`、不正 cursor は `BAD_REQUEST`。応答が `graphResponseMaxBytes` を超える場合は頁を縮め、1 件も収まらない場合のみ `LIMIT_EXCEEDED`。heat/exposure/usage は増やさない。
+- `graph.local` は 1 件を中心とした Obsidian 風ローカルグラフを返す。params は `scope / id` (+任意 `depth` (既定 1、1..2) / `includeRetired` / `limit`)。中心は status 不問、隣接は同一 scope かつ active (+`includeRetired` 時 retired)。辺は `record.links` の outbound と backlink を無向に辿り、派生 similar edge も無向に辿る。`summary / correction` 由来の辺は `consolidation`、similar edge は `similar`、それ以外は `related` (格納方向のまま)。応答は `center + nodes[{id, status, kind, label, tags, topics, createdAt, episode, hop}] + edges[{from, to, kind}] + truncated + version`。順序は center → hop → `createdAt DESC, id ASC`。`limit` は `graphLimitMax` まで、応答が `graphResponseMaxBytes` を超える場合は遠い/新しい node から決定的に削り `truncated:true` にする (center 単体が収まらない場合のみ `LIMIT_EXCEEDED`)。中心 id が同一 scope に無い場合は `NOT_FOUND`。heat/exposure/usage は増やさない。
+- `graph.version` は `scope` のみを受け取り、その scope の `{version}` (不透明文字列) を返す。record/link/status/episode ledger に加え、派生 `record_topics` / `similar_edges` の scope 別 max rowid・件数も含むため maintain.associate / topic.set の書込みで変化し、純粋な読み取りでは変化しない (global graph のキャッシュ判定用)。
 - `bodyMaxCp` は record 本文のみの上限である。`event.append` の raw 本文は `rawBodyMaxCp` で受ける (record の上限を raw に流用しない)。
 
 ## raw 取出し (event.get / event.range / record.sources)
@@ -138,6 +138,15 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 ## 想起方式
 
 語彙 (FTS5/BM25 + char-bigram) + raw 下降 (`record_source_refs` 経由で active・同一 scope レコードへ写像) + タグ・リンク種 + 有界グラフ展開に、M2 のベクトル候補 (ローカル多言語埋め込みのコサイン上位) を固定重みで融合する。同一の正本・索引・heat 状態では同一順序。同点は `createdAt DESC, id ASC`。超過は切り詰めず `LIMIT_EXCEEDED`。モデル・索引の欠落・無効時は語彙 + グラフに縮退して継続する (エラーにしない)。
+
+- 派生 topic が空でなければ、正規化クエリ (NFKC lowercase) に 2 code point 以上の現在 topic が部分一致したとき、その topic を持つ active 記憶をタグ seed と同じ固定重みで候補に加える (`record.search` は active+retired)。
+- 派生 similar edge があれば、seed・語彙上位から同じ深さ上限で無向に辿り、辺 score に比例し明示リンクより低い重みで融合する。どちらの派生表も空なら順位は従来と同一。
+
+## 連想の派生層 (maintain.associate / topic.set / topic.pending)
+
+- `maintain.associate` (write op、`idempotencyKey` 必須) は active 記憶の埋め込みから派生表だけを再構築する: `record_topics` (現在 bodyHash の 1〜3 話題。canonical tags > external > LLM) と `similar_edges` (同一 scope・active の top-K コサイン近傍)。canonical `record_links` は追加・削除しない。モデル欠落・無効時は適用 0 の縮退 OK。
+- 設定 `associate.*` (任意・起動時のみ): `batchMax` 50 (上限 500)、`topK` 5、`minScore` 0.45、`topicMergeMin` 0.8、`topicBonus` 0.3、`llmTopics` false。`llmTopics` は既定 false。実測では pinned Qwen2.5-1.5B が Ninja H2 を「ゲーム機」、GSX-S1000F を「自転車」と分類したため、SLM による話題抽出を既定で行わない (タグと `topic.set` が優先)。
+- `topic.set` は 1 件の active 記録に外部話題 (最大 3) を設定する。`topic.pending` はタグも外部話題も無い active 記録を返す。どちらも呼出側のより大きなモデルが話題を供給するための口であり、本 CLI 内で生成を強制しない。どちらも heat・露出を変えない。
 
 ## 冪等・エラー
 

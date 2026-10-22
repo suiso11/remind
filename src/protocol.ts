@@ -81,6 +81,8 @@ export const WRITE_OPS = new Set([
   "record.reactivate",
   "maintain.distill",
   "maintain.episodes",
+  "maintain.associate",
+  "topic.set",
 ]);
 /** Read ops: no idempotency key. */
 export const READ_OPS = new Set([
@@ -96,6 +98,7 @@ export const READ_OPS = new Set([
   "graph.page",
   "graph.local",
   "graph.version",
+  "topic.pending",
 ]);
 
 export interface ValidRequest {

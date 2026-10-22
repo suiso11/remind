@@ -70,6 +70,14 @@ async function main(): Promise<void> {
     process.stderr.write("error: store unavailable\n");
     process.exit(3);
   }
+  // A rebuild replaces every active vector, so every record must be rescanned
+  // by the next maintain.associate. Clearing the dirty-state table (derived,
+  // rebuildable) is enough; incident edges are replaced on that rescan.
+  try {
+    db.exec(`DELETE FROM associate_state`);
+  } catch {
+    /* table absent on a pre-association file: nothing to clear */
+  }
   try {
     const rows = db
       .prepare(

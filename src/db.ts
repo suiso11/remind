@@ -5,7 +5,9 @@ import type { AppConfig } from "./config.js";
 import { resolveDbPath } from "./config.js";
 import {
   LEGACY_M1_USER_VERSION,
+  LEGACY_SCHEMA_VERSION_3,
   SCHEMA_VERSION,
+  ensureAssociateSchema,
   ensureM1Schema,
   hasLegacyApprovalSchema,
 } from "./store.js";
@@ -92,9 +94,15 @@ export function initDb(
     db.exec(`PRAGMA busy_timeout = ${busy};`);
 
     const uv = readUserVersion(db);
-    // 0 = fresh; 2 = original M1 stamp (upgraded in place); SCHEMA_VERSION =
-    // already current. Anything else is an unrelated/legacy file.
-    if (uv !== 0 && uv !== LEGACY_M1_USER_VERSION && uv !== SCHEMA_VERSION) {
+    // 0 = fresh; 2 = original M1 stamp; 3 = pre-topic-origin M1 stamp (both
+    // upgraded in place); SCHEMA_VERSION = already current. Anything else is
+    // an unrelated/legacy file.
+    if (
+      uv !== 0 &&
+      uv !== LEGACY_M1_USER_VERSION &&
+      uv !== LEGACY_SCHEMA_VERSION_3 &&
+      uv !== SCHEMA_VERSION
+    ) {
       throw new Error(LEGACY_DB_MESSAGE);
     }
     // Any trace of the old candidate/approval architecture is legacy,
@@ -145,8 +153,10 @@ export function initDb(
     if (uv === SCHEMA_VERSION) {
       // Fast path: the schema is already current, so skip the write lock and
       // every PRAGMA table_info inspection (scope seeding is read-only when
-      // the configured scopes already exist).
+      // the configured scopes already exist). Derived association tables are
+      // created idempotently so pre-P3 files gain them without a version bump.
       seedScopes(false);
+      ensureAssociateSchema(db);
     } else {
       // ONE write lock spans every inspection, ALTER/TABLE rebuild, index
       // creation and the version stamp. A concurrent opener waits on

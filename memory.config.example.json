@@ -53,5 +53,13 @@
     "maxNewTokens": 128,
     "batchMax": 5
   },
+  "associate": {
+    "batchMax": 50,
+    "topK": 5,
+    "minScore": 0.45,
+    "topicMergeMin": 0.8,
+    "topicBonus": 0.3,
+    "llmTopics": false
+  },
   "requirePrivacy": false
 }

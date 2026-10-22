@@ -8,7 +8,8 @@
  * (offline only, bounded by vectors.timeoutMs) and fuses vector candidates
  * with lexical/raw/graph. Missing/invalid model or vectors degrade to the M1
  * lexical+graph path inside the same transaction (§8). Writes never embed
- * inline (deadlines preserved): vectors are populated by scripts/rebuild-vectors.
+ * inline (deadlines preserved): vectors are populated by scripts/rebuild-vectors
+ * or by the derived maintain.associate maintenance op (same pinned model).
  */
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
@@ -39,6 +40,7 @@ import { drainProjection } from "./projection.js";
 import { applyResponseBudget, fail } from "./protocol.js";
 import { normalizeBody } from "./normalize.js";
 import { maintainDistill } from "./distill.js";
+import { maintainAssociate, topicPending, topicSet } from "./associate.js";
 import {
   embedTexts,
   resolveModelDir,
@@ -145,6 +147,13 @@ function runOpSync(db: DatabaseSync, req: Req, vector?: RecallVectorInput) {
         return applyResponseBudget(fail("BAD_REQUEST"), cfg.limits.responseMaxBytes);
       }
       return reactivateRecord(db, cfg, req.params, req.idempotencyKey);
+    case "topic.set":
+      if (typeof req.idempotencyKey !== "string") {
+        return applyResponseBudget(fail("BAD_REQUEST"), cfg.limits.responseMaxBytes);
+      }
+      return topicSet(db, cfg, req.params, req.idempotencyKey);
+    case "topic.pending":
+      return topicPending(db, cfg, req.params);
     default:
       return applyResponseBudget(fail("BAD_REQUEST"), cfg.limits.responseMaxBytes);
   }
@@ -165,6 +174,14 @@ async function runOpAsync(db: DatabaseSync, req: Req, workerStartMs: number) {
     // canonical transaction (lease/dequeue/apply/settle are short separate
     // transactions around the inference phase).
     return maintainDistill(db, req.config, req.configPath, req.params, req.idempotencyKey);
+  }
+  if (req.op === "maintain.associate") {
+    if (typeof req.idempotencyKey !== "string") {
+      return applyResponseBudget(fail("BAD_REQUEST"), req.config.limits.responseMaxBytes);
+    }
+    // Embedding happens outside the edge/state transactions; the shared
+    // cultivation lease bounds it against maintain.distill/episodes.
+    return maintainAssociate(db, req.config, req.configPath, req.params, req.idempotencyKey);
   }
   return runOpSync(db, req, req.op === "record.recall" ? await recallVectorFor(req, workerStartMs) : undefined);
 }

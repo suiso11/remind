@@ -121,7 +121,6 @@ describe("m1 schema: fresh current version and legacy fail-fast", () => {
       const uv = (ctx.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
       assert.equal(uv, M1_USER_VERSION);
       assert.equal(uv, SCHEMA_VERSION);
-      assert.equal(uv, 3);
       for (const t of ["raw_events", "records", "operations", "audit", "exposures", "projection_queue"]) {
         const row = ctx.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(t) as
           | { name: string }
@@ -342,11 +341,11 @@ describe("m1 protocol op allowlist: no approval-era ops", () => {
     }
     assert.deepEqual(
       [...WRITE_OPS].sort(),
-      ["event.append", "maintain.distill", "maintain.episodes", "record.archive", "record.correct", "record.feedback", "record.reactivate", "record.remember", "record.retire"].sort(),
+      ["event.append", "maintain.associate", "maintain.distill", "maintain.episodes", "record.archive", "record.correct", "record.feedback", "record.reactivate", "record.remember", "record.retire", "topic.set"].sort(),
     );
     assert.deepEqual(
       [...READ_OPS].sort(),
-      ["episode.list", "episode.windows", "event.get", "event.range", "graph.local", "graph.page", "graph.version", "record.get", "record.list", "record.recall", "record.search", "record.sources"].sort(),
+      ["episode.list", "episode.windows", "event.get", "event.range", "graph.local", "graph.page", "graph.version", "record.get", "record.list", "record.recall", "record.search", "record.sources", "topic.pending"].sort(),
     );
   });
 
