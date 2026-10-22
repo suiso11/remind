@@ -341,7 +341,7 @@ describe("m1 protocol op allowlist: no approval-era ops", () => {
     }
     assert.deepEqual(
       [...WRITE_OPS].sort(),
-      ["event.append", "maintain.associate", "maintain.distill", "maintain.episodes", "record.archive", "record.correct", "record.feedback", "record.reactivate", "record.remember", "record.retire", "topic.set"].sort(),
+      ["event.append", "maintain.associate", "maintain.consolidate", "maintain.distill", "maintain.episodes", "record.archive", "record.correct", "record.feedback", "record.reactivate", "record.remember", "record.retire", "topic.set"].sort(),
     );
     assert.deepEqual(
       [...READ_OPS].sort(),

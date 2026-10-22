@@ -184,7 +184,7 @@ const SUMMARY_CUE = "要約：";
  * Remove the Japanese assistant prefill if the model echoes it at the start of
  * its output. Verify/claim prompts have no cue, so they never call this.
  */
-function stripSummaryCue(raw: string | null): string | null {
+export function stripSummaryCue(raw: string | null): string | null {
   if (typeof raw !== "string") return null;
   return raw.replace(/^\s*要約\s*[:：]\s*/u, "");
 }

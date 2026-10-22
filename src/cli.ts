@@ -26,9 +26,10 @@
  *   event.append, record.remember, record.get, record.list,
  *   record.recall, record.search, record.feedback, record.correct,
  *   record.archive, record.retire, record.reactivate, maintain.distill,
- *   maintain.episodes, maintain.associate
+ *   maintain.episodes, maintain.associate, maintain.consolidate
  *
- * maintain.distill / maintain.episodes / maintain.associate run under the
+ * maintain.distill / maintain.episodes / maintain.associate /
+ * maintain.consolidate run under the
  * startup-configured maintenance.timeoutMs
  * budget (default 120s, separate from the regular 5s cliMs) because it
  * performs bounded local-model inference; every other op keeps cliMs.
@@ -382,6 +383,7 @@ const STORE_OPS = new Set([
   "maintain.distill",
   "maintain.episodes",
   "maintain.associate",
+  "maintain.consolidate",
   "topic.set",
   "topic.pending",
 ]);
@@ -503,7 +505,7 @@ async function main(): Promise<void> {
             // maintain.distill gets the long startup-configured maintenance
             // budget (local-model inference); all other ops keep cliMs.
             const budget =
-              v.req.op === "maintain.distill" || v.req.op === "maintain.episodes" || v.req.op === "maintain.associate"
+              v.req.op === "maintain.distill" || v.req.op === "maintain.episodes" || v.req.op === "maintain.associate" || v.req.op === "maintain.consolidate"
                 ? maintenanceTimeoutMs(config)
                 : config.timeouts.cliMs;
             opBudget = budget;

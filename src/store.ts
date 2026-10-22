@@ -101,10 +101,11 @@ import {
  * schema; 4 adds record_topics.origin (tag/external/llm precedence); 5 adds
  * the derived association tables to the versioned migration (they are no
  * longer re-created on every open); 6 adds associate_scope_state, the
- * whole-scope edge fingerprint. Older 2-, 3-, 4-, and 5-stamped files are
- * migrated in place (never refused).
+ * whole-scope edge fingerprint; 7 adds the maintain.consolidate cluster
+ * ledger. Older 2- through 6-stamped files are migrated in place (never
+ * refused).
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -113,6 +114,8 @@ export const LEGACY_SCHEMA_VERSION_3 = 3;
 export const LEGACY_SCHEMA_VERSION_4 = 4;
 /** Per-record-edge-scan stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_5 = 5;
+/** Pre-consolidation-cluster-ledger stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_6 = 6;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -556,6 +559,18 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_episode
     ON episode_summaries(scope, kind, episodeKey, level)`);
+  // P3 maintain.consolidate ledger (derived; rebuildable). One active
+  // topic-cluster summary per (scope, topic); recordId points at the active
+  // canonical summary (or its latest revision) and memberFingerprint is the
+  // sorted member ids + bodyHashes the summary was generated from. When the
+  // fingerprint changes, the next pass regenerates and supersedes the record.
+  db.exec(`CREATE TABLE IF NOT EXISTS cluster_summaries(
+    scope TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    recordId TEXT NOT NULL,
+    memberFingerprint TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY(scope, topic))`);
   // Explicit per-event completion marker. An event is pending until its last
   // verified/verbatim window transaction (or a no-op "all windows already
   // present" repair) inserts this row. Unlike a createdAt watermark this is
@@ -3043,6 +3058,46 @@ export function listEpisodeSummaries(
     foldedRecordIds: parseFoldedRecordIds(row.foldedRecordIds),
     verbatim: row.verbatim === 1,
   }));
+}
+
+/** One derived topic-cluster ledger row (maintain.consolidate). */
+export interface ClusterSummaryRow {
+  scope: string;
+  topic: string;
+  recordId: string;
+  memberFingerprint: string;
+  createdAt: string;
+}
+
+/**
+ * Upsert one cluster ledger row. No transaction is opened here so the
+ * maintainer can commit it atomically with the canonical summary record
+ * (afterInsert under the cultivation lease fence).
+ */
+export function upsertClusterSummary(db: DatabaseSync, row: ClusterSummaryRow): void {
+  db.prepare(
+    `INSERT INTO cluster_summaries(scope, topic, recordId, memberFingerprint, createdAt)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(scope, topic) DO UPDATE SET
+       recordId = excluded.recordId,
+       memberFingerprint = excluded.memberFingerprint,
+       createdAt = excluded.createdAt`,
+  ).run(row.scope, row.topic, row.recordId, row.memberFingerprint, row.createdAt);
+}
+
+/** Read one cluster ledger row (scope + topic), or null when absent. */
+export function getClusterSummary(
+  db: DatabaseSync,
+  scope: string,
+  topic: string,
+): ClusterSummaryRow | null {
+  const row = db
+    .prepare(
+      `SELECT scope, topic, recordId, memberFingerprint, createdAt
+       FROM cluster_summaries WHERE scope = ? AND topic = ?`,
+    )
+    .get(scope, topic) as ClusterSummaryRow | undefined;
+  return row ?? null;
 }
 
 function encodeEpisodeCursor(startAt: string, episodeKey: string): string {

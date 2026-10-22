@@ -100,6 +100,18 @@ export interface AssociateConfig {
 }
 
 /**
+ * P3 topic-cluster consolidation bounds (startup-only, optional). A topic
+ * cluster is consolidated only once it has at least minMembers active member
+ * records; one pass processes at most batchMax clusters.
+ */
+export interface ConsolidateConfig {
+  /** Minimum active member records for a topic to be consolidated (default 3). */
+  minMembers: number;
+  /** Max topic clusters processed per maintain.consolidate run (default 5). */
+  batchMax: number;
+}
+
+/**
  * P2 episode derivation bounds (startup-only, optional). Absent uses the
  * documented defaults. utcOffsetMinutes only shifts the `day` episode key;
  * stored timestamps stay canonical UTC.
@@ -134,6 +146,8 @@ export interface AppConfig {
   episodes?: EpisodesConfig;
   /** P3 derived association bounds (optional; absent uses defaults). */
   associate?: AssociateConfig;
+  /** P3 topic-cluster consolidation bounds (optional; absent uses defaults). */
+  consolidate?: ConsolidateConfig;
   /**
    * F-I01-05 (optional boolean, default false): when true, event.append and
    * record.remember without a `privacy` object are BAD_REQUEST (no side
@@ -155,6 +169,7 @@ const TOP_KEYS = [
   "maintenance",
   "episodes",
   "associate",
+  "consolidate",
   "requirePrivacy",
 ] as const;
 const LIMIT_KEYS = [
@@ -535,6 +550,27 @@ export function loadConfig(configPath: string): AppConfig {
     };
   }
 
+  let consolidate: ConsolidateConfig | undefined;
+  if ("consolidate" in parsed && (parsed as Record<string, unknown>)["consolidate"] !== undefined) {
+    const c = (parsed as Record<string, unknown>)["consolidate"];
+    if (!isPlainObject(c)) throw new Error("consolidate must be an object");
+    for (const k of Object.keys(c)) {
+      if (!["minMembers", "batchMax"].includes(k)) {
+        throw new Error(`unknown consolidate field: ${k}`);
+      }
+    }
+    const minMembers = c["minMembers"] ?? CONSOLIDATE_DEFAULT_MIN_MEMBERS;
+    const eM = checkRange("consolidate.minMembers", minMembers, 2, 50);
+    if (eM) throw new Error(eM);
+    const batchMax = c["batchMax"] ?? CONSOLIDATE_DEFAULT_BATCH_MAX;
+    const eB = checkRange("consolidate.batchMax", batchMax, 1, 50);
+    if (eB) throw new Error(eB);
+    consolidate = {
+      minMembers: minMembers as number,
+      batchMax: batchMax as number,
+    };
+  }
+
   let requirePrivacy: boolean | undefined;
   if ("requirePrivacy" in parsed && (parsed as Record<string, unknown>)["requirePrivacy"] !== undefined) {
     const rp = (parsed as Record<string, unknown>)["requirePrivacy"];
@@ -573,6 +609,7 @@ export function loadConfig(configPath: string): AppConfig {
     ...(maintenance ? { maintenance } : {}),
     ...(episodes ? { episodes } : {}),
     ...(associate ? { associate } : {}),
+    ...(consolidate ? { consolidate } : {}),
     ...(requirePrivacy !== undefined ? { requirePrivacy } : {}),
   };
 }
@@ -632,6 +669,17 @@ export const ASSOCIATE_DEFAULT_TOPIC_MERGE_MIN = 0.8;
 export const ASSOCIATE_DEFAULT_TOPIC_BONUS = 0.3;
 /** Topic extraction is opt-in; canonical tags and topic.set do not need the SLM. */
 export const ASSOCIATE_DEFAULT_LLM_TOPICS = false;
+
+/** P3 topic-cluster consolidation defaults (startup-only). */
+export const CONSOLIDATE_DEFAULT_MIN_MEMBERS = 3;
+export const CONSOLIDATE_DEFAULT_BATCH_MAX = 5;
+
+export function consolidateBounds(config: AppConfig): Required<ConsolidateConfig> {
+  return {
+    minMembers: config.consolidate?.minMembers ?? CONSOLIDATE_DEFAULT_MIN_MEMBERS,
+    batchMax: config.consolidate?.batchMax ?? CONSOLIDATE_DEFAULT_BATCH_MAX,
+  };
+}
 
 export function associateBounds(config: AppConfig): Required<AssociateConfig> {
   return {

@@ -8,6 +8,7 @@ import {
   LEGACY_SCHEMA_VERSION_3,
   LEGACY_SCHEMA_VERSION_4,
   LEGACY_SCHEMA_VERSION_5,
+  LEGACY_SCHEMA_VERSION_6,
   SCHEMA_VERSION,
   ensureM1Schema,
   hasLegacyApprovalSchema,
@@ -96,15 +97,16 @@ export function initDb(
 
     const uv = readUserVersion(db);
     // 0 = fresh; 2 = original M1 stamp; 3 = pre-topic-origin; 4 = pre-derived
-    // association tables; 5 = pre-whole-scope edge fingerprint (all upgraded
-    // in place); SCHEMA_VERSION = already current. Anything else is an
-    // unrelated/legacy file.
+    // association tables; 5 = pre-whole-scope edge fingerprint; 6 = pre
+    // consolidation cluster ledger (all upgraded in place); SCHEMA_VERSION =
+    // already current. Anything else is an unrelated/legacy file.
     if (
       uv !== 0 &&
       uv !== LEGACY_M1_USER_VERSION &&
       uv !== LEGACY_SCHEMA_VERSION_3 &&
       uv !== LEGACY_SCHEMA_VERSION_4 &&
       uv !== LEGACY_SCHEMA_VERSION_5 &&
+      uv !== LEGACY_SCHEMA_VERSION_6 &&
       uv !== SCHEMA_VERSION
     ) {
       throw new Error(LEGACY_DB_MESSAGE);

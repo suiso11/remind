@@ -61,5 +61,9 @@
     "topicBonus": 0.3,
     "llmTopics": false
   },
+  "consolidate": {
+    "minMembers": 3,
+    "batchMax": 5
+  },
   "requirePrivacy": false
 }

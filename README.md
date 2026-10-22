@@ -148,6 +148,18 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 - 設定 `associate.*` (任意・起動時のみ): `batchMax` 50 (上限 500)、`topK` 5、`minScore` 0.45、`topicMergeMin` 0.8、`topicBonus` 0.3、`llmTopics` false。`llmTopics` は既定 false。実測では pinned Qwen2.5-1.5B が Ninja H2 を「ゲーム機」、GSX-S1000F を「自転車」と分類したため、SLM による話題抽出を既定で行わない (タグと `topic.set` が優先)。
 - `topic.set` は 1 件の active 記録に外部話題 (最大 3) を設定する。`topic.pending` はタグも外部話題も無い active 記録を返す。どちらも呼出側のより大きなモデルが話題を供給するための口であり、本 CLI 内で生成を強制しない。どちらも heat・露出を変えない。
 
+## 話題クラスタ統合 (maintain.consolidate)
+
+```powershell
+'{"v":1,"op":"maintain.consolidate","idempotencyKey":"cons-001","params":{"scope":"personal/default"}}' | node dist/src/cli.js --config ./memory.config.json
+```
+
+- `maintain.consolidate` (write op、`idempotencyKey` 必須、`maintenance.timeoutMs` 予算) は `record_topics` の話題を単位に、`consolidate.minMembers` (既定 3) 件以上の active メンバーを持つ話題クラスタを 1 回の grounded summary に統合する。メンバーは現在 bodyHash の topic 行を持ち、この op 自身が書いた summary (`source = cultivation:llm-derived-cluster`) を除く。`limit` (既定 `consolidate.batchMax` 5) は処理する変更済みクラスタ数。
+- クラスタの member fingerprint (member id と bodyHash の昇順組) が `cluster_summaries` の保存値と一致する場合はモデルを呼ばず、`unchanged` として返す (変更済みクラスタの処理上限は消費しない)。変更がある場合だけ `createdAt ASC` のメンバーを最大 `EPISODE_FOLD_MAX` (5) 件ずつ cited reduce prompt に渡す。各文は (a) 引用した全メンバー本文に anchor token が存在すること、(b) 引用本文に対する厳密 YES/NO、の両方を通った場合だけ残す。anchor 不在・NO の文は落とし、1 文も残らなければ extractive fallback を書かずに `no_grounded_sentences` として記録する (作り話を書かない)。
+- 生成・文検証が一時的失敗 (null / timeout / 例外) の場合はそのクラスタを `deferred` として何も書かず、次回に再試行する。`requirePrivacy` で引用メンバーの privacy が unknown の場合も defer する。
+- 書込みは `kind: summary`、`tags: [topic]` (`tagsMax` で有界)、`links`: 引用メンバー id (`linksMax` で有界)、`sourceRefs`: 引用メンバーの sourceRefs の和集合 (span 保持、`sourceRefsMax` で有界)、provenance `cultivation:llm-derived-cluster`、privacy は `deriveConsolidationPrivacy` (sensitive 優先・全 known なら normal・unknown を含めば null)。同一 topic の active summary がある場合は `record.correct` で旧版を `superseded` にして履歴を残す。canonical record と `cluster_summaries` 行は同じ transaction で lease fence 下に書く。
+- 応答 `clusters[{topic, members, sentencesKept, sentencesDropped, recordId, outcome}] + applied + degraded`。`outcome` は `written / unchanged / no_grounded_sentences / deferred`。LLM 無効・欠落時は `{clusters:[], applied:0, degraded:true}` を返し、状態を変えない。設定 `consolidate{minMembers=3, batchMax=5}` は起動時のみ (任意)。
+
 ## 冪等・エラー
 
 - 全書き込みは `idempotencyKey` 必須。欠落は `BAD_REQUEST`。同一キー + 同一 params の再送は保存済み応答を `deduplicated:true` で返す。params 改変は `CONFLICT`。
