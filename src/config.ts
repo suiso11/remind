@@ -100,6 +100,39 @@ export interface AssociateConfig {
 }
 
 /**
+ * ACT-R activation model bounds (startup-only, optional). Absent uses the
+ * documented defaults. The model/preview are read-only; maintain.activation
+ * writes only when `apply` is true.
+ */
+export interface ActivationConfig {
+  /** Base-level decay d in [0,2] (default 0.5). */
+  decay: number;
+  /** Retire below this activation (default -1.5). */
+  tauRetire: number;
+  /** Reactivate at or above this activation (default -0.5). */
+  tauReactivate: number;
+  /** Minimum age in hours before an active record may retire (default 72). */
+  minAgeHours: number;
+  /** Weight applied to importance in [0,1] (default 2.0). */
+  wImportance: number;
+  /** Per-kind additive weights (defaults: user_fact 1.0, model_inference 0.0, summary 0.3, correction 1.0). */
+  wKind: {
+    user_fact: number;
+    model_inference: number;
+    summary: number;
+    correction: number;
+  };
+  /** Reconsider legacy LOW_SIGNAL retirements for reactivation (default true). */
+  reconsiderLegacy: boolean;
+  /** Max records scored per maintain.activation run (default 20, cap 200). */
+  batchMax: number;
+  /** Apply retirement/reactivation decisions (default false: report only). */
+  apply: boolean;
+  /** Importance at/above which retirement needs the protective margin (default 0.66). */
+  protectImportance: number;
+}
+
+/**
  * P2 episode derivation bounds (startup-only, optional). Absent uses the
  * documented defaults. utcOffsetMinutes only shifts the `day` episode key;
  * stored timestamps stay canonical UTC.
@@ -134,6 +167,8 @@ export interface AppConfig {
   episodes?: EpisodesConfig;
   /** P3 derived association bounds (optional; absent uses defaults). */
   associate?: AssociateConfig;
+  /** ACT-R activation model/preview bounds (optional; absent uses defaults). */
+  activation?: ActivationConfig;
   /**
    * F-I01-05 (optional boolean, default false): when true, event.append and
    * record.remember without a `privacy` object are BAD_REQUEST (no side
@@ -155,6 +190,7 @@ const TOP_KEYS = [
   "maintenance",
   "episodes",
   "associate",
+  "activation",
   "requirePrivacy",
 ] as const;
 const LIMIT_KEYS = [
@@ -535,6 +571,102 @@ export function loadConfig(configPath: string): AppConfig {
     };
   }
 
+  let activation: ActivationConfig | undefined;
+  if ("activation" in parsed && (parsed as Record<string, unknown>)["activation"] !== undefined) {
+    const a = (parsed as Record<string, unknown>)["activation"];
+    if (!isPlainObject(a)) throw new Error("activation must be an object");
+    for (const k of Object.keys(a)) {
+      if (
+        ![
+          "decay",
+          "tauRetire",
+          "tauReactivate",
+          "minAgeHours",
+          "wImportance",
+          "wKind",
+          "reconsiderLegacy",
+          "batchMax",
+          "apply",
+          "protectImportance",
+        ].includes(k)
+      ) {
+        throw new Error(`unknown activation field: ${k}`);
+      }
+    }
+    const decay = a["decay"] ?? ACTIVATION_DEFAULT_DECAY;
+    if (typeof decay !== "number" || !Number.isFinite(decay) || decay < 0 || decay > 2) {
+      throw new Error("activation.decay must be a number in 0..2");
+    }
+    const tauRetire = a["tauRetire"] ?? ACTIVATION_DEFAULT_TAU_RETIRE;
+    if (typeof tauRetire !== "number" || !Number.isFinite(tauRetire) || tauRetire < -10 || tauRetire > 10) {
+      throw new Error("activation.tauRetire must be a number in -10..10");
+    }
+    const tauReactivate = a["tauReactivate"] ?? ACTIVATION_DEFAULT_TAU_REACTIVATE;
+    if (typeof tauReactivate !== "number" || !Number.isFinite(tauReactivate) || tauReactivate < -10 || tauReactivate > 10) {
+      throw new Error("activation.tauReactivate must be a number in -10..10");
+    }
+    if (!(tauRetire < tauReactivate)) {
+      throw new Error("activation.tauRetire must be < activation.tauReactivate");
+    }
+    const minAgeHours = a["minAgeHours"] ?? ACTIVATION_DEFAULT_MIN_AGE_HOURS;
+    const eAge = checkRange("activation.minAgeHours", minAgeHours, 0, 87600);
+    if (eAge) throw new Error(eAge);
+    const wImportance = a["wImportance"] ?? ACTIVATION_DEFAULT_W_IMPORTANCE;
+    if (typeof wImportance !== "number" || !Number.isFinite(wImportance) || wImportance < 0 || wImportance > 10) {
+      throw new Error("activation.wImportance must be a number in 0..10");
+    }
+    const wKindRaw = a["wKind"] ?? {};
+    if (!isPlainObject(wKindRaw)) throw new Error("activation.wKind must be an object");
+    for (const k of Object.keys(wKindRaw)) {
+      if (!["user_fact", "model_inference", "summary", "correction"].includes(k)) {
+        throw new Error(`unknown activation.wKind field: ${k}`);
+      }
+      const w = wKindRaw[k];
+      if (typeof w !== "number" || !Number.isFinite(w) || w < -10 || w > 10) {
+        throw new Error(`activation.wKind.${k} must be a number in -10..10`);
+      }
+    }
+    const wKind = {
+      user_fact: (wKindRaw["user_fact"] as number | undefined) ?? ACTIVATION_DEFAULT_W_KIND.user_fact,
+      model_inference:
+        (wKindRaw["model_inference"] as number | undefined) ?? ACTIVATION_DEFAULT_W_KIND.model_inference,
+      summary: (wKindRaw["summary"] as number | undefined) ?? ACTIVATION_DEFAULT_W_KIND.summary,
+      correction: (wKindRaw["correction"] as number | undefined) ?? ACTIVATION_DEFAULT_W_KIND.correction,
+    };
+    const reconsiderLegacy = a["reconsiderLegacy"] ?? ACTIVATION_DEFAULT_RECONSIDER_LEGACY;
+    if (typeof reconsiderLegacy !== "boolean") {
+      throw new Error("activation.reconsiderLegacy must be a boolean");
+    }
+    const batchMax = a["batchMax"] ?? ACTIVATION_DEFAULT_BATCH_MAX;
+    const eBatch = checkRange("activation.batchMax", batchMax, 1, ACTIVATION_BATCH_MAX_CAP);
+    if (eBatch) throw new Error(eBatch);
+    const apply = a["apply"] ?? ACTIVATION_DEFAULT_APPLY;
+    if (typeof apply !== "boolean") {
+      throw new Error("activation.apply must be a boolean");
+    }
+    const protectImportance = a["protectImportance"] ?? ACTIVATION_DEFAULT_PROTECT_IMPORTANCE;
+    if (
+      typeof protectImportance !== "number" ||
+      !Number.isFinite(protectImportance) ||
+      protectImportance < 0 ||
+      protectImportance > 1
+    ) {
+      throw new Error("activation.protectImportance must be a number in 0..1");
+    }
+    activation = {
+      decay,
+      tauRetire,
+      tauReactivate,
+      minAgeHours: minAgeHours as number,
+      wImportance,
+      wKind,
+      reconsiderLegacy,
+      batchMax: batchMax as number,
+      apply,
+      protectImportance,
+    };
+  }
+
   let requirePrivacy: boolean | undefined;
   if ("requirePrivacy" in parsed && (parsed as Record<string, unknown>)["requirePrivacy"] !== undefined) {
     const rp = (parsed as Record<string, unknown>)["requirePrivacy"];
@@ -573,6 +705,7 @@ export function loadConfig(configPath: string): AppConfig {
     ...(maintenance ? { maintenance } : {}),
     ...(episodes ? { episodes } : {}),
     ...(associate ? { associate } : {}),
+    ...(activation ? { activation } : {}),
     ...(requirePrivacy !== undefined ? { requirePrivacy } : {}),
   };
 }
@@ -632,6 +765,50 @@ export const ASSOCIATE_DEFAULT_TOPIC_MERGE_MIN = 0.8;
 export const ASSOCIATE_DEFAULT_TOPIC_BONUS = 0.3;
 /** Topic extraction is opt-in; canonical tags and topic.set do not need the SLM. */
 export const ASSOCIATE_DEFAULT_LLM_TOPICS = false;
+
+/** ACT-R activation defaults (startup-only; documented in memory.config.example.json). */
+export const ACTIVATION_DEFAULT_DECAY = 0.5;
+export const ACTIVATION_DEFAULT_TAU_RETIRE = -1.5;
+export const ACTIVATION_DEFAULT_TAU_REACTIVATE = -0.5;
+export const ACTIVATION_DEFAULT_MIN_AGE_HOURS = 72;
+export const ACTIVATION_DEFAULT_W_IMPORTANCE = 2.0;
+export const ACTIVATION_DEFAULT_W_KIND = {
+  user_fact: 1.0,
+  model_inference: 0.0,
+  summary: 0.3,
+  correction: 1.0,
+} as const;
+export const ACTIVATION_DEFAULT_RECONSIDER_LEGACY = true;
+/** Importance scoring batch size per maintain.activation run. */
+export const ACTIVATION_DEFAULT_BATCH_MAX = 20;
+/** Hard cap for one scoring batch (also the op limit cap). */
+export const ACTIVATION_BATCH_MAX_CAP = 200;
+/** Applying decisions is opt-in until the model is tuned. */
+export const ACTIVATION_DEFAULT_APPLY = false;
+/** protectImportance default (2/3 rounded down); see retireDecision. */
+export const ACTIVATION_DEFAULT_PROTECT_IMPORTANCE = 0.66;
+
+export function activationBounds(config: AppConfig): ActivationConfig {
+  const a = config.activation;
+  const kind = a?.wKind;
+  return {
+    decay: a?.decay ?? ACTIVATION_DEFAULT_DECAY,
+    tauRetire: a?.tauRetire ?? ACTIVATION_DEFAULT_TAU_RETIRE,
+    tauReactivate: a?.tauReactivate ?? ACTIVATION_DEFAULT_TAU_REACTIVATE,
+    minAgeHours: a?.minAgeHours ?? ACTIVATION_DEFAULT_MIN_AGE_HOURS,
+    wImportance: a?.wImportance ?? ACTIVATION_DEFAULT_W_IMPORTANCE,
+    wKind: {
+      user_fact: kind?.user_fact ?? ACTIVATION_DEFAULT_W_KIND.user_fact,
+      model_inference: kind?.model_inference ?? ACTIVATION_DEFAULT_W_KIND.model_inference,
+      summary: kind?.summary ?? ACTIVATION_DEFAULT_W_KIND.summary,
+      correction: kind?.correction ?? ACTIVATION_DEFAULT_W_KIND.correction,
+    },
+    reconsiderLegacy: a?.reconsiderLegacy ?? ACTIVATION_DEFAULT_RECONSIDER_LEGACY,
+    batchMax: a?.batchMax ?? ACTIVATION_DEFAULT_BATCH_MAX,
+    apply: a?.apply ?? ACTIVATION_DEFAULT_APPLY,
+    protectImportance: a?.protectImportance ?? ACTIVATION_DEFAULT_PROTECT_IMPORTANCE,
+  };
+}
 
 export function associateBounds(config: AppConfig): Required<AssociateConfig> {
   return {

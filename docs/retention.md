@@ -16,6 +16,14 @@
 - 「この会話中は出さない」等の一時的な非表示と、耐久的な引退は別物として扱う。
 - 既存の終端 `archived` は可逆引退ではない。`superseded`（旧版履歴）・`archived` と可逆 `retired` を区別する。`archived` の明示的検索範囲は未決定であり黙って決めない。
 
+## 活性化関数による引退（2026-10-22 決定・決定者 haruka）
+
+- 引退は**経過時間だけでは決めない**。利用頻度・直近性（作成・検証済み feedback 利用・訂正・再活性化の時刻）に kind 重みとモデル採点の重要度を加えた ACT-R 風の活性化関数 `A` で決める。式・既定値は README「活性化による引退」を参照。
+- 重要度はローカル LLM が 0..3 で採点し、`record_importance` に `importance = n/3`、`source='llm'`、現在の `bodyHash` とともに保存する。本文が訂正され bodyHash が変わった採点は陳腐化として無視する。モデル無効・欠落時は採点をスキップし、中立 0.5 として扱う（嘘の 0 を入れない）。
+- 引退は可逆である。`active <-> retired` の既存遷移経路（監査付き）を使い、`LOW_ACTIVATION` で引退、活性が `tauReactivate` 以上に戻れば再活性化する。旧 `LOW_SIGNAL` 引退も `reconsiderLegacy` で再検討する。
+- 重要度が `activation.protectImportance`（既定 0.66 ≒ 2/3）以上の記憶は、通常の `tauRetire` では引退せず `A < tauRetire - 1` の保護マージンを要求する。
+- `activation.apply` は**既定 false**。false の間は状態を変えず `wouldRetire / wouldReactivate` を報告するだけに留め、モデルと閾値の調整が済むまで自動適用しない。有効化は起動時 config の明示指定のみで行う。
+
 ## 保持するもの・保持しないもの（実装済み範囲）
 
 - `raw_events` は不変の追記のみ。更新・削除はない。

@@ -26,10 +26,11 @@
  *   event.append, record.remember, record.get, record.list,
  *   record.recall, record.search, record.feedback, record.correct,
  *   record.archive, record.retire, record.reactivate, maintain.distill,
- *   maintain.episodes, maintain.associate
+ *   maintain.episodes, maintain.associate, maintain.activation,
+ *   activation.preview
  *
- * maintain.distill / maintain.episodes / maintain.associate run under the
- * startup-configured maintenance.timeoutMs
+ * maintain.distill / maintain.episodes / maintain.associate /
+ * maintain.activation run under the startup-configured maintenance.timeoutMs
  * budget (default 120s, separate from the regular 5s cliMs) because it
  * performs bounded local-model inference; every other op keeps cliMs.
  *
@@ -47,6 +48,7 @@ import {
   type ResponseEnvelope,
 } from "./protocol.js";
 import { episodeWindows } from "./episodes.js";
+import { activationPreview } from "./activation.js";
 import { initDb, isLegacyDbError } from "./db.js";
 import { effectiveBusyMs, runStoreOpWithDeadline } from "./deadline.js";
 import * as fs from "node:fs";
@@ -339,6 +341,8 @@ export function handleValidatedRequest(
       return reactivateRecord(db, config, params, idempotencyKey);
     case "record.search":
       return searchRecords(db, config, params);
+    case "activation.preview":
+      return activationPreview(db, config, params);
     default:
       return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
   }
@@ -382,8 +386,10 @@ const STORE_OPS = new Set([
   "maintain.distill",
   "maintain.episodes",
   "maintain.associate",
+  "maintain.activation",
   "topic.set",
   "topic.pending",
+  "activation.preview",
 ]);
 
 async function main(): Promise<void> {
@@ -503,7 +509,10 @@ async function main(): Promise<void> {
             // maintain.distill gets the long startup-configured maintenance
             // budget (local-model inference); all other ops keep cliMs.
             const budget =
-              v.req.op === "maintain.distill" || v.req.op === "maintain.episodes" || v.req.op === "maintain.associate"
+              v.req.op === "maintain.distill" ||
+              v.req.op === "maintain.episodes" ||
+              v.req.op === "maintain.associate" ||
+              v.req.op === "maintain.activation"
                 ? maintenanceTimeoutMs(config)
                 : config.timeouts.cliMs;
             opBudget = budget;

@@ -61,6 +61,7 @@ export const RETIRE_REASONS = [
   "NO_LONGER_USEFUL",
   "OUTDATED",
   "LOW_SIGNAL",
+  "LOW_ACTIVATION",
   "CONSOLIDATED",
 ] as const;
 
