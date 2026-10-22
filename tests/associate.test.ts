@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "../src/config.js";
 import {
   ASSOCIATE_DEFAULT_BATCH_MAX,
@@ -19,9 +19,9 @@ import {
   ASSOCIATE_DEFAULT_TOP_K,
   loadConfig,
 } from "../src/config.js";
-import { initDb } from "../src/db.js";
+import { initDb, SCHEMA_VERSION } from "../src/db.js";
 import { normalizeBody } from "../src/normalize.js";
-import { eventAppend, rememberRecord, correctRecord, retireRecord } from "../src/store.js";
+import { eventAppend, rememberRecord, correctRecord, retireRecord, LEGACY_SCHEMA_VERSION_4 } from "../src/store.js";
 import { acquireCultivationLease, releaseCultivationLease } from "../src/cultivation.js";
 import { maintainAssociate, topicSet, topicPending, buildTopicPrompt, parseTopicResponse, type AssociateEmbed, type AssociateGenerate } from "../src/associate.js";
 import { VECTOR_DIM, normalizeVec } from "../src/vectors.js";
@@ -1005,6 +1005,54 @@ describe("associate config validation", () => {
       assert.equal(cfg.associate?.llmTopics, false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("associate schema is versioned, not per-open", () => {
+  it("a second initDb on a current file performs no DDL (schema_version and mtime unchanged)", () => {
+    const ctx = setup();
+    try {
+      const dbFile = path.join(ctx.dir, "t.db");
+      const before = (ctx.db.prepare(`PRAGMA schema_version`).get() as { schema_version: number }).schema_version;
+      ctx.db.close();
+      const mtimeBefore = fs.statSync(dbFile).mtimeMs;
+      const reopened = initDb(ctx.config, path.join(ctx.dir, "memory.config.json"));
+      const after = (reopened.db.prepare(`PRAGMA schema_version`).get() as { schema_version: number }).schema_version;
+      assert.equal(after, before, "already-current open must not run DDL");
+      assert.equal(fs.statSync(dbFile).mtimeMs, mtimeBefore, "already-current open must not write the db file");
+      const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
+      assert.equal(uv, SCHEMA_VERSION);
+      reopened.db.close();
+    } finally {
+      try { ctx.db.close(); } catch { /* already closed */ }
+      fs.rmSync(ctx.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
+
+  it("a version-4 file (pre-derived-association build) migrates in place to the current stamp", () => {
+    const ctx = setup();
+    try {
+      const dbFile = path.join(ctx.dir, "t.db");
+      const cfgPath = path.join(ctx.dir, "memory.config.json");
+      ctx.db.exec(`DROP TABLE similar_edges`);
+      ctx.db.exec(`DROP TABLE associate_state`);
+      ctx.db.exec(`DROP TABLE record_topics`);
+      ctx.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION_4}`);
+      ctx.db.close();
+      const reopened = initDb(ctx.config, cfgPath);
+      const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
+      assert.equal(uv, SCHEMA_VERSION);
+      for (const table of ["similar_edges", "associate_state", "record_topics"]) {
+        const row = reopened.db
+          .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = ?`)
+          .get(table) as { found: number } | undefined;
+        assert.ok(row, `${table} created by the versioned migration`);
+      }
+      reopened.db.close();
+    } finally {
+      try { ctx.db.close(); } catch { /* already closed */ }
+      fs.rmSync(ctx.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 });

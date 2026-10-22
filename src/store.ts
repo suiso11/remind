@@ -98,14 +98,18 @@ import {
  * Current additive schema generation, stamped into PRAGMA user_version only
  * after every migration and index in ensureM1Schema has succeeded. Version 2
  * was the original M1 stamp; 3 marks the serialized, span/episode-complete
- * schema; 4 adds record_topics.origin (tag/external/llm precedence). Older
- * 2- and 3-stamped files are migrated in place (never refused).
+ * schema; 4 adds record_topics.origin (tag/external/llm precedence); 5 adds
+ * the derived association tables to the versioned migration (they are no
+ * longer re-created on every open). Older 2-, 3-, and 4-stamped files are
+ * migrated in place (never refused).
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_3 = 3;
+/** Pre-association-schema stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_4 = 4;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -387,7 +391,9 @@ function readSchemaVersion(db: DatabaseSync): number {
  * recomputes that record's incident edges. Both tables can be dropped at any
  * time; canonical `record_links` remain caller-authored and untouched.
  *
- * Idempotent and safe to call on every open (tables already present => no-op).
+ * Runs once inside the versioned migration lock; it is NOT called on the
+ * already-current fast path (every DDL/PRAGMA here would otherwise be paid on
+ * every CLI/worker open even though the tables are unchanged).
  */
 export function ensureAssociateSchema(db: DatabaseSync): void {
   db.exec(`CREATE TABLE IF NOT EXISTS similar_edges(
@@ -606,9 +612,8 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
  */
 export function ensureM1Schema(db: DatabaseSync): void {
   if (readSchemaVersion(db) === SCHEMA_VERSION) {
-    // Derived association tables were added without a version bump; keep
-    // already-current databases self-healing without rewriting canonical rows.
-    ensureAssociateSchema(db);
+    // Already current: no write lock, no DDL, no PRAGMA inspection. The
+    // derived association tables are part of the versioned migration below.
     return;
   }
   const ownTransaction = !db.isTransaction;
@@ -3373,6 +3378,13 @@ function topicSeedIds(
 ): string[] {
   const nq = normalizeBody(query);
   if (countCp(nq) < TOPIC_SEED_MIN_CP) return [];
+  // The derived layer is empty until maintain.associate / topic.set runs.
+  // Cheap existence probe: skip the DISTINCT/JOIN/ORDER BY scan entirely.
+  try {
+    if (!db.prepare(`SELECT 1 AS one FROM record_topics LIMIT 1`).get()) return [];
+  } catch {
+    return [];
+  }
   const statusList = statuses.map(() => "?").join(",");
   let topicRows: Array<{ topic: string }>;
   try {
@@ -3445,15 +3457,30 @@ function expandSimilarEdges(
   const contributions = new Map<string, number>();
   const visited = new Set<string>(frontier0);
   let frontier = [...frontier0];
+  // Empty derived layer: one existence probe replaces the per-frontier
+  // queries (frontier0 can be 20 ids plus explicit-link neighbours).
+  try {
+    if (!db.prepare(`SELECT 1 AS one FROM similar_edges LIMIT 1`).get()) return contributions;
+  } catch {
+    return contributions;
+  }
+  const CHUNK = 400;
   for (let hop = 1; hop <= GRAPH_DEPTH_MAX && frontier.length > 0; hop++) {
     const rawScore = new Map<string, number>();
-    for (const id of frontier) {
+    for (let i = 0; i < frontier.length; i += CHUNK) {
+      const part = frontier.slice(i, i + CHUNK);
+      const members = new Set(part);
+      const list = part.map(() => "?").join(",");
       try {
+        // One batched query per hop instead of one query per frontier id.
         const rows = db
-          .prepare(`SELECT a, b, score FROM similar_edges WHERE scope = ? AND (a = ? OR b = ?)`)
-          .all(scope, id, id) as Array<{ a: string; b: string; score: number }>;
+          .prepare(
+            `SELECT a, b, score FROM similar_edges
+             WHERE scope = ? AND (a IN (${list}) OR b IN (${list}))`,
+          )
+          .all(scope, ...part, ...part) as Array<{ a: string; b: string; score: number }>;
         for (const row of rows) {
-          const nb = row.a === id ? row.b : row.a;
+          const nb = members.has(row.a) ? row.b : row.a;
           if (visited.has(nb)) continue;
           const s = typeof row.score === "number" && Number.isFinite(row.score) ? row.score : 0;
           if (s <= 0) continue;
@@ -3461,22 +3488,33 @@ function expandSimilarEdges(
           if (prev === undefined || s > prev) rawScore.set(nb, s);
         }
       } catch {
-        /* skip this frontier member */
+        /* skip this frontier chunk */
       }
     }
     const resolved: Array<{ id: string; createdAt: string; contribution: number }> = [];
-    for (const [id, score] of rawScore) {
+    const candidates = [...rawScore.keys()];
+    const createdAtById = new Map<string, string>();
+    for (let i = 0; i < candidates.length; i += CHUNK) {
+      const part = candidates.slice(i, i + CHUNK);
+      const list = part.map(() => "?").join(",");
       try {
-        const row = db
-          .prepare(`SELECT id, createdAt FROM records WHERE id = ? AND scope = ? AND status = 'active'`)
-          .get(id, scope) as { id: string; createdAt: string } | undefined;
-        if (!row) continue;
-        if (since !== null && row.createdAt < since) continue;
-        if (until !== null && row.createdAt >= until) continue;
-        resolved.push({ id, createdAt: row.createdAt, contribution: (SIMILAR_FUSION_WEIGHT * score) / hop });
+        const rows = db
+          .prepare(
+            `SELECT id, createdAt FROM records
+             WHERE scope = ? AND status = 'active' AND id IN (${list})`,
+          )
+          .all(scope, ...part) as Array<{ id: string; createdAt: string }>;
+        for (const row of rows) createdAtById.set(row.id, row.createdAt);
       } catch {
         /* dangling/unreadable similar rows are skipped */
       }
+    }
+    for (const [id, score] of rawScore) {
+      const createdAt = createdAtById.get(id);
+      if (createdAt === undefined) continue;
+      if (since !== null && createdAt < since) continue;
+      if (until !== null && createdAt >= until) continue;
+      resolved.push({ id, createdAt, contribution: (SIMILAR_FUSION_WEIGHT * score) / hop });
     }
     resolved.sort((a, b) =>
       b.contribution !== a.contribution
