@@ -199,15 +199,15 @@ npm run smoke:episodes   # 実 LLM での取込 -> episode 索引スモーク (�
 "llm": {
   "backend": "openai",
   "enabled": true,
-  "baseUrl": "http://127.0.0.1:8080",
-  "model": "Ornith-1.5-9B",
+  "baseUrl": "http://127.0.0.1:18090",
+  "model": "ornith-1.5-9b",
   "timeoutMs": 60000,
   "maxNewTokens": 48,
   "maxPromptChars": 2000
 }
 ```
 
-`llama-server -m <model.gguf> --host 127.0.0.1 --port 8080` で起動する。LiteLLM 等も localhost で待ち受けていれば同じ設定で使える。ONNX と同じく、接続失敗・HTTP エラー・タイムアウト・不正出力は state を変えず keep/再試行に縮退する (タイムアウト後は同一バックエンドの新規推論を当面拒否する)。
+`llama-server -m <model.gguf> --host 127.0.0.1 --port 18090` で起動する。LiteLLM 等も localhost で待ち受けていれば同じ設定で使える。ONNX と同じく、接続失敗・HTTP エラー・タイムアウト・不正出力は state を変えず keep/再試行に縮退する (タイムアウト後は同一バックエンドの新規推論を当面拒否する)。
 
 - 状態: `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード、メタデータのみ監査)。`superseded / archived` は動かさない。通常想起・一覧 (既定)・raw 下降・グラフ・ベクトルは active のみ。
 - `record.search`: 利用者指示の明示的検索で active + retired を返す (`archived / superseded` 除外)。各 item は `revision` を含む。heat・再活性化・feedback 露出なし。
