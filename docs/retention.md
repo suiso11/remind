@@ -41,12 +41,14 @@
 
 ## 可逆引退・蒸留・統合（M3 で実装済み）
 
+- **自動引退は既定で無効（決定 2026-10-22・決定者 haruka）:** `cultivation.autoRetire`（boolean・任意・既定 `false`）が false の間、`maintain.distill` は保持ゲート（`buildRetireGatePrompt` / `parseRetireGate`）を呼ばず、retire action を作らない。統合・共有事実確認・要約は全レビューで従来どおり継続する。true のときのみ従来のゲート判定で引退する。根拠: 本番で 82/127 件が 1.5B の `LOW_SIGNAL` 判定により引退し、好みの事実も含んだ。引退は今後、利用・引用・再活性化などの活性化ベースの規則へ移す計画であり、本変更は可逆引退・手動 `record.retire / reactivate`・明示検索を削除しない。
+
 - 状態・スキーマ表現は `records.status` の第 4 値 `retired` に確定した（既存行を保持する savepoint 再構築で移行し、`user_version` は単一の直列化された `BEGIN IMMEDIATE` 移行の完了時に `SCHEMA_VERSION` の `3` へ更新される。既に `3` のファイルは書込みロックを取らない fast path で起動する）。
 - `record.retire / record.reactivate` は `active <-> retired` の可逆遷移（冪等・固定理由コード・メタデータのみ監査）。`superseded / archived` は動かさない。通常想起・一覧（既定）・raw 下降・グラフ・ベクトルは active のみ。
 - 利用者指示の明示的検索は `record.search`（active + retired、`archived / superseded` 除外、各 item は `revision` を含む、heat・再活性化・feedback 露出なし）。一度の取出しは再活性化しない。
  - 内容・文脈の判定は外部送信なしのローカル小規模 LLM（`onnx-community/Qwen2.5-1.5B-Instruct` @ `d54957e3`、基盤 `Qwen/Qwen2.5-1.5B-Instruct`、license `apache-2.0`、`@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`、量子化 ONNX `onnx/model_q4.onnx` をオフライン生成、greedy 決定論）が行う。取得は `npm run provision:llm` のみ、実行時は完全オフライン。
-  - `maintain.distill` は有界バッチ・単一 flight（SQLite リース、crash/retry/cancel 対応）・失敗隔離・リトライキュー・取消可能で、summary/correction を通常の冪等 op で直接・自律的に書く。判定は二段階（(1) 保持ゲート：永続内容の抽出か `NONE`、厳密 `NONE` のみ引退候補・その他は継続・不確実は keep。(2) 位置指定の統合選択：関連記憶を番号 `1..N` で提示し `MERGE <n> / KEEP` で回答、コードが実際の同一 scope 有界入力に写像しモデルは ID を複写しない。(3) 共有事実の確認：統合提案は両記憶の共有事実の抽出か `NONE` で検証し、`NONE`・不確実は keep、共有事実のみ要約草案へ。同一バッチで両者が互いに指名し合う場合のみ統合し、片思いの指名は keep とする。相互指名の同一無順序ペアは同一バッチで 1 回のみ統合する（最小 recordId 代表が単一の実生成要約を書き、対は監査付き keep、重複サマリなし、全キューは done 解決、原物・union refs/links 保持）。抽出文自体は保存・再利用しない）。推論は正準トランザクション外、モデル文脈は同一 scope 最大 6 件の断片に有界。統合は最低 2 件の関連表示を要求し、確認なしの統合・ID 複写・単一トークン判定はしない。会話書き込み側にインライン推論はなく、常駐スケジューラ・全 corpus 見直し・TTL 削除はない。
-- キュー投入の契機は `remember / correct / 検証済み feedback` の確定後のみ（露出検証前の mere recall は投入しない）。起動時 bounds は `cultivation{queueMax=500, batchMax=20, leaseTtlMs=120000, reviewMaxAttempts=5}`、`llm{timeoutMs=60000, maxNewTokens=48, maxPromptChars=2000}`、`maintenance{timeoutMs=120000}`（いずれも任意・既定あり）。
+  - `maintain.distill` は有界バッチ・単一 flight（SQLite リース、crash/retry/cancel 対応）・失敗隔離・リトライキュー・取消可能で、summary/correction を通常の冪等 op で直接・自律的に書く。判定は二段階（(1) 保持ゲート：`cultivation.autoRetire=true` のときのみ呼び、永続内容の抽出か `NONE`、厳密 `NONE` のみ引退候補・その他は継続・不確実は keep。既定 off では呼ばず retire action も作らない。(2) 位置指定の統合選択：関連記憶を番号 `1..N` で提示し `MERGE <n> / KEEP` で回答、コードが実際の同一 scope 有界入力に写像しモデルは ID を複写しない。(3) 共有事実の確認：統合提案は両記憶の共有事実の抽出か `NONE` で検証し、`NONE`・不確実は keep、共有事実のみ要約草案へ。同一バッチで両者が互いに指名し合う場合のみ統合し、片思いの指名は keep とする。相互指名の同一無順序ペアは同一バッチで 1 回のみ統合する（最小 recordId 代表が単一の実生成要約を書き、対は監査付き keep、重複サマリなし、全キューは done 解決、原物・union refs/links 保持）。抽出文自体は保存・再利用しない）。推論は正準トランザクション外、モデル文脈は同一 scope 最大 6 件の断片に有界。統合は最低 2 件の関連表示を要求し、確認なしの統合・ID 複写・単一トークン判定はしない。会話書き込み側にインライン推論はなく、常駐スケジューラ・全 corpus 見直し・TTL 削除はない。
+- キュー投入の契機は `remember / correct / 検証済み feedback` の確定後のみ（露出検証前の mere recall は投入しない）。起動時 bounds は `cultivation{queueMax=500, batchMax=20, leaseTtlMs=120000, reviewMaxAttempts=5, autoRetire=false}`、`llm{timeoutMs=60000, maxNewTokens=48, maxPromptChars=2000}`、`maintenance{timeoutMs=120000}`（いずれも任意・既定あり）。
 
 - 自動忘却は行削除ではなく、通常の `record.recall` の対象外とする状態変更（`retired` 想定）に留める。行・原記録は保持する。
 - 利用者指示の明示的検索は `record.search`（active + retired、`archived / superseded` 除外、heat・再活性化・feedback 露出なし）に確定した（M3 state の U5 実装選択：`retired` を第 4 `status` 値とし savepoint 再構築で移行、キューは 1 record 1 open review・満杯時 drop、単一 global リース・TTL steal/heartbeat、適用は per-action 保守 no-change、統合の links は同一 scope 解決必須）。一度の取出しは再活性化しない。レビュー指摘の回帰 9 件も確定済み：steal 時の孤立 `leased`→`pending` 回収、縮退 drain の dequeue 前判定（`leased` 残留なし）、実行ごと一意の lease 所有者（同一キー並行 drain の単一 flight 保持）、`(nextAt, queueId)` 複合 cursor（旧 bare 形式は同 keyset に解決）、推論合間の heartbeat 更新＋`maintenance.timeoutMs` 打切り（fence 付き abort）、適用 txn 内の lease 存続＋行 `leased` 存続の二重 fence（取消後・奪取後は `CONFLICT` 無変更）、open-per-record 重複投入の `duplicate` 報告、索引喪失時の正準 `bodyNorm` fallback（`record.search`）、プロンプトの構造尾部保持（`maxPromptChars` 500..8000）。drain 内の lease/dequeue/fence は単一時刻（`nowOverride` 指定時は固定時刻、通常は壁時計）を共有する。
@@ -57,7 +59,7 @@
 
 - 不確実・無効・失敗・欠落・タイムアウトのモデル出力は状態・本文を変更しない（不確実な判定は監査付き keep、推論失敗は有界リトライへ、陳腐化した適用は per-action no-change）。
 - コードは削除を強制的に禁じる（物理削除なし。`applyCultivationBatch` の統合は summary 行の INSERT のみで元記録を自動引退させない）。外的送信は provision 以外の全経路で禁止し、想起・再構築・蒸留の実行時は `allowRemoteModels=false` の完全オフライン。
-  - モデル欠落・無効時は縮退 OK（適用 0・キュー不変・偽の判定なし）。検証は `tests/m3-state.test.ts` (23 件：回帰 9 件含む) と実モデル `npm run smoke:m3` (適用 2：引退 1＋統合 1、サマリ 1) で行う。実モデル drain は保持ゲートの `NONE` による一過性気分の実際の引退と、位置指定＋共有事実確認を経た近似重複の実際の統合（要約行 1 件のみの適用、重複サマリなし）を出力し、耐久事実・不確実記録は保全する。統合・失敗隔離・リトライ・ペア重複排除の機構証明は決定論的テストの範囲と区別する。
+  - モデル欠落・無効時は縮退 OK（適用 0・キュー不変・偽の判定なし）。検証は `tests/m3-state.test.ts` (25 件：回帰 9 件含む) と実モデル `npm run smoke:m3` (適用 2：引退 1＋統合 1、サマリ 1) で行う。実モデル drain は保持ゲートの `NONE` による一過性気分の実際の引退と、位置指定＋共有事実確認を経た近似重複の実際の統合（要約行 1 件のみの適用、重複サマリなし）を出力し、耐久事実・不確実記録は保全する。統合・失敗隔離・リトライ・ペア重複排除の機構証明は決定論的テストの範囲と区別する。
 
 ## 未解決技術詳細（残件のみ）
 

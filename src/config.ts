@@ -54,6 +54,13 @@ export interface CultivationConfig {
   leaseTtlMs: number;
   /** Max retries per queued review before it is marked failed (default 5). */
   reviewMaxAttempts: number;
+  /**
+   * Whether maintain.distill may let the local model retire a record
+   * (default false). When false the retire gate is never invoked and no
+   * retire action is produced; merge/confirm/summary still run for every
+   * reviewed record. When true the previous gate-driven behavior applies.
+   */
+  autoRetire: boolean;
 }
 
 export interface LlmConfig {
@@ -383,7 +390,7 @@ export function loadConfig(configPath: string): AppConfig {
     const c = (parsed as Record<string, unknown>)["cultivation"];
     if (!isPlainObject(c)) throw new Error("cultivation must be an object");
     for (const k of Object.keys(c)) {
-      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts"].includes(k)) {
+      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts", "autoRetire"].includes(k)) {
         throw new Error(`unknown cultivation field: ${k}`);
       }
     }
@@ -399,11 +406,16 @@ export function loadConfig(configPath: string): AppConfig {
     const reviewMaxAttempts = c["reviewMaxAttempts"] ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS;
     const eR = checkRange("cultivation.reviewMaxAttempts", reviewMaxAttempts, 1, 10);
     if (eR) throw new Error(eR);
+    const autoRetire = c["autoRetire"] ?? CULTIVATION_DEFAULT_AUTO_RETIRE;
+    if (typeof autoRetire !== "boolean") {
+      throw new Error("cultivation.autoRetire must be a boolean");
+    }
     cultivation = {
       queueMax: queueMax as number,
       batchMax: batchMax as number,
       leaseTtlMs: leaseTtlMs as number,
       reviewMaxAttempts: reviewMaxAttempts as number,
+      autoRetire,
     };
   }
 
@@ -674,6 +686,8 @@ export const CULTIVATION_DEFAULT_QUEUE_MAX = 500;
 export const CULTIVATION_DEFAULT_BATCH_MAX = 20;
 export const CULTIVATION_DEFAULT_LEASE_TTL_MS = 120000;
 export const CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS = 5;
+/** Automatic model-driven retirement is opt-in; consolidation stays enabled. */
+export const CULTIVATION_DEFAULT_AUTO_RETIRE = false;
 
 export function cultivationBounds(config: AppConfig): Required<CultivationConfig> {
   return {
@@ -682,6 +696,7 @@ export function cultivationBounds(config: AppConfig): Required<CultivationConfig
     leaseTtlMs: config.cultivation?.leaseTtlMs ?? CULTIVATION_DEFAULT_LEASE_TTL_MS,
     reviewMaxAttempts:
       config.cultivation?.reviewMaxAttempts ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS,
+    autoRetire: config.cultivation?.autoRetire ?? CULTIVATION_DEFAULT_AUTO_RETIRE,
   };
 }
 

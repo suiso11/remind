@@ -46,6 +46,10 @@
  *   no-change via applyCultivationBatch.
  * - No deletes, no TTL, no age-only retirement anywhere. Consolidation only
  *   INSERTs summary rows; sources are never auto-retired.
+ * - Automatic retirement is opt-in: cultivation.autoRetire defaults false.
+ *   When false the retire gate is never invoked and no retire action is
+ *   planned; merge/confirm/summary still run for every reviewed record.
+ *   When true the gate-driven retirement behavior below applies unchanged.
  * - No model (disabled section or missing files) => degraded OK with zero
  *   applies and zero review changes (no fake decisions, no heuristics).
  * - Single-flight: the global m3 lease is held for the whole drain; a live
@@ -425,6 +429,7 @@ export async function maintainDistill(
     const timeoutMs = llmTimeoutMs(config);
     const maxNewTokens = llmMaxNewTokens(config);
     const maxPromptChars = llmMaxPromptChars(config);
+    const autoRetire = cultivationBounds(config).autoRetire;
     const maintenanceMs = maintenanceTimeoutMs(config);
     const startedMs = Date.now();
     const overDeadline = (): boolean => Date.now() - startedMs > maintenanceMs;
@@ -501,35 +506,41 @@ export async function maintainDistill(
         continue;
       }
       const peers = loadPeers(db, p.scope, target.id);
-      // Stage 1 (retention gate): lasting content, or NONE for a pure
-      // passing mood. Uncertain/invalid => audited keep, never a mutation.
-      let gateRaw: string | null = null;
-      try {
-        gateRaw = await decide(buildRetireGatePrompt(target.body, maxPromptChars), Math.min(maxNewTokens, 32));
-      } catch {
-        gateRaw = null;
-      }
-      if (gateRaw === null) {
-        inferencePoisoned = true; // uncancelled inference: stop issuing model calls
-        planned.push({ review, action: null, retry: true }); // inference failure => retry, no apply
-        if (!renewOrAbort()) {
-          settleOwned(items.map((it) => it.queueId));
-          return budgeted(overDeadline() ? fail("TIMEOUT") : conflict(), config);
+      // Stage 1 (retention gate) is opt-in: with cultivation.autoRetire=false
+      // (the default) the model is never asked to retire, no retire action is
+      // produced, and every reviewed record proceeds to the merge/confirm/
+      // summary path below. autoRetire=true preserves the previous behavior.
+      if (autoRetire) {
+        // Stage 1 (retention gate): lasting content, or NONE for a pure
+        // passing mood. Uncertain/invalid => audited keep, never a mutation.
+        let gateRaw: string | null = null;
+        try {
+          gateRaw = await decide(buildRetireGatePrompt(target.body, maxPromptChars), Math.min(maxNewTokens, 32));
+        } catch {
+          gateRaw = null;
         }
-        continue;
-      }
-      const gate = parseRetireGate(gateRaw);
-      if (gate.kind === "uncertain") {
-        planned.push({ review, action: keepOf(target.id, target.revision), retry: false });
-        continue;
-      }
-      if (gate.kind === "retire") {
-        planned.push({
-          review,
-          action: { recordId: target.id, action: "retire", reasonCode: DISTILL_RETIRE_REASON, expectedRevision: target.revision, expectedStatus: "active" },
-          retry: false,
-        });
-        continue;
+        if (gateRaw === null) {
+          inferencePoisoned = true; // uncancelled inference: stop issuing model calls
+          planned.push({ review, action: null, retry: true }); // inference failure => retry, no apply
+          if (!renewOrAbort()) {
+            settleOwned(items.map((it) => it.queueId));
+            return budgeted(overDeadline() ? fail("TIMEOUT") : conflict(), config);
+          }
+          continue;
+        }
+        const gate = parseRetireGate(gateRaw);
+        if (gate.kind === "uncertain") {
+          planned.push({ review, action: keepOf(target.id, target.revision), retry: false });
+          continue;
+        }
+        if (gate.kind === "retire") {
+          planned.push({
+            review,
+            action: { recordId: target.id, action: "retire", reasonCode: DISTILL_RETIRE_REASON, expectedRevision: target.revision, expectedStatus: "active" },
+            retry: false,
+          });
+          continue;
+        }
       }
       // Stage 2a (positional merge/keep): at least 2 peers must be shown for
       // a real choice; a single peer cannot demonstrate one. The model names

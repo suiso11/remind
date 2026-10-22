@@ -102,6 +102,17 @@ function prov(source = "session:s1:turn:3"): { source: string; observedAt: strin
   return { source, observedAt: OBS };
 }
 
+/** Explicit opt-in for tests that exercise the model-driven retire gate. */
+function enableAutoRetire(config: AppConfig): void {
+  config.cultivation = {
+    queueMax: 500,
+    batchMax: 20,
+    leaseTtlMs: 120000,
+    reviewMaxAttempts: 5,
+    autoRetire: true,
+  };
+}
+
 function raw(db: DatabaseSync, config: AppConfig, eventId: string, scope = "personal/default"): void {
   const r = eventAppend(
     db,
@@ -893,6 +904,135 @@ describe("m3 distill reciprocal pair dedup", () => {
   });
 });
 
+describe("m3 distill autoRetire switch", () => {
+  function fakeLlmDir(dir: string): string {
+    const modelDir = path.join(dir, "fake-llm-retire");
+    fs.mkdirSync(path.join(modelDir, "onnx"), { recursive: true });
+    for (const f of [
+      "config.json",
+      "generation_config.json",
+      "tokenizer.json",
+      "tokenizer_config.json",
+      "special_tokens_map.json",
+      "onnx/model_q4.onnx",
+    ]) {
+      fs.writeFileSync(path.join(modelDir, f), "{}");
+    }
+    return modelDir;
+  }
+
+  function enableFakeLlm(ctx: { config: AppConfig }, modelDir: string): void {
+    ctx.config.llm = {
+      modelDir, timeoutMs: 5000, enabled: true, maxNewTokens: 48, maxPromptChars: 2000,
+    };
+  }
+
+  it("default off: no retire-gate prompt/action, record stays active, merges still apply", async () => {
+    const ctx = setup();
+    try {
+      enableFakeLlm(ctx, fakeLlmDir(ctx.dir));
+      const bodyA = "the cabin spare key hangs inside the woodshed on a blue hook";
+      const bodyB = "the cabin spare key rests on the blue hook inside the woodshed";
+      const bodyC = "I feel sad and low tonight";
+      const idA = remember(ctx.db, ctx.config, bodyA, "m3-ar-a");
+      const idB = remember(ctx.db, ctx.config, bodyB, "m3-ar-b");
+      const idC = remember(ctx.db, ctx.config, bodyC, "m3-ar-c");
+      // No cultivation section at all: autoRetire must default to false.
+      assert.equal(ctx.config.cultivation, undefined);
+
+      const rows = ctx.db
+        .prepare(`SELECT id, body FROM records WHERE scope='personal/default' AND status='active' ORDER BY createdAt DESC, id ASC`)
+        .all() as Array<{ id: string; body: string }>;
+      const bodyById = new Map(rows.map((r) => [r.id, r.body]));
+      // Identify prompt kinds by exact builder output, never by prompt wording.
+      const gatePrompts = new Set(rows.map((r) => buildRetireGatePrompt(r.body, 2000)));
+      const mergeAnswers = new Map<string, string>();
+      for (const target of rows) {
+        const shown = rows.filter((r) => r.id !== target.id).slice(0, 6);
+        const prompt = buildMergePrompt(target.body, shown, 2000);
+        if (target.id === idA || target.id === idB) {
+          const peerId = target.id === idA ? idB : idA;
+          mergeAnswers.set(prompt, `MERGE ${shown.findIndex((r) => r.id === peerId) + 1}`);
+        } else {
+          mergeAnswers.set(prompt, "KEEP");
+        }
+      }
+      const sharedFact = "the cabin spare key is on the blue hook in the woodshed";
+      const summaryBody = "the cabin spare key hangs on the blue hook in the woodshed";
+      const confirmAnswers = new Map<string, string>([
+        [buildConfirmPrompt(bodyA, bodyB, 2000), sharedFact],
+        [buildConfirmPrompt(bodyB, bodyA, 2000), sharedFact],
+      ]);
+      const summaryAnswers = new Map<string, string>([
+        [buildSummaryPrompt(bodyA, bodyB, 2000), summaryBody],
+        [buildSummaryPrompt(bodyB, bodyA, 2000), summaryBody],
+      ]);
+      const seen: string[] = [];
+      const decide = async (prompt: string): Promise<string | null> => {
+        seen.push(prompt);
+        // A retire-gate call would return NONE, so an accidental retirement is
+        // observable; the assertion below proves it was never even sent.
+        if (gatePrompts.has(prompt)) return "NONE";
+        return mergeAnswers.get(prompt) ?? confirmAnswers.get(prompt) ?? summaryAnswers.get(prompt) ?? "KEEP";
+      };
+      const res = await maintainDistill(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"),
+        { scope: "personal/default", limit: 10 }, "m3-ar-off", decide, T3,
+      );
+      assert.equal(res.ok, true, JSON.stringify(res));
+      assert.equal(seen.filter((p) => gatePrompts.has(p)).length, 0, "retire gate must never be sent when autoRetire=false");
+      assert.ok([...mergeAnswers.keys()].some((p) => seen.includes(p)), "merge path must still call the generator");
+      const sums = ctx.db.prepare(`SELECT body FROM records WHERE kind='summary'`).all() as Array<{ body: string }>;
+      assert.equal(sums.length, 1, "merge/confirm/summary must still apply");
+      assert.equal(sums[0]?.body, summaryBody);
+      for (const id of [idA, idB, idC]) {
+        const v = getRecord(ctx.db, ctx.config, { id, scope: "personal/default" });
+        assert.equal((v.data as { record: { status: string } }).record.status, "active");
+      }
+      assert.equal(bodyById.get(idC), bodyC);
+      const retiredAudit = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM audit WHERE op='maintain.cultivate' AND reasonCode='LOW_SIGNAL'`)
+        .get() as { n: number };
+      assert.equal(retiredAudit.n, 0, "no retire audit row may be written");
+      assert.equal(countOpenCultivationReviews(ctx.db), 0, "all reviews resolve, none left open");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("autoRetire true preserves gate-driven retirement", async () => {
+    const ctx = setup();
+    try {
+      enableFakeLlm(ctx, fakeLlmDir(ctx.dir));
+      enableAutoRetire(ctx.config);
+      const id = remember(ctx.db, ctx.config, "I feel sad and low tonight", "m3-ar-on");
+      const body = (getRecord(ctx.db, ctx.config, { id, scope: "personal/default" }).data as {
+        record: { body: string };
+      }).record.body;
+      const gatePrompt = buildRetireGatePrompt(body, 2000);
+      const seen: string[] = [];
+      const decide = async (prompt: string): Promise<string | null> => {
+        seen.push(prompt);
+        return prompt === gatePrompt ? "NONE" : "KEEP";
+      };
+      const res = await maintainDistill(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"),
+        { scope: "personal/default", limit: 10 }, "m3-ar-on-drain", decide, T3,
+      );
+      assert.equal(res.ok, true, JSON.stringify(res));
+      assert.ok(seen.includes(gatePrompt), "autoRetire=true must send the retire gate");
+      const v = getRecord(ctx.db, ctx.config, { id, scope: "personal/default" });
+      assert.equal((v.data as { record: { status: string } }).record.status, "retired");
+      const retiredAudit = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM audit WHERE op='maintain.cultivate' AND targetId=? AND reasonCode='LOW_SIGNAL'`)
+        .get(id) as { n: number };
+      assert.equal(retiredAudit.n, 1, "retirement keeps its LOW_SIGNAL audit row");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
 describe("m3 review fixes (orphan/degraded/singleflight/cursor/cancel/dup/search/prompts)", () => {
   function fakeLlmDir(dir: string): string {
     const modelDir = path.join(dir, "fake-llm");
@@ -972,6 +1112,7 @@ describe("m3 review fixes (orphan/degraded/singleflight/cursor/cancel/dup/search
       remember(ctx.db, ctx.config, "singleflight probe note", "m3-rf-3");
       const modelDir = fakeLlmDir(ctx.dir);
       enableFakeLlm(ctx, modelDir);
+      enableAutoRetire(ctx.config); // single-record gate call drives the model
       const configPath = path.join(ctx.dir, "memory.config.json");
       let seenOwner: string | null = null;
       const decide = async (prompt: string): Promise<string | null> => {
@@ -1041,6 +1182,7 @@ describe("m3 review fixes (orphan/degraded/singleflight/cursor/cancel/dup/search
       const id = remember(ctx.db, ctx.config, "cancel race probe note", "m3-rf-5");
       const modelDir = fakeLlmDir(ctx.dir);
       enableFakeLlm(ctx, modelDir);
+      enableAutoRetire(ctx.config); // this test fences a planned retire action
       const decide = async (prompt: string): Promise<string | null> => {
         if (prompt.includes("What lasting fact")) {
           // Race: an external cancel lands after dequeue but before the apply commit.

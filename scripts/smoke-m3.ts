@@ -23,7 +23,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { loadConfig, type AppConfig } from "../src/config.js";
+import { cultivationBounds, loadConfig, type AppConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
 import {
   LLM_MODEL_ID,
@@ -122,6 +122,9 @@ async function main(): Promise<void> {
       timeouts: { cliMs: 60000, busyMs: base.timeouts.busyMs },
       llm: { modelDir: llmDir, timeoutMs: 120000, enabled: true, maxNewTokens: 24, maxPromptChars: 2000 },
       maintenance: { timeoutMs: 300000 },
+      // The real-model smoke explicitly exercises gate-driven retirement;
+      // production defaults autoRetire to false.
+      cultivation: { ...cultivationBounds(base), autoRetire: true },
     };
     const cfg = path.join(dir, "memory.config.json");
     fs.writeFileSync(cfg, JSON.stringify(config));

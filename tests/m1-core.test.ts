@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { constants, DatabaseSync } from "node:sqlite";
-import { loadConfig, type AppConfig } from "../src/config.js";
+import { cultivationBounds, loadConfig, type AppConfig } from "../src/config.js";
 import { initDb, M1_USER_VERSION, SCHEMA_VERSION } from "../src/db.js";
 import { bodyHashFor, normalizeBody } from "../src/normalize.js";
 import { ensureM1Schema, eventAppend, getRecord, listRecords, recallRecords, rememberRecord, hasLegacyApprovalSchema } from "../src/store.js";
@@ -326,6 +326,31 @@ describe("m1 strict startup config", () => {
     const cfg = loadConfig(path.join(process.cwd(), "memory.config.example.json"));
     assert.ok(cfg.vaultPath.length > 0);
     assert.ok(cfg.limits.linksMax >= 0 && cfg.limits.sourceRefsMax >= 0);
+    assert.equal(cfg.cultivation?.autoRetire, false);
+  });
+
+  it("cultivation.autoRetire defaults off and is validated as a boolean", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "m1-cfg-retire-"));
+    try {
+      const omitted = loadConfig(writeConfig(dir, validObj()));
+      assert.equal(omitted.cultivation, undefined);
+      assert.equal(cultivationBounds(omitted).autoRetire, false);
+
+      const explicit = loadConfig(writeConfig(dir, { ...validObj(), cultivation: { autoRetire: true } }));
+      assert.equal(explicit.cultivation?.autoRetire, true);
+      assert.equal(cultivationBounds(explicit).queueMax, 500, "other cultivation defaults still apply");
+
+      assert.throws(
+        () => loadConfig(writeConfig(dir, { ...validObj(), cultivation: { autoRetire: "yes" } })),
+        /cultivation\.autoRetire must be a boolean/,
+      );
+      assert.throws(
+        () => loadConfig(writeConfig(dir, { ...validObj(), cultivation: { autoRetire: false, bogus: 1 } })),
+        /unknown cultivation field: bogus/,
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
