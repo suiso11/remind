@@ -9,7 +9,7 @@
  * applyCultivationBatch and drains the queue under the lease.
  *
  * U5 implementation choices (fixed here, bounds configurable at startup via
- * `cultivation{queueMax,batchMax,leaseTtlMs,reviewMaxAttempts}`):
+ * `cultivation{queueMax,batchMax,leaseTtlMs,reviewMaxAttempts,retireMinAgeMs}`):
  * - Queue dedup: at most one OPEN (pending/leased) review per record
  *   (partial unique index). Re-triggers while open are duplicates, not new rows.
  * - Queue full: enqueue drops (returns 'dropped_full'); the canonical
@@ -733,6 +733,46 @@ export function completeCultivationReview(
       ).run(attempts, nextAt, queueId);
     }
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Defer one queued review without counting a failure: return a leased row to
+ * `pending` with the caller-supplied nextAt and batchId cleared, leaving
+ * attempts untouched (unlike the retry path, which increments attempts and
+ * applies backoff). Same ownership guard as the retry path: when `guard.batchId`
+ * is given, only a row still leased under that batch is deferred; a reclaimed
+ * or re-leased row is left to its owner. Returns false when nothing changed.
+ * Never throws.
+ */
+export function deferCultivationReview(
+  db: DatabaseSync,
+  _config: AppConfig,
+  queueId: string,
+  input: { nextAt: string; guard?: { batchId: string } },
+): boolean {
+  try {
+    ensureCultivationSchema(db);
+    const nextMs = Date.parse(input.nextAt);
+    if (!Number.isFinite(nextMs)) return false;
+    const nextAt = new Date(nextMs).toISOString();
+    const res = input.guard
+      ? db
+          .prepare(
+            `UPDATE cultivation_queue SET status='pending', nextAt=?, batchId=NULL
+             WHERE queueId=? AND status='leased' AND batchId=?`,
+          )
+          .run(nextAt, queueId, input.guard.batchId)
+      : db
+          .prepare(
+            `UPDATE cultivation_queue SET status='pending', nextAt=?, batchId=NULL
+             WHERE queueId=? AND status='leased'`,
+          )
+          .run(nextAt, queueId);
+    const c = (res as { changes?: unknown })?.changes;
+    return (typeof c === "number" ? c : 0) === 1;
   } catch {
     return false;
   }

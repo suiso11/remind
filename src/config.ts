@@ -54,6 +54,12 @@ export interface CultivationConfig {
   leaseTtlMs: number;
   /** Max retries per queued review before it is marked failed (default 5). */
   reviewMaxAttempts: number;
+  /**
+   * Minimum record age before an auto-retire candidate may actually be
+   * retired (default 86400000 = 24h; 0 disables the grace period). Younger
+   * DROP candidates are deferred without counting a failure.
+   */
+  retireMinAgeMs: number;
 }
 
 export type LlmBackend = "onnx" | "openai";
@@ -426,7 +432,7 @@ export function loadConfig(configPath: string): AppConfig {
     const c = (parsed as Record<string, unknown>)["cultivation"];
     if (!isPlainObject(c)) throw new Error("cultivation must be an object");
     for (const k of Object.keys(c)) {
-      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts"].includes(k)) {
+      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts", "retireMinAgeMs"].includes(k)) {
         throw new Error(`unknown cultivation field: ${k}`);
       }
     }
@@ -442,11 +448,15 @@ export function loadConfig(configPath: string): AppConfig {
     const reviewMaxAttempts = c["reviewMaxAttempts"] ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS;
     const eR = checkRange("cultivation.reviewMaxAttempts", reviewMaxAttempts, 1, 10);
     if (eR) throw new Error(eR);
+    const retireMinAgeMs = c["retireMinAgeMs"] ?? CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS;
+    const eA = checkRange("cultivation.retireMinAgeMs", retireMinAgeMs, 0, 2592000000);
+    if (eA) throw new Error(eA);
     cultivation = {
       queueMax: queueMax as number,
       batchMax: batchMax as number,
       leaseTtlMs: leaseTtlMs as number,
       reviewMaxAttempts: reviewMaxAttempts as number,
+      retireMinAgeMs: retireMinAgeMs as number,
     };
   }
 
@@ -790,6 +800,7 @@ export const CULTIVATION_DEFAULT_QUEUE_MAX = 500;
 export const CULTIVATION_DEFAULT_BATCH_MAX = 20;
 export const CULTIVATION_DEFAULT_LEASE_TTL_MS = 120000;
 export const CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS = 5;
+export const CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS = 86400000;
 
 export function cultivationBounds(config: AppConfig): Required<CultivationConfig> {
   return {
@@ -798,6 +809,7 @@ export function cultivationBounds(config: AppConfig): Required<CultivationConfig
     leaseTtlMs: config.cultivation?.leaseTtlMs ?? CULTIVATION_DEFAULT_LEASE_TTL_MS,
     reviewMaxAttempts:
       config.cultivation?.reviewMaxAttempts ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS,
+    retireMinAgeMs: config.cultivation?.retireMinAgeMs ?? CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS,
   };
 }
 

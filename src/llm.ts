@@ -11,7 +11,8 @@
  *   resolves decoder sessions as onnx/model_<quant>.onnx)
  * - decoding: greedy (do_sample:false) => deterministic for fixed input
  * - prompts: ChatML (<|im_start|> roles) matching the model's instruction
- *   template; the model answers with one verdict line or one merged sentence
+ *   template; the model answers with one classification label, one verdict
+ *   line, or one merged sentence
  *
  * Why not bloomz-560m: the previously pinned Xenova/bloomz-560m @ e760ef38
  * was probed on the real distill prompts and proved unsuitable — the review
@@ -528,28 +529,52 @@ function clampMaxPromptChars(n: unknown): number {
   return m;
 }
 
+/** KEEP-type labels: lasting user content that must not be auto-retired. */
+export const RETIRE_GATE_KEEP_LABELS = [
+  "FACT",
+  "PREFERENCE",
+  "OPINION",
+  "PLAN",
+  "EVENT",
+  "RELATIONSHIP",
+  "PROJECT",
+] as const;
+/** DROP-type labels: low-signal content eligible for auto-retirement. */
+export const RETIRE_GATE_DROP_LABELS = ["GREETING", "TRANSIENT", "CHATOPS"] as const;
+
 /**
- * Retire-gate prompt (stage 1 of a distill review). Generation-style on
- * purpose: single-token verdicts proved unusable on the pinned q4 model
- * (probes: bare RETIRE/KEEP/FEELING/1-way questions always echoed one biased
- * token regardless of content, 4-6/10 at best), while this extraction form
- * scored 10/10 across transient feelings, facts, preferences, uncertainty,
- * plans, and events. The model either states the lasting content it sees or
- * replies NONE; code maps strict-NONE to a retire candidate and any other
- * text to the merge/keep stage. The extracted sentence itself is NEVER
- * stored, audited, or reused — only the NONE-vs-content distinction drives
- * the decision, so no memory text is keyword-scanned and no template text is
- * substituted. General instruction only; no fixture answers.
+ * Retire-gate prompt (stage 1 of a distill review, OpenAI backend only).
+ *
+ * Single-label classification: the model must reply with exactly one label
+ * from RETIRE_GATE_KEEP_LABELS or RETIRE_GATE_DROP_LABELS. The previous
+ * extraction-form gate (state the lasting content, or NONE) still returned
+ * NONE for durable opinions and mis-retired lasting facts under the pinned
+ * ONNX model, so the gate is now an explicit label taxonomy. The prompt is
+ * English with a short definition per label because the labels are the
+ * contract; the memory body stays verbatim (clipped). General instruction
+ * only; no fixture answers. The body is never keyword-scanned and no label
+ * definition is derived from the body.
  */
 export function buildRetireGatePrompt(body: string, maxPromptChars: number): string {
   const max = clampMaxPromptChars(maxPromptChars);
   const head =
-    "<|im_start|>system\nYou judge one memory. Reply with only what is asked and nothing else.<|im_end|>\n" +
+    "<|im_start|>system\nYou classify one memory. Reply with exactly one label and nothing else.<|im_end|>\n" +
     "<|im_start|>user\nMemory: \"\"\"";
   const tail =
     "\"\"\"\n" +
-    "What lasting fact, event, observation, preference, or plan does this memory record? " +
-    "Reply with only that fact in one short sentence, or reply NONE if the memory is only a passing mood or feeling with no lasting content.<|im_end|>\n<|im_start|>assistant\n";
+    "Labels:\n" +
+    "- FACT: a lasting fact about the user, their belongings, or their environment.\n" +
+    "- PREFERENCE: something the user likes, dislikes, or prefers.\n" +
+    "- OPINION: the user's view, belief, or judgment about anything.\n" +
+    "- PLAN: something the user intends to do or is working toward.\n" +
+    "- EVENT: something that happened and matters beyond the day.\n" +
+    "- RELATIONSHIP: a person, group, or relationship that matters to the user.\n" +
+    "- PROJECT: a project, tool, or body of work the user is building.\n" +
+    "- GREETING: only a formulaic exchange such as a greeting, acknowledgement, or goodnight.\n" +
+    "- TRANSIENT: a same-day condition such as health, weather, or mood that will not help later conversation.\n" +
+    "- CHATOPS: conversation management itself, such as a request to search or feedback on tone or persona that carries no lasting preference.\n" +
+    "Anything describing the user's lasting traits, opinions, interests, plans, belongings, projects, or relationships is KEEP-type (FACT, PREFERENCE, OPINION, PLAN, EVENT, RELATIONSHIP, PROJECT).\n" +
+    "Reply with the label only.<|im_end|>\n<|im_start|>assistant\n";
   const budget = Math.max(0, max - cpLen(head) - cpLen(tail));
   const clipped = clip(body, Math.min(600, budget));
   const full = head + clipped + tail;
@@ -561,18 +586,45 @@ export function buildRetireGatePrompt(body: string, maxPromptChars: number): str
 export type RetireGateResult = { kind: "retire" } | { kind: "continue" } | { kind: "uncertain" };
 
 /**
- * Parse retire-gate output. Strict: exactly NONE (case-insensitive,
- * surrounding whitespace allowed) means the model found no lasting content
- * (retire candidate). Any other non-empty text means it saw lasting content
- * (continue to merge/keep). Non-strings and empties are uncertain (caller
- * keeps state unchanged). Never throws. Parses MODEL output only.
+ * Parse retire-gate output as an exact label. Trim, strip trailing
+ * punctuation, compare case-insensitively. DROP-type labels (GREETING,
+ * TRANSIENT, CHATOPS) => retire candidate; KEEP-type labels (FACT,
+ * PREFERENCE, OPINION, PLAN, EVENT, RELATIONSHIP, PROJECT) => continue to the
+ * merge/keep stage. Anything else (narrative text, NONE, empty, non-string)
+ * is uncertain => caller keeps state unchanged. Never throws. Parses MODEL
+ * output only.
  */
 export function parseRetireGate(raw: unknown): RetireGateResult {
   if (typeof raw !== "string") return { kind: "uncertain" };
-  if (/^\s*NONE\s*$/i.test(raw)) return { kind: "retire" };
   if (raw.length === 0 || raw.length > 4000) return { kind: "uncertain" };
   if (hasControl(raw.replace(/\n/g, "")) || containsLoneSurrogateDeep(raw)) return { kind: "uncertain" };
-  return { kind: "continue" };
+  const label = raw
+    .trim()
+    .replace(/[\s.!?,;:。！？、，；：'"`）)\]}]+$/u, "")
+    .trim()
+    .toUpperCase();
+  if (!label) return { kind: "uncertain" };
+  if ((RETIRE_GATE_DROP_LABELS as readonly string[]).includes(label)) return { kind: "retire" };
+  if ((RETIRE_GATE_KEEP_LABELS as readonly string[]).includes(label)) return { kind: "continue" };
+  return { kind: "uncertain" };
+}
+
+export type SharedFactResult = { kind: "shared" } | { kind: "none" } | { kind: "uncertain" };
+
+/**
+ * Parse shared-fact confirmation output (stage 2b). The prompt is
+ * generation-style (state the shared fact, or NONE), so this is deliberately
+ * NOT the label parser: exactly NONE (case-insensitive, optional trailing
+ * punctuation) means the merge is rejected; any other non-empty text is a
+ * stated shared fact; invalid/empty/non-string is uncertain (caller keeps).
+ * Never throws. Parses MODEL output only.
+ */
+export function parseSharedFact(raw: unknown): SharedFactResult {
+  if (typeof raw !== "string") return { kind: "uncertain" };
+  if (raw.length === 0 || raw.length > 4000) return { kind: "uncertain" };
+  if (hasControl(raw.replace(/\n/g, "")) || containsLoneSurrogateDeep(raw)) return { kind: "uncertain" };
+  if (/^\s*NONE\s*[.!?,;:。！？、，；：]*\s*$/iu.test(raw)) return { kind: "none" };
+  return raw.trim().length > 0 ? { kind: "shared" } : { kind: "uncertain" };
 }
 
 export type MergeChoice = { kind: "merge"; index: number } | { kind: "keep" } | { kind: "uncertain" };

@@ -35,7 +35,8 @@
     "queueMax": 500,
     "batchMax": 20,
     "leaseTtlMs": 120000,
-    "reviewMaxAttempts": 5
+    "reviewMaxAttempts": 5,
+    "retireMinAgeMs": 86400000
   },
   "llm": {
     "backend": "onnx",
