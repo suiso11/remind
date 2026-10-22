@@ -64,11 +64,10 @@ import {
 } from "./normalize.js";
 import {
   generateCompletion,
-  llmEnabled,
+  llmUsable,
   llmMaxNewTokens,
   llmMaxPromptChars,
   llmTimeoutMs,
-  modelFilesPresent as llmModelFilesPresent,
   resolveLlmDir,
 } from "./llm.js";
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
@@ -932,7 +931,7 @@ export async function maintainAssociate(
     const modelUsable = vectorsEnabled(config) && modelFilesPresent(modelDir);
     const usable = modelUsable || (embedOverride !== undefined && config.vectors === undefined);
     const llmModelDir = resolveLlmDir(config, configPath);
-    const llmModelUsable = llmEnabled(config) && llmModelFilesPresent(llmModelDir);
+    const llmModelUsable = llmUsable(config, llmModelDir);
     // An injected generator against a config without an llm section is the
     // test model itself (same convention as maintain.episodes). llmTopics is
     // opt-in: when false the generator is never invoked, even if configured.
@@ -1034,6 +1033,7 @@ export async function maintainAssociate(
           generateCompletion(prompt, llmModelDir, {
             timeoutMs: llmTimeoutMs(config),
             maxNewTokens: tokens,
+            config,
           }));
       const existingTopics: string[] = [];
       const seenTopics = new Set<string>();

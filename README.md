@@ -188,6 +188,27 @@ npm run smoke:episodes   # 実 LLM での取込 -> episode 索引スモーク (�
 
 ## M3 育てる保守 (実装済み)
 
+### LLM バックエンド (ローカル OpenAI 互換)
+
+- `llm.backend` は `"onnx"` (既定。現行のプロセス内 Qwen2.5-1.5B) または `"openai"`。`openai` は OpenAI 互換の `/v1/chat/completions` を呼ぶ。
+- `llm.baseUrl` は `openai` では必須で、`http(s)://127.0.0.1[:port]`、`http(s)://[::1][:port]`、`http(s)://localhost[:port]` のいずれか (任意で `/v1` を付加可能)。それ以外のホスト・任意パス・URL 内の資格情報は起動時に拒否する。外部送信は行わない。
+- `llm.model` は必須。`llm.apiKeyEnv` はトークンを持つ**環境変数名**のみを指定し、鍵そのものを設定ファイルに書かない。`llm.disableThinking` は既定 true で、リクエストに `chat_template_kwargs: {"enable_thinking": false}` を付け、応答の `<think>…</think>` を除去する。
+- 例 (llama.cpp `llama-server`):
+
+```json
+"llm": {
+  "backend": "openai",
+  "enabled": true,
+  "baseUrl": "http://127.0.0.1:18090",
+  "model": "ornith-1.5-9b",
+  "timeoutMs": 60000,
+  "maxNewTokens": 48,
+  "maxPromptChars": 2000
+}
+```
+
+`llama-server -m <model.gguf> --host 127.0.0.1 --port 18090` で起動する。LiteLLM 等も localhost で待ち受けていれば同じ設定で使える。ONNX と同じく、接続失敗・HTTP エラー・タイムアウト・不正出力は state を変えず keep/再試行に縮退する (タイムアウト後は同一バックエンドの新規推論を当面拒否する)。
+
 - 状態: `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード、メタデータのみ監査)。`superseded / archived` は動かさない。通常想起・一覧 (既定)・raw 下降・グラフ・ベクトルは active のみ。
 - `record.search`: 利用者指示の明示的検索で active + retired を返す (`archived / superseded` 除外)。各 item は `revision` を含む。heat・再活性化・feedback 露出なし。
  - LLM: `onnx-community/Qwen2.5-1.5B-Instruct` (pinned revision `d54957e3af1be04546436e874a60fe386041b244`、基盤 `Qwen/Qwen2.5-1.5B-Instruct`、license `apache-2.0`、量子化 ONNX `onnx/model_q4.onnx`)。ランタイムは `@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`。取得は `npm run provision:llm` のみが行い、想起・蒸留の実行時は外部送信なしの完全オフライン。greedy 生成のため同一入力には決定論的。旧 `Xenova/bloomz-560m` は実プロンプト検証で不適（保持ゲートは不確実・要約は繰返し幻覚）、`Qwen2.5-0.5B-Instruct` は `RETIRE` を一切出さず引退不能のため不採用。

@@ -39,11 +39,10 @@ import { acquireCultivationLease, isCultivationLeaseHeldBy, releaseCultivationLe
 import { deriveConsolidationPrivacy, type PrivacyMetadata } from "./privacy.js";
 import {
   generateCompletion,
-  llmEnabled,
+  llmUsable,
   llmMaxNewTokens,
   llmMaxPromptChars,
   llmTimeoutMs,
-  modelFilesPresent,
   parseSummaryBody,
   resolveLlmDir,
 } from "./llm.js";
@@ -1333,7 +1332,7 @@ export async function maintainEpisodes(
     // configured but unusable llm section never runs, even with an injected
     // generator). A generator injected against a config that has no llm
     // section is the test model itself, so no model files are required.
-    const modelUsable = llmEnabled(config) && modelFilesPresent(modelDir);
+    const modelUsable = llmUsable(config, modelDir);
     const usable =
       modelUsable || (generateOverride !== undefined && config.llm === undefined);
     if (!usable) {
@@ -1369,7 +1368,7 @@ export async function maintainEpisodes(
     };
     const generate: EpisodesGenerate =
       generateOverride ??
-      ((prompt, tokens) => generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens: tokens }));
+      ((prompt, tokens) => generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens: tokens, config }));
 
     let selected: EpisodeEntry[];
     try {

@@ -81,11 +81,10 @@ import {
   buildRetireGatePrompt,
   buildSummaryPrompt,
   generateCompletion,
-  llmEnabled,
+  llmUsable,
   llmMaxNewTokens,
   llmMaxPromptChars,
   llmTimeoutMs,
-  modelFilesPresent,
   parseMergeChoice,
   parseRetireGate,
   parseSummaryBody,
@@ -381,7 +380,7 @@ export async function maintainDistill(
     // stay pending for a future provisioned run; the lease is released below.
     // (Dequeueing before this check leased rows that were never settled.)
     const modelDir = resolveLlmDir(config, configPath);
-    const usable = llmEnabled(config) && modelFilesPresent(modelDir);
+    const usable = llmUsable(config, modelDir);
     if (!usable) {
       const stored = budgeted(
         ok({ distill: { applied: 0, reviewed: 0, failed: 0, batchId: null, nextCursor: p.cursor, degraded: true, reason: "model unavailable", model: LLM_MODEL_ID, revision: LLM_MODEL_REVISION } }),
@@ -457,7 +456,7 @@ export async function maintainDistill(
       }
     };
     const decide: DistillDecide =
-      decideOverride ?? ((prompt) => generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens }));
+      decideOverride ?? ((prompt) => generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens, config }));
     const planned: PlannedItem[] = [];
     interface StagedProposal {
       review: CultivationReview;
