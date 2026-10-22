@@ -74,8 +74,7 @@ import {
   type CultivationReview,
 } from "./cultivation.js";
 import {
-  LLM_MODEL_ID,
-  LLM_MODEL_REVISION,
+  activeModelLabel,
   buildConfirmPrompt,
   buildMergePrompt,
   buildRetireGatePrompt,
@@ -381,9 +380,10 @@ export async function maintainDistill(
     // (Dequeueing before this check leased rows that were never settled.)
     const modelDir = resolveLlmDir(config, configPath);
     const usable = llmUsable(config, modelDir);
+    const modelLabel = activeModelLabel(config);
     if (!usable) {
       const stored = budgeted(
-        ok({ distill: { applied: 0, reviewed: 0, failed: 0, batchId: null, nextCursor: p.cursor, degraded: true, reason: "model unavailable", model: LLM_MODEL_ID, revision: LLM_MODEL_REVISION } }),
+        ok({ distill: { applied: 0, reviewed: 0, failed: 0, batchId: null, nextCursor: p.cursor, degraded: true, reason: "model unavailable", ...modelLabel } }),
         config,
       );
       try {
@@ -405,7 +405,7 @@ export async function maintainDistill(
     items = batch.items;
     if (items.length === 0) {
       const stored = budgeted(
-        ok({ distill: { applied: 0, reviewed: 0, failed: 0, batchId: null, nextCursor: p.cursor, degraded: false, model: LLM_MODEL_ID, revision: LLM_MODEL_REVISION } }),
+        ok({ distill: { applied: 0, reviewed: 0, failed: 0, batchId: null, nextCursor: p.cursor, degraded: false, ...modelLabel } }),
         config,
       );
       try {
@@ -782,7 +782,7 @@ export async function maintainDistill(
     const last = items.length > 0 ? items[items.length - 1]! : null;
     const nextCursor = last ? encodeCultivationCursor(last.nextAt, last.queueId) : p.cursor;
     const stored = budgeted(
-      ok({ distill: { applied, reviewed: items.length, failed, batchId, nextCursor, degraded: false, model: LLM_MODEL_ID, revision: LLM_MODEL_REVISION } }),
+      ok({ distill: { applied, reviewed: items.length, failed, batchId, nextCursor, degraded: false, ...modelLabel } }),
       config,
     );
     try {
