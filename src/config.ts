@@ -72,6 +72,34 @@ export interface MaintenanceConfig {
 }
 
 /**
+ * Derived association-layer bounds (startup-only, optional). Association is
+ * rebuildable and never canonical: it only decides which existing memories
+ * are semantically near each other.
+ */
+export interface AssociateConfig {
+  /** Max records embedded+scanned per maintain.associate run (default 50, cap 500). */
+  batchMax: number;
+  /** Max similarity edges kept per record (default 5). */
+  topK: number;
+  /** Minimum cosine to keep an edge (default 0.45; measured against MiniLM). */
+  minScore: number;
+  /**
+   * Minimum MiniLM cosine for merging two topic strings (default 0.8). Exact
+   * NFKC-lowercase equality always merges; this only catches near-synonyms.
+   */
+  topicMergeMin?: number;
+  /** Additive cosine bonus for a peer sharing >=1 topic (default 0.3, capped at 1). */
+  topicBonus?: number;
+  /**
+   * Whether maintain.associate may call the local SLM to extract topics for
+   * records that have neither canonical tags nor externally supplied topics
+   * (default false). Tags and topic.set always take precedence and never
+   * invoke the model.
+   */
+  llmTopics?: boolean;
+}
+
+/**
  * P2 episode derivation bounds (startup-only, optional). Absent uses the
  * documented defaults. utcOffsetMinutes only shifts the `day` episode key;
  * stored timestamps stay canonical UTC.
@@ -104,6 +132,8 @@ export interface AppConfig {
   maintenance?: MaintenanceConfig;
   /** P2 episode derivation bounds (optional; absent uses documented defaults). */
   episodes?: EpisodesConfig;
+  /** P3 derived association bounds (optional; absent uses defaults). */
+  associate?: AssociateConfig;
   /**
    * F-I01-05 (optional boolean, default false): when true, event.append and
    * record.remember without a `privacy` object are BAD_REQUEST (no side
@@ -124,6 +154,7 @@ const TOP_KEYS = [
   "llm",
   "maintenance",
   "episodes",
+  "associate",
   "requirePrivacy",
 ] as const;
 const LIMIT_KEYS = [
@@ -453,6 +484,57 @@ export function loadConfig(configPath: string): AppConfig {
     };
   }
 
+  let associate: AssociateConfig | undefined;
+  if ("associate" in parsed && (parsed as Record<string, unknown>)["associate"] !== undefined) {
+    const a = (parsed as Record<string, unknown>)["associate"];
+    if (!isPlainObject(a)) throw new Error("associate must be an object");
+    for (const k of Object.keys(a)) {
+      if (!["batchMax", "topK", "minScore", "topicMergeMin", "topicBonus", "llmTopics"].includes(k)) {
+        throw new Error(`unknown associate field: ${k}`);
+      }
+    }
+    const batchMax = a["batchMax"] ?? ASSOCIATE_DEFAULT_BATCH_MAX;
+    const eB = checkRange("associate.batchMax", batchMax, 1, 500);
+    if (eB) throw new Error(eB);
+    const topK = a["topK"] ?? ASSOCIATE_DEFAULT_TOP_K;
+    const eK = checkRange("associate.topK", topK, 1, 50);
+    if (eK) throw new Error(eK);
+    const minScore = a["minScore"] ?? ASSOCIATE_DEFAULT_MIN_SCORE;
+    if (typeof minScore !== "number" || !Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
+      throw new Error("associate.minScore must be a number in 0..1");
+    }
+    const topicMergeMin = a["topicMergeMin"] ?? ASSOCIATE_DEFAULT_TOPIC_MERGE_MIN;
+    if (
+      typeof topicMergeMin !== "number" ||
+      !Number.isFinite(topicMergeMin) ||
+      topicMergeMin < 0 ||
+      topicMergeMin > 1
+    ) {
+      throw new Error("associate.topicMergeMin must be a number in 0..1");
+    }
+    const topicBonus = a["topicBonus"] ?? ASSOCIATE_DEFAULT_TOPIC_BONUS;
+    if (
+      typeof topicBonus !== "number" ||
+      !Number.isFinite(topicBonus) ||
+      topicBonus < 0 ||
+      topicBonus > 1
+    ) {
+      throw new Error("associate.topicBonus must be a number in 0..1");
+    }
+    const llmTopics = a["llmTopics"] ?? ASSOCIATE_DEFAULT_LLM_TOPICS;
+    if (typeof llmTopics !== "boolean") {
+      throw new Error("associate.llmTopics must be a boolean");
+    }
+    associate = {
+      batchMax: batchMax as number,
+      topK: topK as number,
+      minScore: minScore as number,
+      topicMergeMin: topicMergeMin as number,
+      topicBonus: topicBonus as number,
+      llmTopics,
+    };
+  }
+
   let requirePrivacy: boolean | undefined;
   if ("requirePrivacy" in parsed && (parsed as Record<string, unknown>)["requirePrivacy"] !== undefined) {
     const rp = (parsed as Record<string, unknown>)["requirePrivacy"];
@@ -490,6 +572,7 @@ export function loadConfig(configPath: string): AppConfig {
     ...(llm ? { llm } : {}),
     ...(maintenance ? { maintenance } : {}),
     ...(episodes ? { episodes } : {}),
+    ...(associate ? { associate } : {}),
     ...(requirePrivacy !== undefined ? { requirePrivacy } : {}),
   };
 }
@@ -535,6 +618,31 @@ export const EPISODES_DEFAULT_UTC_OFFSET_MINUTES = 0;
 export const EPISODES_DEFAULT_WINDOW_MAX_CP = 1200;
 export const EPISODES_DEFAULT_MAX_NEW_TOKENS = 128;
 export const EPISODES_DEFAULT_BATCH_MAX = 5;
+
+/**
+ * P3 association defaults. minScore was chosen from the real pinned
+ * multilingual MiniLM corpus (see src/associate.ts): the strongest
+ * bike/bike pair scored 0.4649 while the strongest bike/unrelated pair
+ * scored 0.2911, so 0.45 links the bike pair and excludes unrelated text.
+ */
+export const ASSOCIATE_DEFAULT_BATCH_MAX = 50;
+export const ASSOCIATE_DEFAULT_TOP_K = 5;
+export const ASSOCIATE_DEFAULT_MIN_SCORE = 0.45;
+export const ASSOCIATE_DEFAULT_TOPIC_MERGE_MIN = 0.8;
+export const ASSOCIATE_DEFAULT_TOPIC_BONUS = 0.3;
+/** Topic extraction is opt-in; canonical tags and topic.set do not need the SLM. */
+export const ASSOCIATE_DEFAULT_LLM_TOPICS = false;
+
+export function associateBounds(config: AppConfig): Required<AssociateConfig> {
+  return {
+    batchMax: config.associate?.batchMax ?? ASSOCIATE_DEFAULT_BATCH_MAX,
+    topK: config.associate?.topK ?? ASSOCIATE_DEFAULT_TOP_K,
+    minScore: config.associate?.minScore ?? ASSOCIATE_DEFAULT_MIN_SCORE,
+    topicMergeMin: config.associate?.topicMergeMin ?? ASSOCIATE_DEFAULT_TOPIC_MERGE_MIN,
+    topicBonus: config.associate?.topicBonus ?? ASSOCIATE_DEFAULT_TOPIC_BONUS,
+    llmTopics: config.associate?.llmTopics ?? ASSOCIATE_DEFAULT_LLM_TOPICS,
+  };
+}
 
 export function episodesBounds(config: AppConfig): Required<EpisodesConfig> {
   return {

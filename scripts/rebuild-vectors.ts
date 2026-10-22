@@ -70,6 +70,20 @@ async function main(): Promise<void> {
     process.stderr.write("error: store unavailable\n");
     process.exit(3);
   }
+  // A rebuild replaces every active vector, so the whole-scope edge
+  // fingerprints must be invalidated: the next maintain.associate recomputes
+  // each scope's edges from the rebuilt vectors. Both tables are derived and
+  // rebuildable; associate_state is the legacy per-record marker.
+  try {
+    db.exec(`DELETE FROM associate_scope_state`);
+  } catch {
+    /* table absent on a pre-association file: nothing to clear */
+  }
+  try {
+    db.exec(`DELETE FROM associate_state`);
+  } catch {
+    /* table absent on a pre-association file: nothing to clear */
+  }
   try {
     const rows = db
       .prepare(

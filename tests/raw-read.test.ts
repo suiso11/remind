@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 import type { AppConfig } from "../src/config.js";
-import { initDb } from "../src/db.js";
+import { initDb, SCHEMA_VERSION } from "../src/db.js";
 import { requestHashFor } from "../src/normalize.js";
 import type { ResponseEnvelope } from "../src/protocol.js";
 import {
@@ -913,7 +913,7 @@ describe("legacy raw_events / record_source_refs migration", () => {
 
       const result = await resultPromise;
       assert.equal(result.ok, true, result.error);
-      assert.equal(result.userVersion, 3);
+      assert.equal(result.userVersion, SCHEMA_VERSION);
       // Both connections see the fully migrated, committed schema.
       for (const table of ["raw_events", "records"]) {
         const cols = (
