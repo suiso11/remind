@@ -2,25 +2,35 @@
  * maintain.associate: derived, rebuildable semantic association layer.
  *
  * Canonical `record_links` stay caller-authored: this module never adds or
- * removes them. It maintains two derived tables only:
+ * removes them. It maintains only derived, rebuildable tables:
  * - vec_notes: active record embeddings (shared with M2 recall; same pinned
  *   model, same normalization, same upsert helper). The bodyHash column stores
  *   a hash of the actual embedding input (body, plus "\n話題: ..." when SLM
  *   topics exist), so a topic change re-embeds the record.
  * - record_topics: 1-3 SLM-extracted general-category topics per active
  *   record for the current bodyHash.
- * - similar_edges / associate_state: top-K cosine neighbours per active
- *   record within one scope, plus the bodyHash last scanned per record. A
- *   peer sharing at least one topic gets an additive `topicBonus` (capped at
- *   1) before the minScore check, because world-knowledge-only links (two
- *   motorcycle memories) score far below unrelated text on MiniLM.
+ * - similar_edges: union over every active embedded record r in one scope of
+ *   r's top-K cosine neighbours. A peer sharing at least one topic gets an
+ *   additive `topicBonus` (capped at 1) before the minScore check, because
+ *   world-knowledge-only links (two motorcycle memories) score far below
+ *   unrelated text on MiniLM. Unordered pairs are canonicalized (min, max)
+ *   and keep the maximum score any record assigned.
+ * - associate_scope_state: one fingerprint per scope (edge settings + model
+ *   id + sorted (recordId, embedding-input hash) of active embedded records).
+ *   A mismatch means the whole scope's edges are stale and are rebuilt in a
+ *   single transaction: newly embedded records, re-embeddings, topic changes,
+ *   status changes and config changes all move the fingerprint.
  *
- * Work per run is bounded by `limit` (default associate.batchMax, cap 500):
- * at most that many active records are embedded/scanned. A record is dirty
- * when it has no current vec_notes row or associate_state's bodyHash differs
- * from the canonical record bodyHash. Missing model / vectors disabled is an
- * OK degraded result with zero applied work; an embedding failure writes no
- * edges (derived writes are always rebuildable).
+ * Embedding remains incremental and bounded by `limit` (default
+ * associate.batchMax, cap 500): at most that many active records are embedded
+ * per run. Edge recomputation runs after embedding whenever the fingerprint
+ * differs, including when `remaining > 0`, so a partial graph is still the
+ * correct union of the vectors that currently exist. The recompute is brute
+ * force O(n^2) over the scope and is intentionally not capped; at the
+ * documented target of ~2000 active vectors per scope this is bounded work.
+ * Missing model / vectors disabled is an OK degraded result with zero applied
+ * work; an embedding failure writes no edges (derived writes are always
+ * rebuildable).
  *
  * Threshold note (measured with the pinned multilingual MiniLM):
  *   bike corpus (rows/cols: H2 intake, GSX-S1000F, ZX-4R SE, speed, miso, dentist)
@@ -36,9 +46,9 @@
  *   H2/GSX pair scores 0.145 on this model, below any threshold that does not
  *   also admit unrelated text; that is a model limitation, not a tuning knob.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { AppConfig } from "./config.js";
+import type { AppConfig, AssociateConfig } from "./config.js";
 import { associateBounds, maintenanceTimeoutMs, rangeLimitMax } from "./config.js";
 import {
   acquireCultivationLease,
@@ -64,6 +74,8 @@ import {
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
 import {
   VECTOR_DIM,
+  VECTOR_MODEL_ID,
+  VECTOR_MODEL_REVISION,
   cosine,
   deserializeVec,
   embedTexts,
@@ -445,15 +457,181 @@ function loadActiveRows(db: DatabaseSync, scope: string): ActiveRow[] {
   }));
 }
 
-function loadScannedHashes(db: DatabaseSync, scope: string): Map<string, string> {
-  const rows = db
-    .prepare(
-      `SELECT s.recordId AS recordId, s.bodyHash AS bodyHash
-       FROM associate_state s JOIN records r ON r.id = s.recordId
-       WHERE r.scope = ? AND r.status = 'active'`,
+/** Last successful whole-scope edge fingerprint, or null when never computed. */
+function loadScopeFingerprint(db: DatabaseSync, scope: string): string | null {
+  const row = db
+    .prepare(`SELECT fingerprint FROM associate_scope_state WHERE scope = ?`)
+    .get(scope) as { fingerprint: string } | undefined;
+  return row?.fingerprint ?? null;
+}
+
+/**
+ * Hash of everything that determines the scope's edge set: the scoring
+ * settings, the pinned model identity, and the sorted per-active-embedded
+ * record (id, current embedding-input hash, stored embedding-input hash).
+ * Comparing both hashes matters: a topic change dirties the scope even before
+ * the record is re-embedded, and the subsequent vector write dirties it again
+ * so the edges are rebuilt against the new vector. New/removed records and
+ * config changes move the value directly.
+ */
+function computeScopeFingerprint(
+  bounds: Required<AssociateConfig>,
+  records: ActiveRow[],
+  topicsById: Map<string, string[]>,
+): string {
+  const embedded = records
+    .filter((r) => r.vec !== null)
+    .map((r) => [
+      r.id,
+      embeddingInputHash(r.bodyNorm, topicsById.get(r.id)),
+      r.vecHash ?? "",
+    ] as [string, string, string])
+    .sort((x, y) =>
+      x[0] < y[0]
+        ? -1
+        : x[0] > y[0]
+          ? 1
+          : x[1] < y[1]
+            ? -1
+            : x[1] > y[1]
+              ? 1
+              : x[2] < y[2]
+                ? -1
+                : x[2] > y[2]
+                  ? 1
+                  : 0,
+    );
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        v: 2,
+        topK: bounds.topK,
+        minScore: bounds.minScore,
+        topicBonus: bounds.topicBonus,
+        topicMergeMin: bounds.topicMergeMin,
+        model: `${VECTOR_MODEL_ID}@${VECTOR_MODEL_REVISION}`,
+        records: embedded,
+      }),
     )
-    .all(scope) as Array<{ recordId: string; bodyHash: string }>;
-  return new Map(rows.map((r) => [r.recordId, r.bodyHash]));
+    .digest("hex");
+}
+
+/** NFKC-lowercase topic sets for cheap shared-topic detection. */
+function buildTopicSets(topicsById: Map<string, string[]>): Map<string, Set<string>> {
+  const sets = new Map<string, Set<string>>();
+  for (const [id, list] of topicsById) {
+    if (list.length > 0) sets.set(id, new Set(list.map((t) => normalizeField(t, true))));
+  }
+  return sets;
+}
+
+function sharesTopic(
+  topicSets: Map<string, Set<string>>,
+  a: string,
+  b: string,
+): boolean {
+  const ta = topicSets.get(a);
+  const tb = topicSets.get(b);
+  if (!ta || !tb) return false;
+  const [small, large] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
+  for (const t of small) {
+    if (large.has(t)) return true;
+  }
+  return false;
+}
+
+interface ScopeEdgeResult {
+  written: number;
+  removed: number;
+  scanned: number;
+}
+
+/**
+ * Recompute the WHOLE scope's similar-edge set from the vectors that exist
+ * now, then replace only the rows whose pair/score changed in one
+ * transaction. Desired set = union over every embedded record r of r's
+ * top-K peers (topic-adjusted score >= minScore), deduped as (min,max) with
+ * the maximum score. O(n^2) per scope; intentionally uncapped (see header).
+ */
+function recomputeScopeEdges(
+  db: DatabaseSync,
+  scope: string,
+  active: ActiveRow[],
+  topicsById: Map<string, string[]>,
+  bounds: Required<AssociateConfig>,
+  fingerprint: string,
+  now: string,
+): ScopeEdgeResult {
+  const vecById = new Map<string, Float32Array>();
+  for (const row of active) {
+    if (row.vec !== null) vecById.set(row.id, row.vec);
+  }
+  const topicSets = buildTopicSets(topicsById);
+  const desired = new Map<string, { a: string; b: string; score: number }>();
+  for (const [id, self] of vecById) {
+    const scored: Array<{ id: string; score: number }> = [];
+    for (const [peerId, peerVec] of vecById) {
+      if (peerId === id) continue;
+      let score = cosine(self, peerVec);
+      if (!Number.isFinite(score)) continue;
+      if (sharesTopic(topicSets, id, peerId)) score = Math.min(1, score + bounds.topicBonus);
+      if (score < bounds.minScore) continue;
+      scored.push({ id: peerId, score });
+    }
+    scored.sort((x, y) =>
+      y.score !== x.score ? y.score - x.score : x.id < y.id ? -1 : x.id > y.id ? 1 : 0,
+    );
+    for (const edge of scored.slice(0, bounds.topK)) {
+      const a = id < edge.id ? id : edge.id;
+      const b = id < edge.id ? edge.id : id;
+      const key = `${a}\u0000${b}`;
+      const prev = desired.get(key);
+      if (prev === undefined || edge.score > prev.score) {
+        desired.set(key, { a, b, score: edge.score });
+      }
+    }
+  }
+
+  let written = 0;
+  let removed = 0;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const existingRows = db
+      .prepare(`SELECT a, b, score FROM similar_edges WHERE scope = ?`)
+      .all(scope) as Array<{ a: string; b: string; score: number }>;
+    const existing = new Map<string, number>();
+    for (const row of existingRows) existing.set(`${row.a}\u0000${row.b}`, row.score);
+    const del = db.prepare(`DELETE FROM similar_edges WHERE scope = ? AND a = ? AND b = ?`);
+    const ins = db.prepare(
+      `INSERT OR REPLACE INTO similar_edges(scope, a, b, score, computedAt) VALUES (?, ?, ?, ?, ?)`,
+    );
+    const EPS = 1e-12;
+    for (const [key, row] of existingRows.map((r) => [`${r.a}\u0000${r.b}`, r] as const)) {
+      const want = desired.get(key);
+      if (want !== undefined && Math.abs(want.score - row.score) <= EPS) continue;
+      del.run(scope, row.a, row.b);
+      if (want === undefined) removed++;
+    }
+    for (const [key, edge] of desired) {
+      const prior = existing.get(key);
+      if (prior !== undefined && Math.abs(prior - edge.score) <= EPS) continue;
+      ins.run(scope, edge.a, edge.b, edge.score, now);
+      written++;
+    }
+    db.prepare(
+      `INSERT INTO associate_scope_state(scope, fingerprint, computedAt) VALUES (?, ?, ?)
+       ON CONFLICT(scope) DO UPDATE SET fingerprint = excluded.fingerprint, computedAt = excluded.computedAt`,
+    ).run(scope, fingerprint, now);
+    db.exec("COMMIT");
+  } catch (e) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+  return { written, removed, scanned: vecById.size };
 }
 
 /** Canonical tags per active record (record_tags is caller-authored). */
@@ -631,10 +809,6 @@ function pruneInactive(db: DatabaseSync, scope: string): number {
          (SELECT id FROM records WHERE scope = ? AND status != 'active')`,
     ).run(scope);
     db.prepare(
-      `DELETE FROM associate_state WHERE recordId IN
-         (SELECT id FROM records WHERE scope = ? AND status != 'active')`,
-    ).run(scope);
-    db.prepare(
       `DELETE FROM record_topics WHERE recordId IN
          (SELECT id FROM records WHERE scope = ? AND status != 'active')`,
     ).run(scope);
@@ -650,15 +824,31 @@ function pruneInactive(db: DatabaseSync, scope: string): number {
   }
 }
 
-/** Active records still needing an embedding or a scan (post-run remaining). */
-function countRemaining(db: DatabaseSync, scope: string): number {
+/**
+ * Active records still needing an embedding or (when topic extraction is
+ * enabled/usable) SLM topics, i.e. the incremental work left after `limit`.
+ * Edge freshness is tracked separately by the scope fingerprint.
+ */
+function countRemaining(db: DatabaseSync, scope: string, extractTopics: boolean): number {
   const active = loadActiveRows(db, scope);
-  const scanned = loadScannedHashes(db, scope);
-  const topics = loadTopicState(db, scope, active).topicsById;
+  const topicState = loadTopicState(db, scope, active);
+  const topics = topicState.topicsById;
   let n = 0;
   for (const r of active) {
-    const inputHash = embeddingInputHash(r.bodyNorm, topics.get(r.id));
-    if (r.vec === null || r.vecHash !== inputHash || scanned.get(r.id) !== r.bodyHash) n++;
+    const list = topics.get(r.id);
+    const inputHash = embeddingInputHash(r.bodyNorm, list);
+    if (r.vec === null || r.vecHash !== inputHash) {
+      n++;
+      continue;
+    }
+    if (
+      extractTopics &&
+      !topicState.tagged.has(r.id) &&
+      !topicState.external.has(r.id) &&
+      (list === undefined || list.length === 0)
+    ) {
+      n++;
+    }
   }
   return n;
 }
@@ -753,7 +943,7 @@ export async function maintainAssociate(
     if (!usable) {
       let remaining = 0;
       try {
-        remaining = countRemaining(db, p.scope);
+        remaining = countRemaining(db, p.scope, topicsUsable);
       } catch {
         /* diagnostics only */
       }
@@ -786,12 +976,12 @@ export async function maintainAssociate(
     }
 
     let active: ActiveRow[];
-    let scannedHashes: Map<string, string>;
     let topicState: TopicState;
+    let priorFingerprint: string | null;
     try {
       active = loadActiveRows(db, p.scope);
-      scannedHashes = loadScannedHashes(db, p.scope);
       topicState = loadTopicState(db, p.scope, active);
+      priorFingerprint = loadScopeFingerprint(db, p.scope);
     } catch {
       return budgeted(fail("STORE_UNAVAILABLE"), config);
     }
@@ -812,7 +1002,6 @@ export async function maintainAssociate(
     interface WorkItem {
       row: ActiveRow;
       current: boolean;
-      dirty: boolean;
       topicsDirty: boolean;
     }
     const work: WorkItem[] = [];
@@ -820,24 +1009,19 @@ export async function maintainAssociate(
       const topics = topicsById.get(row.id);
       const inputHash = embeddingInputHash(row.bodyNorm, topics);
       const current = row.vec !== null && row.vecHash === inputHash;
-      const dirty = scannedHashes.get(row.id) !== row.bodyHash;
       const topicsDirty =
         (topics === undefined || topics.length === 0) &&
         !topicState.tagged.has(row.id) &&
         !topicState.external.has(row.id);
       // Topic extraction only selects work when llmTopics is enabled and the
       // SLM is usable: otherwise missing topics are intentional and must not
-      // keep every record dirty forever.
-      if (!current || dirty || (topicsDirty && topicsUsable)) {
-        work.push({ row, current, dirty, topicsDirty });
+      // keep every record dirty forever. Edge freshness is separate: see the
+      // scope fingerprint below.
+      if (!current || (topicsDirty && topicsUsable)) {
+        work.push({ row, current, topicsDirty });
       }
     }
     const selected = work.slice(0, p.limit);
-
-    const vecById = new Map<string, Float32Array>();
-    for (const row of active) {
-      if (row.vec !== null) vecById.set(row.id, row.vec);
-    }
 
     // Step a (continued): SLM topic extraction for selected dirty records,
     // before embedding. Extraction failure leaves the record dirty for topics
@@ -943,7 +1127,7 @@ export async function maintainAssociate(
         // were already current remain usable, and this is reported degraded.
         let remaining = 0;
         try {
-          remaining = countRemaining(db, p.scope);
+          remaining = countRemaining(db, p.scope, topicsUsable);
         } catch {
           /* diagnostics only */
         }
@@ -974,96 +1158,44 @@ export async function maintainAssociate(
         const inputHash = embeddingInputHash(w.row.bodyNorm, topicsById.get(w.row.id));
         if (upsertRecordVector(db, w.row.id, vec, inputHash, nowValid, VECTOR_DIM)) {
           embedded++;
-          vecById.set(w.row.id, vec);
+          // Keep the in-memory row in sync so the fingerprint below reflects
+          // the vector just written (no extra SELECT).
+          w.row.vec = vec;
+          w.row.vecHash = inputHash;
         }
       }
     }
 
-    // Step b: compute top-K neighbours for each selected record and replace
-    // that record's incident edges atomically. Work is bounded by `limit`.
-    if (overDeadline()) return budgeted(fail("TIMEOUT"), config);
-    if (!renew()) return budgeted(conflict(), config);
-
-    interface Scan {
-      id: string;
-      bodyHash: string;
-      edges: Array<{ id: string; score: number }>;
-    }
-    const scans: Scan[] = [];
-    const topicSets = new Map<string, Set<string>>();
-    for (const [id, list] of topicsById) {
-      if (list.length > 0) topicSets.set(id, new Set(list.map((t) => normalizeField(t, true))));
-    }
-    const sharesTopic = (a: string, b: string): boolean => {
-      const ta = topicSets.get(a);
-      const tb = topicSets.get(b);
-      if (!ta || !tb) return false;
-      const [small, large] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
-      for (const t of small) {
-        if (large.has(t)) return true;
-      }
-      return false;
-    };
-    for (const w of selected) {
-      const self = vecById.get(w.row.id);
-      if (!self) continue;
-      const scored: Array<{ id: string; score: number }> = [];
-      for (const [peerId, peerVec] of vecById) {
-        if (peerId === w.row.id) continue;
-        let score = cosine(self, peerVec);
-        if (!Number.isFinite(score)) continue;
-        if (sharesTopic(w.row.id, peerId)) score = Math.min(1, score + bounds.topicBonus);
-        if (score < bounds.minScore) continue;
-        scored.push({ id: peerId, score });
-      }
-      scored.sort((x, y) =>
-        y.score !== x.score ? y.score - x.score : x.id < y.id ? -1 : x.id > y.id ? 1 : 0,
-      );
-      scans.push({
-        id: w.row.id,
-        bodyHash: w.row.bodyHash,
-        edges: scored.slice(0, bounds.topK),
-      });
-    }
-
-    const writtenPairs = new Set<string>();
-    if (scans.length > 0) {
-      db.exec("BEGIN IMMEDIATE");
+    // Step b: recompute the WHOLE scope edge set when the fingerprint moved.
+    // This runs after embedding (including when remaining > 0), so a partial
+    // graph is always the union of the vectors that exist right now.
+    let edgesWritten = 0;
+    let scanned = 0;
+    const fingerprint = computeScopeFingerprint(bounds, active, topicsById);
+    if (fingerprint !== priorFingerprint) {
+      if (overDeadline()) return budgeted(fail("TIMEOUT"), config);
+      if (!renew()) return budgeted(conflict(), config);
       try {
-        const del = db.prepare(
-          `DELETE FROM similar_edges WHERE scope = ? AND (a = ? OR b = ?)`,
+        const result = recomputeScopeEdges(
+          db,
+          p.scope,
+          active,
+          topicsById,
+          bounds,
+          fingerprint,
+          nowValid,
         );
-        const ins = db.prepare(
-          `INSERT OR IGNORE INTO similar_edges(scope, a, b, score, computedAt) VALUES (?, ?, ?, ?, ?)`,
-        );
-        const state = db.prepare(
-          `INSERT INTO associate_state(recordId, bodyHash, scannedAt) VALUES (?, ?, ?)
-           ON CONFLICT(recordId) DO UPDATE SET bodyHash = excluded.bodyHash, scannedAt = excluded.scannedAt`,
-        );
-        for (const scan of scans) {
-          edgesRemoved += changedRows(del.run(p.scope, scan.id, scan.id));
-          for (const edge of scan.edges) {
-            const a = scan.id < edge.id ? scan.id : edge.id;
-            const b = scan.id < edge.id ? edge.id : scan.id;
-            const inserted = ins.run(p.scope, a, b, edge.score, nowValid);
-            if (changedRows(inserted) > 0) writtenPairs.add(`${a}\u0000${b}`);
-          }
-          state.run(scan.id, scan.bodyHash, nowValid);
-        }
-        db.exec("COMMIT");
-      } catch (e) {
-        try {
-          db.exec("ROLLBACK");
-        } catch {
-          /* ignore */
-        }
-        throw e;
+        edgesWritten = result.written;
+        edgesRemoved += result.removed;
+        scanned = result.scanned;
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
       }
     }
 
     let remaining = 0;
     try {
-      remaining = countRemaining(db, p.scope);
+      remaining = countRemaining(db, p.scope, topicsUsable);
     } catch {
       /* diagnostics only */
     }
@@ -1072,9 +1204,9 @@ export async function maintainAssociate(
         associate: {
           applied: embedded,
           embedded,
-          edgesWritten: writtenPairs.size,
+          edgesWritten,
           edgesRemoved,
-          scanned: scans.length,
+          scanned,
           remaining,
           topicsWritten,
           topicsFailed,
@@ -1127,9 +1259,10 @@ interface StoredRecordRow {
 /**
  * topic.set: replace the externally supplied topics for one active record.
  * Canonical tags still win (precedence tag > external > llm), so this is
- * effective for records without tags. Replacing topics invalidates the
- * derived vector/scan state so the next maintain.associate re-embeds and
- * rescans the record (the topic text and topic bonus both change edges).
+ * effective for records without tags. Replacing topics deletes the derived
+ * vector so the next maintain.associate re-embeds the record; the changed
+ * embedding-input hash moves the scope fingerprint and rebuilds the edges
+ * (the topic text and topic bonus both change them).
  *
  * Idempotent per caller key: same key + same normalized params replays the
  * stored envelope; a different request under that key is CONFLICT.
@@ -1220,9 +1353,9 @@ export function topicSet(
         `INSERT OR REPLACE INTO record_topics(recordId, topic, bodyHash, origin) VALUES (?, ?, ?, 'external')`,
       );
       for (const t of topics) ins.run(id, t, bodyHash);
-      // Derived caches only: force re-embed + rescan on the next associate.
+      // Derived cache only: force re-embedding on the next associate. The
+      // resulting hash change moves the scope fingerprint and rebuilds edges.
       db.prepare(`DELETE FROM vec_notes WHERE recordId = ?`).run(id);
-      db.prepare(`DELETE FROM associate_state WHERE recordId = ?`).run(id);
       db.prepare(
         `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, 'topic.set', ?, ?, ?)`,
       ).run(idempotencyKey, reqHash, JSON.stringify(stored), now);

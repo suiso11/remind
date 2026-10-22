@@ -21,7 +21,7 @@ import {
 } from "../src/config.js";
 import { initDb, SCHEMA_VERSION } from "../src/db.js";
 import { normalizeBody } from "../src/normalize.js";
-import { eventAppend, rememberRecord, correctRecord, retireRecord, LEGACY_SCHEMA_VERSION_4 } from "../src/store.js";
+import { eventAppend, rememberRecord, correctRecord, retireRecord, LEGACY_SCHEMA_VERSION_4, LEGACY_SCHEMA_VERSION_5 } from "../src/store.js";
 import { acquireCultivationLease, releaseCultivationLease } from "../src/cultivation.js";
 import { maintainAssociate, topicSet, topicPending, buildTopicPrompt, parseTopicResponse, type AssociateEmbed, type AssociateGenerate } from "../src/associate.js";
 import { VECTOR_DIM, normalizeVec } from "../src/vectors.js";
@@ -131,6 +131,11 @@ function vec(x: number, y: number, extraIndex?: number): Float32Array {
   return normalizeVec(v);
 }
 
+function vecAngle(degrees: number): Float32Array {
+  const r = (degrees * Math.PI) / 180;
+  return vec(Math.cos(r), Math.sin(r));
+}
+
 function vecAxis(x: number, axis: number): Float32Array {
   const v = new Float32Array(VECTOR_DIM);
   v[0] = x;
@@ -195,10 +200,11 @@ function edgeRows(db: DatabaseSync): Array<{ a: string; b: string; score: number
     .all() as Array<{ a: string; b: string; score: number }>;
 }
 
-function stateIds(db: DatabaseSync): string[] {
-  return (db.prepare(`SELECT recordId FROM associate_state ORDER BY recordId`).all() as Array<{ recordId: string }>).map(
-    (r) => r.recordId,
-  );
+function scopeState(db: DatabaseSync): { fingerprint: string; computedAt: string } | null {
+  const row = db
+    .prepare(`SELECT fingerprint, computedAt FROM associate_scope_state WHERE scope = ?`)
+    .get(SCOPE) as { fingerprint: string; computedAt: string } | undefined;
+  return row ?? null;
 }
 
 function assoc(res: { data: unknown }): Record<string, unknown> {
@@ -236,7 +242,7 @@ describe("maintain.associate derived layer", () => {
       assert.equal(d["scanned"], 2);
       assert.equal(d["remaining"], 0);
       assert.deepEqual(vecIds(ctx.db).sort(), [a, b].sort());
-      assert.deepEqual(stateIds(ctx.db).sort(), [a, b].sort());
+      assert.ok(scopeState(ctx.db), "scope fingerprint stored");
       const edges = edgeRows(ctx.db);
       assert.equal(edges.length, 1, JSON.stringify(edges));
       assert.equal(edges[0]!.a, a < b ? a : b);
@@ -305,7 +311,8 @@ describe("maintain.associate derived layer", () => {
       assert.equal(second.ok, true, JSON.stringify(second));
       const d = assoc(second);
       assert.equal(d["embedded"], 1);
-      assert.equal(d["scanned"], 1);
+      // Whole-scope recompute evaluates both currently embedded records.
+      assert.equal(d["scanned"], 2);
       assert.ok(d["edgesRemoved"] as number >= 1, JSON.stringify(d));
       assert.ok(vecIds(ctx.db).includes(newId));
       assert.ok(!vecIds(ctx.db).includes(oldId));
@@ -395,7 +402,6 @@ describe("maintain.associate derived layer", () => {
       assert.equal(edgeRows(ctx.db).length, 0);
       assert.ok(!vecIds(ctx.db).includes(b));
       assert.ok(vecIds(ctx.db).includes(a));
-      assert.ok(!stateIds(ctx.db).includes(b));
       assert.ok((assoc(second)["edgesRemoved"] as number) >= 1);
     } finally {
       ctx.cleanup();
@@ -511,8 +517,162 @@ describe("maintain.associate derived layer", () => {
       );
       assert.equal(second.ok, true, JSON.stringify(second));
       assert.equal(assoc(second)["embedded"], 1);
-      assert.equal(assoc(second)["scanned"], 1);
+      // The dirty recompute covers all three embedded records in the scope.
+      assert.equal(assoc(second)["scanned"], 3);
       assert.equal(assoc(second)["remaining"], 0);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("keeps both edges from asymmetric top-1 neighbourhoods (A->B, B<->C)", async () => {
+    const ctx = setup({ batchMax: 50, topK: 1, minScore: 0.5 });
+    try {
+      const a = remember(ctx.db, ctx.config, "asym alpha", "as-a", T1);
+      const b = remember(ctx.db, ctx.config, "asym beta", "as-b", T2);
+      const c = remember(ctx.db, ctx.config, "asym gamma", "as-c", "2026-09-01T00:00:03.000Z");
+      const embed = fakeEmbed(
+        keyed([
+          ["asym alpha", vecAngle(0)],
+          ["asym beta", vecAngle(25)],
+          ["asym gamma", vecAngle(45)],
+        ]),
+      );
+      const res = await maintainAssociate(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: SCOPE },
+        "assoc-asym-1", embed, T2,
+      );
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const pair = (x: string, y: string): string => (x < y ? `${x}:${y}` : `${y}:${x}`);
+      const keys = new Set(edgeRows(ctx.db).map((e) => `${e.a}:${e.b}`));
+      assert.equal(keys.size, 2, JSON.stringify([...keys]));
+      assert.ok(keys.has(pair(a, b)), "A->B top-1 edge survives");
+      assert.ok(keys.has(pair(b, c)), "B<->C top-1 edge survives");
+      assert.ok(!keys.has(pair(a, c)), "A->C is not in any top-1 set");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("rescans previously embedded records when a new record is added", async () => {
+    const ctx = setup({ batchMax: 50, topK: 1, minScore: 0.5 });
+    try {
+      const a = remember(ctx.db, ctx.config, "rescan alpha", "rs-a", T1);
+      const b = remember(ctx.db, ctx.config, "rescan beta", "rs-b", T2);
+      const c = remember(ctx.db, ctx.config, "rescan gamma", "rs-c", "2026-09-01T00:00:03.000Z");
+      const embed = fakeEmbed(
+        keyed([
+          ["rescan alpha", vecAngle(0)],
+          ["rescan beta", vecAngle(35)],
+          ["rescan gamma", vecAngle(30)],
+          ["rescan xray", vecAngle(20)],
+        ]),
+      );
+      const first = await maintainAssociate(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: SCOPE },
+        "assoc-rescan-1", embed, T2,
+      );
+      assert.equal(first.ok, true, JSON.stringify(first));
+      const pair = (x: string, y: string): string => (x < y ? `${x}:${y}` : `${y}:${x}`);
+      let keys = new Set(edgeRows(ctx.db).map((e) => `${e.a}:${e.b}`));
+      assert.ok(keys.has(pair(a, c)), JSON.stringify([...keys]));
+      assert.ok(keys.has(pair(b, c)), JSON.stringify([...keys]));
+
+      // X is nearest to A, but X's own nearest is C: A-X can only appear if
+      // the previously scanned A is recomputed.
+      const x = remember(ctx.db, ctx.config, "rescan xray", "rs-x", "2026-09-01T00:00:04.000Z");
+      const second = await maintainAssociate(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: SCOPE },
+        "assoc-rescan-2", embed, T2,
+      );
+      assert.equal(second.ok, true, JSON.stringify(second));
+      const d = assoc(second);
+      assert.equal(d["embedded"], 1);
+      assert.equal(d["scanned"], 4);
+      keys = new Set(edgeRows(ctx.db).map((e) => `${e.a}:${e.b}`));
+      assert.ok(keys.has(pair(a, x)), "new A->X edge requires rescanning A");
+      assert.ok(keys.has(pair(x, c)), "X's own top-1 edge");
+      assert.ok(keys.has(pair(b, c)), "unrelated B<->C edge remains");
+      assert.ok(!keys.has(pair(a, c)), "A's stale top-1 edge is replaced");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("recomputes edges when associate settings change", async () => {
+    const ctx = setup({ batchMax: 50, topK: 5, minScore: 0.5 });
+    try {
+      const a = remember(ctx.db, ctx.config, "cfg alpha", "cf-a", T1);
+      const b = remember(ctx.db, ctx.config, "cfg beta", "cf-b", T2);
+      const c = remember(ctx.db, ctx.config, "cfg gamma", "cf-c", "2026-09-01T00:00:03.000Z");
+      const embed = fakeEmbed(
+        keyed([
+          ["cfg alpha", vecAngle(0)],
+          ["cfg beta", vecAngle(30)],
+          ["cfg gamma", vecAngle(55)],
+        ]),
+      );
+      const first = await maintainAssociate(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: SCOPE },
+        "assoc-cfg-1", embed, T2,
+      );
+      assert.equal(first.ok, true, JSON.stringify(first));
+      const pair = (x: string, y: string): string => (x < y ? `${x}:${y}` : `${y}:${x}`);
+      assert.equal(edgeRows(ctx.db).length, 3, JSON.stringify(edgeRows(ctx.db)));
+      const before = scopeState(ctx.db);
+      assert.ok(before);
+
+      ctx.config.associate!.minScore = 0.8;
+      const second = await maintainAssociate(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: SCOPE },
+        "assoc-cfg-2", embed, T2,
+      );
+      assert.equal(second.ok, true, JSON.stringify(second));
+      const d = assoc(second);
+      assert.equal(d["edgesWritten"], 0);
+      assert.equal(d["edgesRemoved"], 1);
+      const keys = new Set(edgeRows(ctx.db).map((e) => `${e.a}:${e.b}`));
+      assert.ok(keys.has(pair(a, b)), JSON.stringify([...keys]));
+      assert.ok(keys.has(pair(b, c)), JSON.stringify([...keys]));
+      assert.ok(!keys.has(pair(a, c)), "low-score edge removed by minScore");
+      const after = scopeState(ctx.db);
+      assert.ok(after && after.fingerprint !== before.fingerprint);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("writes nothing when the scope is unchanged", async () => {
+    const ctx = setup({ batchMax: 50, topK: 5 });
+    try {
+      remember(ctx.db, ctx.config, "stable alpha", "st-a", T1);
+      remember(ctx.db, ctx.config, "stable beta", "st-b", T2);
+      const embed = fakeEmbed(
+        keyed([
+          ["stable alpha", vecAngle(0)],
+          ["stable beta", vecAngle(20)],
+        ]),
+      );
+      const first = await maintainAssociate(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: SCOPE },
+        "assoc-stable-1", embed, T2,
+      );
+      assert.equal(assoc(first)["edgesWritten"], 1);
+      const before = scopeState(ctx.db);
+      assert.ok(before);
+
+      const second = await maintainAssociate(
+        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: SCOPE },
+        "assoc-stable-2", embed, T2,
+      );
+      assert.equal(second.ok, true, JSON.stringify(second));
+      const d = assoc(second);
+      assert.equal(d["edgesWritten"], 0);
+      assert.equal(d["edgesRemoved"], 0);
+      assert.equal(d["embedded"], 0);
+      assert.equal(d["scanned"], 0);
+      const after = scopeState(ctx.db);
+      assert.deepEqual(after, before, "fingerprint and computedAt unchanged");
     } finally {
       ctx.cleanup();
     }
@@ -829,7 +989,6 @@ describe("topic.set / topic.pending / tag precedence", () => {
       assert.equal(assoc(first)["embedded"], 1);
       assert.equal(assoc(first)["scanned"], 1);
       assert.deepEqual(vecIds(ctx.db), [a]);
-      assert.deepEqual(stateIds(ctx.db), [a]);
 
       const set = topicSet(
         ctx.db, ctx.config,
@@ -839,9 +998,9 @@ describe("topic.set / topic.pending / tag precedence", () => {
       assert.equal(set.ok, true, JSON.stringify(set));
       const topic = (set.data as { topic: { origin: string } }).topic;
       assert.equal(topic.origin, "external");
-      // Derived caches are invalidated immediately.
+      // The derived vector is invalidated immediately; the scope fingerprint
+      // now covers a different (empty) embedded set.
       assert.equal(vecIds(ctx.db).length, 0);
-      assert.equal(stateIds(ctx.db).length, 0);
 
       const second = await maintainAssociate(
         ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: SCOPE },
@@ -852,7 +1011,6 @@ describe("topic.set / topic.pending / tag precedence", () => {
       assert.equal(d["embedded"], 1);
       assert.equal(d["scanned"], 1);
       assert.deepEqual(vecIds(ctx.db), [a]);
-      assert.deepEqual(stateIds(ctx.db), [a]);
       const rows = topicRows(ctx.db);
       assert.deepEqual(rows.map((r) => `${r.topic}:${r.origin}`), ["仕事:external"]);
     } finally {
@@ -1037,18 +1195,43 @@ describe("associate schema is versioned, not per-open", () => {
       const cfgPath = path.join(ctx.dir, "memory.config.json");
       ctx.db.exec(`DROP TABLE similar_edges`);
       ctx.db.exec(`DROP TABLE associate_state`);
+      ctx.db.exec(`DROP TABLE associate_scope_state`);
       ctx.db.exec(`DROP TABLE record_topics`);
       ctx.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION_4}`);
       ctx.db.close();
       const reopened = initDb(ctx.config, cfgPath);
       const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
       assert.equal(uv, SCHEMA_VERSION);
-      for (const table of ["similar_edges", "associate_state", "record_topics"]) {
+      for (const table of ["similar_edges", "associate_state", "associate_scope_state", "record_topics"]) {
         const row = reopened.db
           .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = ?`)
           .get(table) as { found: number } | undefined;
         assert.ok(row, `${table} created by the versioned migration`);
       }
+      reopened.db.close();
+    } finally {
+      try { ctx.db.close(); } catch { /* already closed */ }
+      fs.rmSync(ctx.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
+
+  it("a version-5 file gains associate_scope_state without touching canonical rows", () => {
+    const ctx = setup();
+    try {
+      const cfgPath = path.join(ctx.dir, "memory.config.json");
+      const a = remember(ctx.db, ctx.config, "v5 alpha", "v5-a", T1);
+      ctx.db.exec(`DROP TABLE associate_scope_state`);
+      ctx.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION_5}`);
+      ctx.db.close();
+      const reopened = initDb(ctx.config, cfgPath);
+      const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
+      assert.equal(uv, SCHEMA_VERSION);
+      const table = reopened.db
+        .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = 'associate_scope_state'`)
+        .get() as { found: number } | undefined;
+      assert.ok(table, "associate_scope_state created by the versioned migration");
+      const kept = reopened.db.prepare(`SELECT id FROM records WHERE id = ?`).get(a) as { id: string } | undefined;
+      assert.equal(kept?.id, a);
       reopened.db.close();
     } finally {
       try { ctx.db.close(); } catch { /* already closed */ }

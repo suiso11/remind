@@ -100,16 +100,19 @@ import {
  * was the original M1 stamp; 3 marks the serialized, span/episode-complete
  * schema; 4 adds record_topics.origin (tag/external/llm precedence); 5 adds
  * the derived association tables to the versioned migration (they are no
- * longer re-created on every open). Older 2-, 3-, and 4-stamped files are
+ * longer re-created on every open); 6 adds associate_scope_state, the
+ * whole-scope edge fingerprint. Older 2-, 3-, 4-, and 5-stamped files are
  * migrated in place (never refused).
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_3 = 3;
 /** Pre-association-schema stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_4 = 4;
+/** Per-record-edge-scan stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_5 = 5;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -384,12 +387,17 @@ function readSchemaVersion(db: DatabaseSync): number {
 /**
  * P3 derived association layer (rebuildable; never canonical).
  *
- * similar_edges stores the top-K semantic neighbours of each record. The
- * unordered pair is canonicalized by CHECK(a < b), so a bidirectional match
- * is one row. associate_state records which bodyHash was last scanned for a
- * record; a missing/mismatched row means "dirty" and the next maintain.associate
- * recomputes that record's incident edges. Both tables can be dropped at any
- * time; canonical `record_links` remain caller-authored and untouched.
+ * similar_edges stores the union, over every active embedded record, of that
+ * record's top-K semantic neighbours. The unordered pair is canonicalized by
+ * CHECK(a < b), so a bidirectional match is one row (with the max score).
+ * associate_scope_state stores one fingerprint per scope: a hash of the edge
+ * settings, the model id, and the sorted (recordId, embedding-input hash) of
+ * every active embedded record. When the fingerprint differs, the next
+ * maintain.associate recomputes the WHOLE scope edge set in one transaction.
+ * associate_state is the legacy per-record scan marker; it is retained for
+ * compatibility but no longer read or written. All of these tables are
+ * derived and can be dropped at any time; canonical `record_links` remain
+ * caller-authored and untouched.
  *
  * Runs once inside the versioned migration lock; it is NOT called on the
  * already-current fast path (every DDL/PRAGMA here would otherwise be paid on
@@ -405,10 +413,16 @@ export function ensureAssociateSchema(db: DatabaseSync): void {
     PRIMARY KEY(scope, a, b),
     CHECK(a < b))`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_similar_edges_b ON similar_edges(scope, b)`);
+  // Legacy per-record scan marker (kept for compatibility; unused now that
+  // edge validity is tracked by the whole-scope fingerprint below).
   db.exec(`CREATE TABLE IF NOT EXISTS associate_state(
     recordId TEXT PRIMARY KEY,
     bodyHash TEXT NOT NULL,
     scannedAt TEXT NOT NULL)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS associate_scope_state(
+    scope TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    computedAt TEXT NOT NULL)`);
   // Topics for the current record body. Derived and rebuildable; a row's
   // bodyHash must match records.bodyHash to be considered current. Origin
   // records precedence metadata: canonical tags > external (topic.set) > llm.
