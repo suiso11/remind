@@ -93,6 +93,19 @@ export function llmBackend(config: AppConfig): LlmBackend {
 }
 
 /**
+ * Model identity to report in maintenance responses. ONNX keeps the pinned
+ * repo id + revision (unchanged contract). OpenAI-compatible reports the
+ * operator-configured model name and no revision, because that backend's
+ * weights are not resolved by this process (the local server owns them).
+ */
+export function activeModelLabel(config: AppConfig): { model: string; revision: string | null } {
+  if (llmBackend(config) === "openai") {
+    return { model: config.llm?.model ?? LLM_MODEL_ID, revision: null };
+  }
+  return { model: LLM_MODEL_ID, revision: LLM_MODEL_REVISION };
+}
+
+/**
  * True when maintenance may call the configured backend. ONNX needs the
  * pinned files on disk; OpenAI-compatible needs no files, only an enabled
  * section with a valid loopback baseUrl (config load already enforces it,

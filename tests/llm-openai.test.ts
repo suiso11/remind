@@ -460,9 +460,13 @@ describe("openai backend maintenance flows", () => {
             DRAIN_NOW,
           );
           assert.equal(res.ok, true, JSON.stringify(res));
-          const d = (res.data as { distill: { reviewed: number; applied: number } }).distill;
+          const d = (res.data as {
+            distill: { reviewed: number; applied: number; model: string; revision: string | null };
+          }).distill;
           assert.equal(d.reviewed, 1);
           assert.equal(d.applied, 1);
+          assert.equal(d.model, "ornith-test");
+          assert.equal(d.revision, null);
           const got = getRecord(ctx.db, ctx.config, { id, scope: SCOPE });
           assert.equal((got.data as { record: { status: string } }).record.status, "retired");
           assert.ok(requests.length >= 1);
@@ -474,6 +478,50 @@ describe("openai backend maintenance flows", () => {
       },
     );
     resetLlmRuntime();
+  });
+
+  it("reports the configured openai model (not the pinned onnx label) in distill responses", async () => {
+    const ctx = setup(openAiLlm("http://127.0.0.1:1"));
+    try {
+      // Empty queue (non-degraded fast path).
+      const empty = await maintainDistill(
+        ctx.db,
+        ctx.config,
+        ctx.configPath,
+        { scope: SCOPE, limit: 5 },
+        "openai-label-empty",
+        undefined,
+        DRAIN_NOW,
+      );
+      assert.equal(empty.ok, true, JSON.stringify(empty));
+      const emptyDistill = (empty.data as {
+        distill: { model: string; revision: string | null; degraded: boolean };
+      }).distill;
+      assert.equal(emptyDistill.degraded, false);
+      assert.equal(emptyDistill.model, "ornith-test");
+      assert.equal(emptyDistill.revision, null);
+
+      // Degraded (unusable config) path reports the same configured identity.
+      ctx.config.llm = openAiLlm("http://example.com:8080");
+      const degraded = await maintainDistill(
+        ctx.db,
+        ctx.config,
+        ctx.configPath,
+        { scope: SCOPE, limit: 5 },
+        "openai-label-degraded",
+        undefined,
+        DRAIN_NOW,
+      );
+      assert.equal(degraded.ok, true, JSON.stringify(degraded));
+      const degradedDistill = (degraded.data as {
+        distill: { model: string; revision: string | null; degraded: boolean };
+      }).distill;
+      assert.equal(degradedDistill.degraded, true);
+      assert.equal(degradedDistill.model, "ornith-test");
+      assert.equal(degradedDistill.revision, null);
+    } finally {
+      ctx.cleanup();
+    }
   });
 
   it("runs maintain.episodes end-to-end through the server", async () => {
