@@ -33,12 +33,13 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AppConfig } from "./config.js";
+import type { AppConfig, LlmBackend } from "./config.js";
 import {
   LLM_DEFAULT_MAX_NEW_TOKENS,
   LLM_DEFAULT_MAX_PROMPT_CHARS,
   LLM_DEFAULT_MODEL_DIR,
   LLM_DEFAULT_TIMEOUT_MS,
+  isLoopbackHttpUrl,
   resolveConfigDirPath,
 } from "./config.js";
 import { containsLoneSurrogateDeep, countCp, hasControl } from "./normalize.js";
@@ -84,6 +85,26 @@ export function llmMaxPromptChars(config: AppConfig): number {
 /** True only when the operator explicitly enabled the llm section. Absent => false (fast, no model). */
 export function llmEnabled(config: AppConfig): boolean {
   return config.llm?.enabled === true;
+}
+
+/** Selected maintenance runtime; absent => "onnx" (existing behavior). */
+export function llmBackend(config: AppConfig): LlmBackend {
+  return config.llm?.backend === "openai" ? "openai" : "onnx";
+}
+
+/**
+ * True when maintenance may call the configured backend. ONNX needs the
+ * pinned files on disk; OpenAI-compatible needs no files, only an enabled
+ * section with a valid loopback baseUrl (config load already enforces it,
+ * but programmatic configs are re-checked here).
+ */
+export function llmUsable(config: AppConfig, modelDir: string): boolean {
+  if (!llmEnabled(config)) return false;
+  if (llmBackend(config) === "openai") {
+    return isLoopbackHttpUrl(config.llm?.baseUrl) && typeof config.llm?.model === "string" &&
+      config.llm.model.length > 0;
+  }
+  return modelFilesPresent(modelDir);
 }
 
 interface LlmManifestFile {
@@ -204,19 +225,166 @@ function generatedTextOf(out: unknown): string | null {
   }
 }
 
+/* ---------------- OpenAI-compatible loopback backend ---------------- */
+
+export type ChatRole = "system" | "user" | "assistant";
+export interface ChatMessage {
+  role: ChatRole;
+  content: string;
+}
+export interface ChatMlConversion {
+  messages: ChatMessage[];
+  /** Non-empty trailing assistant content (ChatML prefill). */
+  prefill: string;
+}
+
+/**
+ * Convert the existing ChatML prompt strings into OpenAI chat messages.
+ * A trailing, unterminated assistant turn is an assistant prefill: it is sent
+ * as a final assistant message (llama.cpp continuation) and echoed back to the
+ * caller only when the server includes it in `message.content`. Returns null
+ * for malformed role lines or a non-assistant open turn; the caller degrades.
+ */
+export function chatMlToMessages(prompt: string): ChatMlConversion | null {
+  const START = "<|im_start|>";
+  const END = "<|im_end|>";
+  const messages: ChatMessage[] = [];
+  let prefill = "";
+  let pos = 0;
+  while (pos < prompt.length) {
+    const start = prompt.indexOf(START, pos);
+    if (start < 0) break;
+    const roleStart = start + START.length;
+    const nl = prompt.indexOf("\n", roleStart);
+    if (nl < 0) return null;
+    const role = prompt.slice(roleStart, nl);
+    if (role !== "system" && role !== "user" && role !== "assistant") return null;
+    const contentStart = nl + 1;
+    const end = prompt.indexOf(END, contentStart);
+    if (end < 0) {
+      if (role !== "assistant") return null;
+      prefill = prompt.slice(contentStart);
+      pos = prompt.length;
+      break;
+    }
+    messages.push({ role, content: prompt.slice(contentStart, end) });
+    pos = end + END.length;
+  }
+  if (messages.length === 0) return null;
+  if (prefill.length > 0) messages.push({ role: "assistant", content: prefill });
+  return { messages, prefill };
+}
+
+/** Remove any complete think block from model output. */
+export function stripThinkingBlocks(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>\s*/gi, "").trim();
+}
+
+/** baseUrl (origin or origin/v1) -> OpenAI chat completions endpoint. */
+export function openAiChatCompletionsUrl(baseUrl: string): string {
+  const u = new URL(baseUrl);
+  const p = u.pathname.replace(/\/+$/, "");
+  return `${u.origin}${p === "" ? "/v1" : p}/chat/completions`;
+}
+
+async function generateOpenAiCompletion(
+  prompt: string,
+  opts: { timeoutMs: number; maxNewTokens: number; config?: AppConfig },
+): Promise<string | null> {
+  const config = opts.config;
+  const l = config?.llm;
+  if (!config || !l || llmBackend(config) !== "openai") return null;
+  if (!isLoopbackHttpUrl(l.baseUrl) || typeof l.model !== "string" || l.model.length === 0) {
+    return null;
+  }
+  const conv = chatMlToMessages(prompt);
+  if (!conv) return null;
+  const poisonKey = `openai:${l.baseUrl}`;
+  if (poisonedDir !== null && poisonedDir === poisonKey) return null;
+
+  const disableThinking = l.disableThinking !== false;
+  const request: Record<string, unknown> = {
+    model: l.model,
+    messages: conv.messages,
+    temperature: 0,
+    max_tokens: opts.maxNewTokens,
+    seed: 0,
+    stream: false,
+  };
+  if (disableThinking) request["chat_template_kwargs"] = { enable_thinking: false };
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json",
+  };
+  if (l.apiKeyEnv) {
+    const token = process.env[l.apiKeyEnv];
+    if (token) headers["authorization"] = `Bearer ${token}`;
+  }
+
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const ctrl = new AbortController();
+  timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, Math.max(1, opts.timeoutMs));
+  (timer as unknown as { unref?: () => void }).unref?.();
+  try {
+    const res = await fetch(openAiChatCompletionsUrl(l.baseUrl), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(request),
+      signal: ctrl.signal,
+      // A loopback server must not be able to redirect the request to a
+      // non-loopback host; refuse redirects instead of following them.
+      redirect: "error",
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      choices?: Array<{ message?: { content?: unknown } }>;
+    };
+    const raw = json?.choices?.[0]?.message?.content;
+    if (typeof raw !== "string" || raw.length === 0) return null;
+    let text = disableThinking ? stripThinkingBlocks(raw) : raw;
+    // llama.cpp returns only the continuation for a final assistant message,
+    // but some servers echo the prefill. Callers (episodes) strip 要約： as
+    // well; removing it here keeps both server behaviors equivalent to ONNX.
+    if (conv.prefill.length > 0 && text.startsWith(conv.prefill)) {
+      text = text.slice(conv.prefill.length);
+    }
+    if (text.length === 0) return null;
+    if (containsLoneSurrogateDeep(text) || hasControl(text.replace(/\n/g, ""))) return null;
+    return text;
+  } catch {
+    // Only a timeout poisons the backend (same ownership rule as ONNX); an
+    // ordinary network/HTTP error is retryable on the next call.
+    if (timedOut) poisonedDir = poisonKey;
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * Generate a greedy (deterministic) completion with the pinned local model.
  * Offline only. Resolves null on ANY failure (disabled/missing model,
  * timeout, bad output): callers degrade to keep/retry without state change.
  * Never throws for model reasons.
+ *
+ * With opts.config.llm.backend === "openai", dispatch to a loopback-only
+ * OpenAI-compatible server instead of loading ONNX files.
  */
 export async function generateCompletion(
   prompt: string,
   modelDir: string,
-  opts: { timeoutMs: number; maxNewTokens: number },
+  opts: { timeoutMs: number; maxNewTokens: number; config?: AppConfig },
 ): Promise<string | null> {
   try {
     if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 8000) return null;
+    if (opts.config && llmBackend(opts.config) === "openai") {
+      return await generateOpenAiCompletion(prompt, opts);
+    }
     if (!modelFilesPresent(modelDir)) return null;
     // Refuse to start new model work after a timeout for this dir (poison):
     // the timed-out load/generation is still running uncancelled, so piling
