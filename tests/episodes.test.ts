@@ -15,7 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 import { countCp, type AppConfig, type EpisodesConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
 import { normalizeBody } from "../src/normalize.js";
-import { correctRecord, eventAppend, getRecord, recordSources } from "../src/store.js";
+import { correctRecord, eventAppend, getRecord, recordSources, retireRecord } from "../src/store.js";
 import { listEpisodes } from "../src/store.js";
 import {
   EPISODE_FOLD_MAX,
@@ -253,6 +253,8 @@ interface WindowsItem {
   recordId: string;
   eventId: string;
   span: { start: number; end: number };
+  /** Explicit ledger marker; tags may be absent when tagsMax is small. */
+  verbatim?: boolean;
   snippet: string;
   truncated: boolean;
 }
@@ -1702,6 +1704,303 @@ describe("maintain.episodes privacy propagation and verification budgets", () =>
         .get() as unknown as { n: number };
       assert.equal(done.n, 0);
       assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, true);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("PR #26 round 5 follow-ups", () => {
+  it("falls back to a verbatim window when normalization exceeds bodyMaxCp", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds({ windowMaxCp: 1200 });
+      ctx.config.limits.bodyMaxCp = 200;
+      const body = "…".repeat(100); // raw 100cp, normalizeBody -> 300cp
+      append(ctx, { eventId: "ev-normalize-overflow", body, observedAt: T0, createdAt: T0 });
+
+      const run = episodeData(
+        await maintain(
+          ctx,
+          "ep-normalize-overflow-1",
+          makeGen({ windowText: "…".repeat(100) }),
+          RUN1,
+        ),
+      );
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsWritten, 0);
+      assert.equal(ep.windowsVerbatim, 1);
+      assert.equal(ep.windowsRejected, 1);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const rows = windowRows(ctx);
+      assert.equal(rows.length, 1);
+      assert.deepEqual([rows[0]!.spanStart, rows[0]!.spanEnd], [0, 100]);
+      const w = rec(ctx, rows[0]!.recordId);
+      assert.notEqual(w.body, "…".repeat(100));
+      assert.ok(w.tags.includes(EPISODE_WINDOW_VERBATIM_TAG));
+      assert.ok(countCp(w.body) <= 200);
+      assert.ok(countCp(normalizeBody(w.body)) <= 200);
+      const ledger = ctx.db
+        .prepare(`SELECT verbatim FROM episode_summaries WHERE recordId = ?`)
+        .get(rows[0]!.recordId) as { verbatim: number };
+      assert.equal(ledger.verbatim, 1);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("bounds window tags by tagsMax 1 and identifies verbatim from the ledger", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      ctx.config.limits.tagsMax = 1;
+      append(ctx, {
+        eventId: "ev-tags-one",
+        body: "Tanaka repaired the table.",
+        observedAt: T0,
+        createdAt: T0,
+      });
+
+      const run = episodeData(
+        await maintain(ctx, "ep-tags-one", makeGen({ rejectText: "Tanaka" }), RUN1),
+      );
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsVerbatim, 1);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const row = windowRows(ctx)[0]!;
+      const w = rec(ctx, row.recordId);
+      assert.deepEqual(w.tags, [EPISODE_WINDOW_TAG]);
+      assert.deepEqual(rec(ctx, ep.episodeRecordId as string).tags, ["episode"]);
+
+      // episode.windows carries the explicit ledger marker even though the
+      // verbatim tag was dropped by the tag budget.
+      const listed = windows(ctx, { scope: SCOPE, kind: "session", episodeKey: "s1" });
+      assert.equal(listed.items.length, 1);
+      assert.equal(listed.items[0]!.recordId, row.recordId);
+      assert.equal(listed.items[0]!.verbatim, true);
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("writes windows and episode records with no tags when tagsMax is 0", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      ctx.config.limits.tagsMax = 0;
+      append(ctx, { eventId: "ev-tags-zero", body: "alpha one", observedAt: T0, createdAt: T0 });
+
+      const run = episodeData(await maintain(ctx, "ep-tags-zero", makeGen(), RUN1));
+      const ep = run.episodes[0]!;
+      assert.equal(ep.windowsWritten, 1);
+      assert.notEqual(ep.episodeRecordId, null);
+
+      const row = windowRows(ctx)[0]!;
+      assert.deepEqual(rec(ctx, row.recordId).tags, []);
+      assert.deepEqual(rec(ctx, ep.episodeRecordId as string).tags, []);
+      const listed = windows(ctx, { scope: SCOPE, kind: "session", episodeKey: "s1" });
+      assert.equal(listed.items.length, 1);
+      assert.equal(listed.items[0]!.recordId, row.recordId);
+      assert.equal(listed.items[0]!.verbatim, false);
+      const listData = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.equal(listData.items[0]!.stale, false);
+      assert.deepEqual(listData.items[0]!.summaryRecordIds, [ep.episodeRecordId]);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("creates a new episode generation after the prior summary was retired", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      append(ctx, { eventId: "ev-gen-1", body: "alpha one", observedAt: T0, createdAt: T0 });
+
+      const run1 = episodeData(await maintain(ctx, "ep-gen-1", makeGen(), RUN1));
+      const firstId = run1.episodes[0]!.episodeRecordId as string;
+      assert.notEqual(firstId, null);
+
+      const retired = retireRecord(
+        ctx.db,
+        ctx.config,
+        { id: firstId, scope: SCOPE, reasonCode: "OUTDATED" },
+        "retire-ep-gen-1",
+        RUN1,
+      );
+      assert.equal(retired.ok, true, JSON.stringify(retired));
+      assert.equal(rec(ctx, firstId).status, "retired");
+
+      append(ctx, { eventId: "ev-gen-2", body: "beta two", observedAt: T1, createdAt: T1 });
+      const run2 = episodeData(await maintain(ctx, "ep-gen-2", makeGen(), RUN2));
+      const secondId = run2.episodes[0]!.episodeRecordId as string;
+      assert.notEqual(secondId, null);
+      assert.notEqual(secondId, firstId);
+      assert.equal(rec(ctx, secondId).status, "active");
+      assert.equal(rec(ctx, firstId).status, "retired");
+
+      const listed = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.equal(listed.items[0]!.stale, false);
+      assert.deepEqual(listed.items[0]!.summaryRecordIds, [secondId]);
+
+      // Retrying the same (already folded) generation adds nothing.
+      const before = stateCounts(ctx);
+      const run3 = episodeData(await maintain(ctx, "ep-gen-3", makeGen(), RUN2));
+      assert.deepEqual(run3.episodes, []);
+      assert.equal(run3.applied, 0);
+      assert.deepEqual(stateCounts(ctx), before);
+      assert.deepEqual(
+        list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.summaryRecordIds,
+        [secondId],
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("PR #27 review follow-ups", () => {
+  it("backfills episode_summaries.verbatim from legacy episode-window-verbatim tags on init", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "episodes-verbatim-backfill-"));
+    const { config, configPath } = baseConfig(dir);
+    try {
+      const legacy = new DatabaseSync(config.dbPath);
+      try {
+        legacy.exec(`CREATE TABLE scopes(scope TEXT PRIMARY KEY)`);
+        legacy.prepare(`INSERT INTO scopes(scope) VALUES (?)`).run(SCOPE);
+        legacy.exec(`CREATE TABLE raw_events(
+          eventId TEXT PRIMARY KEY, sessionId TEXT NOT NULL, turnId TEXT NOT NULL,
+          body TEXT NOT NULL, bodyNorm TEXT NOT NULL,
+          source TEXT NOT NULL, observedAt TEXT NOT NULL,
+          scope TEXT NOT NULL, runId TEXT NULL, createdAt TEXT NOT NULL)`);
+        legacy.exec(`CREATE TABLE records(
+          id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyNorm TEXT NOT NULL, bodyHash TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','summary','correction')),
+          source TEXT NOT NULL, observedAt TEXT NOT NULL, scope TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('active','superseded','archived','retired')),
+          supersedes TEXT NULL, revision INTEGER NOT NULL, createdAt TEXT NOT NULL)`);
+        legacy.exec(`CREATE TABLE record_tags(
+          recordId TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(recordId, tag))`);
+        // Pre-verbatim-column ledger: only tags identify the fallback window.
+        legacy.exec(`CREATE TABLE episode_summaries(
+          scope TEXT, kind TEXT CHECK(kind IN ('session','doc','day')),
+          episodeKey TEXT, level TEXT CHECK(level IN ('window','episode')),
+          recordId TEXT, eventId TEXT NULL, spanStart INTEGER NULL, spanEnd INTEGER NULL,
+          coveredThrough TEXT NULL, foldedRecordIds TEXT NULL, createdAt TEXT,
+          PRIMARY KEY(scope, kind, episodeKey, recordId))`);
+        legacy.prepare(
+          `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt)
+           VALUES ('e-legacy-verbatim', 's1', 't1', 'legacy verbatim window', 'legacy verbatim window',
+                   'session:s1:turn:1', ?, ?, NULL, ?)`,
+        ).run(T0, SCOPE, T0);
+        legacy.prepare(
+          `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
+           VALUES ('rec-legacy-verbatim', 'legacy verbatim window', 'legacy verbatim window',
+                   'sha256:legacy-verbatim', 'summary', 'cultivation:llm-derived-episode',
+                   ?, ?, 'active', NULL, 1, ?)`,
+        ).run(T0, SCOPE, T0);
+        legacy.prepare(
+          `INSERT INTO record_tags(recordId, tag) VALUES ('rec-legacy-verbatim', ?)`,
+        ).run(EPISODE_WINDOW_VERBATIM_TAG);
+        legacy.prepare(
+          `INSERT INTO episode_summaries(scope, kind, episodeKey, level, recordId, eventId,
+             spanStart, spanEnd, coveredThrough, foldedRecordIds, createdAt)
+           VALUES (?, 'session', 's1', 'window', 'rec-legacy-verbatim', 'e-legacy-verbatim',
+                   0, 21, NULL, NULL, ?)`,
+        ).run(SCOPE, T0);
+        legacy.exec(`PRAGMA user_version = 2`);
+      } finally {
+        legacy.close();
+      }
+
+      const { db } = initDb(config, configPath);
+      try {
+        const listed = okData<WindowsData>(
+          episodeWindows(db, config, { scope: SCOPE, kind: "session", episodeKey: "s1" }),
+        );
+        assert.equal(listed.items.length, 1);
+        assert.equal(listed.items[0]!.recordId, "rec-legacy-verbatim");
+        assert.equal(listed.items[0]!.verbatim, true);
+      } finally {
+        db.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds raw and normalized code points of joined cited sentences (decomposed é)", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds({ windowMaxCp: 20 });
+      ctx.config.limits.bodyMaxCp = 200;
+      // Raw 200 cp, normalized 100 cp: two folds of window text.
+      const decomposed = "e\u0301".repeat(100);
+      append(ctx, {
+        eventId: "ev-decomposed-kept",
+        body: decomposed,
+        observedAt: T0,
+        createdAt: T0,
+      });
+      const sentence = "e\u0301".repeat(45); // raw 90 cp, normalized 45 cp
+      const run = episodeData(
+        await maintain(
+          ctx,
+          "ep-decomposed-kept-1",
+          makeGen({
+            windowText: "w s",
+            reduceText: `${sentence} [1]. ${sentence} [1].`,
+          }),
+          RUN1,
+        ),
+      );
+      const ep = run.episodes[0]!;
+      assert.ok(ep.windowsWritten > EPISODE_FOLD_MAX); // two folds
+      assert.equal(ep.extractive, false);
+      assert.notEqual(ep.episodeRecordId, null, JSON.stringify(ep));
+      const body = rec(ctx, ep.episodeRecordId as string).body;
+      assert.ok(countCp(body) <= 200, `raw ${countCp(body)} > 200`);
+      assert.ok(countCp(normalizeBody(body)) <= 200, "normalized body > 200");
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("bounds raw and normalized code points of the extractive fallback (decomposed é)", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds({ windowMaxCp: 20 });
+      ctx.config.limits.bodyMaxCp = 200;
+      const decomposed = "e\u0301".repeat(100); // raw 200 cp, normalized 100 cp
+      append(ctx, {
+        eventId: "ev-decomposed-extractive",
+        body: decomposed,
+        observedAt: T0,
+        createdAt: T0,
+      });
+      const run = episodeData(
+        await maintain(
+          ctx,
+          "ep-decomposed-extractive-1",
+          makeGen({
+            windowText: "e\u0301".repeat(50), // raw 100 cp per window
+            reduceText: "Ghost fact [1].",
+          }),
+          RUN1,
+        ),
+      );
+      const ep = run.episodes[0]!;
+      assert.ok(ep.windowsWritten > EPISODE_FOLD_MAX); // two folds
+      assert.equal(ep.extractive, true);
+      assert.notEqual(ep.episodeRecordId, null);
+      const body = rec(ctx, ep.episodeRecordId as string).body;
+      assert.ok(countCp(body) <= 200, `raw ${countCp(body)} > 200`);
+      assert.ok(countCp(normalizeBody(body)) <= 200, "normalized body > 200");
+      assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
     } finally {
       ctx.cleanup();
     }

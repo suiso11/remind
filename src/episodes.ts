@@ -47,7 +47,7 @@ import {
   parseSummaryBody,
   resolveLlmDir,
 } from "./llm.js";
-import { canonicalTime, countCp, hasControl, requestHashFor } from "./normalize.js";
+import { canonicalTime, countCp, hasControl, normalizeBody, requestHashFor } from "./normalize.js";
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
 import { clipTextToNormalizedCp, splitTextRanges } from "./split.js";
 import type { SourceRef } from "./sourceref.js";
@@ -73,6 +73,15 @@ export const EPISODE_WINDOW_VERBATIM_TAG = "episode-window-verbatim";
 export const EPISODE_TAG = "episode";
 /** A single merge prompt folds at most this many inputs. */
 export const EPISODE_FOLD_MAX = 5;
+
+/**
+ * Caller-side tag budget: keep priority order (primary tag first, marker
+ * second) and slice to tagsMax. The canonical store rejects an over-budget
+ * tag list outright, which must never make a verified window unwritable.
+ */
+function boundTags(tags: string[], max: number): string[] {
+  return tags.slice(0, Math.max(0, max));
+}
 
 const EPISODE_KINDS = new Set<string>(["session", "doc", "day"]);
 
@@ -1172,6 +1181,7 @@ function writeWindowRecord(
   spanEnd: number,
   body: string,
   tags: string[],
+  verbatim: boolean,
   privacy: PrivacyMetadata | null,
   now: string,
   fence: CanonicalWriteFence,
@@ -1191,6 +1201,7 @@ function writeWindowRecord(
       spanStart,
       spanEnd,
       coveredThrough: null,
+      verbatim,
       createdAt: now,
     });
     if (markEventDone) {
@@ -1470,6 +1481,16 @@ export async function maintainEpisodes(
             // parse/anchor checks.
             summaryBody = parseSummaryBody(stripSummaryCue(summaryBody), config.limits.bodyMaxCp);
           }
+          if (
+            summaryBody !== null &&
+            countCp(normalizeBody(summaryBody)) > config.limits.bodyMaxCp
+          ) {
+            // NFKC/whitespace normalization can expand the body (e.g. "…" ->
+            // "..."). parseSummaryBody only bounds the raw length, so check the
+            // exact form rememberRecord will validate: an over-long normalized
+            // body is a content rejection, never an unwritable accepted window.
+            summaryBody = null;
+          }
           // Content rejections (parse failure, anchor miss, verifier NO) still
           // get a window record, but as raw verbatim text: the episode must be
           // able to advance instead of being retried into permanent staleness.
@@ -1518,10 +1539,13 @@ export async function maintainEpisodes(
           if (contentRejected) {
             windowsRejected++;
             windowBody = verbatimWindowBody(windowText, config.limits.bodyMaxCp);
-            windowTags = [EPISODE_WINDOW_TAG, EPISODE_WINDOW_VERBATIM_TAG];
+            windowTags = boundTags(
+              [EPISODE_WINDOW_TAG, EPISODE_WINDOW_VERBATIM_TAG],
+              config.limits.tagsMax,
+            );
           } else {
             windowBody = summaryBody as string;
-            windowTags = [EPISODE_WINDOW_TAG];
+            windowTags = boundTags([EPISODE_WINDOW_TAG], config.limits.tagsMax);
           }
           if (windowBody.length === 0) {
             eventOk = false;
@@ -1553,6 +1577,7 @@ export async function maintainEpisodes(
             range.end,
             windowBody,
             windowTags,
+            contentRejected,
             eventPrivacy,
             nowValid,
             { owner: execOwner, now: writeFenceNow },
@@ -1703,21 +1728,43 @@ export async function maintainEpisodes(
         let finalSummary: string | null = null;
         let citedWindows: EpisodeWindow[] = [];
         if (reduceOk && !aborted) {
+          // The joined body must satisfy BOTH the raw code-point budget and
+          // the normalized body budget, separators included: NFKC can compose
+          // decomposed input (e + U+0301 -> é), so normalized length alone can
+          // hide a raw body that rememberRecord/correctRecord reject.
+          const addPart = (
+            parts: string[],
+            budgets: { raw: number; norm: number },
+            text: string,
+          ): boolean => {
+            const sep = parts.length === 0 ? 0 : 1;
+            const rawCp = countCp(text);
+            const normCp = countCp(normalizeBody(text));
+            if (
+              budgets.raw + sep + rawCp > bodyMaxCp ||
+              budgets.norm + sep + normCp > bodyMaxCp
+            ) {
+              return false;
+            }
+            parts.push(text);
+            budgets.raw += sep + rawCp;
+            budgets.norm += sep + normCp;
+            return true;
+          };
           if (kept.length > 0) {
             const parts: string[] = [];
-            let used = 0;
+            const budgets = { raw: 0, norm: 0 };
             let included = 0;
             for (const k of kept) {
-              const text = clipCp(k.text, bodyMaxCp);
-              const sep = parts.length === 0 ? 0 : 1;
+              // Bound the exact raw and normalized body rememberRecord /
+              // correctRecord will validate.
+              const text = clipTextToNormalizedCp(k.text, bodyMaxCp);
               // Stop at the first sentence that would push the episode body
-              // over bodyMaxCp instead of skipping ahead out of order.
-              if (used + sep + cpLen(text) > bodyMaxCp) {
+              // over either budget instead of skipping ahead out of order.
+              if (!addPart(parts, budgets, text)) {
                 sentencesDropped += kept.length - included;
                 break;
               }
-              parts.push(text);
-              used += sep + cpLen(text);
               citedWindows.push(...k.windows);
               included++;
             }
@@ -1728,13 +1775,10 @@ export async function maintainEpisodes(
             // window summaries in order. This still counts as a successful
             // reduce, so the episode is no longer stale.
             const parts: string[] = [];
-            let used = 0;
+            const budgets = { raw: 0, norm: 0 };
             for (const w of allWindows) {
-              const text = clipCp(w.body, bodyMaxCp);
-              const sep = parts.length === 0 ? 0 : 1;
-              if (parts.length > 0 && used + sep + cpLen(text) > bodyMaxCp) break;
-              parts.push(text);
-              used += sep + cpLen(text);
+              const text = clipTextToNormalizedCp(w.body, bodyMaxCp);
+              if (!addPart(parts, budgets, text)) break;
             }
             finalSummary = parts.join(" ");
             citedWindows = allWindows;
@@ -1764,6 +1808,18 @@ export async function maintainEpisodes(
           // active window this reduce considered. It is written with the
           // episode ledger row in the canonical record's transaction.
           const folded = foldedWindowIds(allWindows);
+          // Creation key includes the input generation (sorted folded window
+          // ids + body), so regenerating the same verified text from NEW input
+          // is a new write. A retry of the same generation stays idempotent.
+          const generationKey = shaHex(
+            [
+              p.scope,
+              p.kind,
+              ep.episodeKey,
+              JSON.stringify([...folded].sort()),
+              finalSummary,
+            ].join("\u0000"),
+          ).slice(0, 48);
           const privacyParam = episodePrivacy !== null ? { privacy: episodePrivacy } : {};
           const effectiveCovered = maxDoneObservedAt(db, p.scope, p.kind, ep.episodeKey);
           const ledgerRow = (recordId: string) => ({
@@ -1790,8 +1846,8 @@ export async function maintainEpisodes(
           };
           let newRecordId: string | null = null;
           if (priorActive) {
-            const correctKey = `epe-${shaHex(
-              [p.scope, p.kind, ep.episodeKey, priorActive.recordId, finalSummary].join("\u0000"),
+            const correctKey = `epec-${shaHex(
+              [generationKey, priorActive.recordId].join("\u0000"),
             ).slice(0, 48)}`;
             const cr = correctRecord(
               db,
@@ -1839,9 +1895,7 @@ export async function maintainEpisodes(
               } else {
                 // Fallback consistent with existing rules: remember the new
                 // summary and archive the old one as OBSOLETE (no deletes).
-                const rememberKey = `eper-${shaHex(
-                  [p.scope, p.kind, ep.episodeKey, finalSummary].join("\u0000"),
-                ).slice(0, 48)}`;
+                const rememberKey = `eper-${generationKey}`;
                 const rr = rememberRecord(
                   db,
                   config,
@@ -1850,7 +1904,7 @@ export async function maintainEpisodes(
                     kind: "summary",
                     provenance,
                     scope: p.scope,
-                    tags: [EPISODE_TAG],
+                    tags: boundTags([EPISODE_TAG], config.limits.tagsMax),
                     links,
                     sourceRefs,
                     ...privacyParam,
@@ -1898,9 +1952,7 @@ export async function maintainEpisodes(
               }
             }
           } else {
-            const rememberKey = `epe-${shaHex(
-              [p.scope, p.kind, ep.episodeKey, finalSummary].join("\u0000"),
-            ).slice(0, 48)}`;
+            const rememberKey = `epe-${generationKey}`;
             const rr = rememberRecord(
               db,
               config,
@@ -1909,7 +1961,7 @@ export async function maintainEpisodes(
                 kind: "summary",
                 provenance,
                 scope: p.scope,
-                tags: [EPISODE_TAG],
+                tags: boundTags([EPISODE_TAG], config.limits.tagsMax),
                 links,
                 sourceRefs,
                 ...privacyParam,
@@ -2085,6 +2137,7 @@ export function episodeWindows(
     const args: Array<string | number> = [scope, nKind, episodeKey];
     let sql = `SELECT s.recordId AS recordId, s.eventId AS eventId,
                       s.spanStart AS spanStart, s.spanEnd AS spanEnd,
+                      s.verbatim AS verbatim,
                       r.body AS body, e.observedAt AS observedAt
                FROM episode_summaries s
                JOIN records r ON r.id = s.recordId AND r.status = 'active' AND r.scope = s.scope
@@ -2107,6 +2160,7 @@ export function episodeWindows(
       eventId: string;
       spanStart: number;
       spanEnd: number;
+      verbatim: number | null;
       body: string;
       observedAt: string;
     }>;
@@ -2117,6 +2171,9 @@ export function episodeWindows(
         recordId: r.recordId,
         eventId: r.eventId,
         span: { start: r.spanStart, end: r.spanEnd },
+        // Explicit mode from the ledger; never inferred from tags (which are
+        // bounded by tagsMax and may be absent).
+        verbatim: r.verbatim === 1,
         snippet,
         truncated,
       };

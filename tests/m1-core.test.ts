@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { constants, DatabaseSync } from "node:sqlite";
 import { loadConfig, type AppConfig } from "../src/config.js";
-import { initDb, M1_USER_VERSION } from "../src/db.js";
+import { initDb, M1_USER_VERSION, SCHEMA_VERSION } from "../src/db.js";
 import { bodyHashFor, normalizeBody } from "../src/normalize.js";
 import { ensureM1Schema, eventAppend, getRecord, listRecords, recallRecords, rememberRecord, hasLegacyApprovalSchema } from "../src/store.js";
 import { validateRequest, WRITE_OPS, READ_OPS } from "../src/protocol.js";
@@ -114,13 +114,14 @@ function rememberWithRef(
   return { recordId: (res.data as { record: { id: string } }).record.id };
 }
 
-describe("m1 schema: fresh v2 and legacy fail-fast", () => {
-  it("fresh init stamps user_version=2 with M1 tables and no legacy trace", () => {
+describe("m1 schema: fresh current version and legacy fail-fast", () => {
+  it("fresh init stamps the current user_version with M1 tables and no legacy trace", () => {
     const ctx = setup();
     try {
       const uv = (ctx.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
       assert.equal(uv, M1_USER_VERSION);
-      assert.equal(uv, 2);
+      assert.equal(uv, SCHEMA_VERSION);
+      assert.equal(uv, 3);
       for (const t of ["raw_events", "records", "operations", "audit", "exposures", "projection_queue"]) {
         const row = ctx.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(t) as
           | { name: string }

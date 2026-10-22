@@ -3,10 +3,17 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import { resolveDbPath } from "./config.js";
-import { ensureM1Schema, hasLegacyApprovalSchema } from "./store.js";
+import {
+  LEGACY_M1_USER_VERSION,
+  SCHEMA_VERSION,
+  ensureM1Schema,
+  hasLegacyApprovalSchema,
+} from "./store.js";
 
-/** Canonical M1 schema version. Fresh and compatible DBs carry exactly 2. */
-export const M1_USER_VERSION = 2;
+export { SCHEMA_VERSION } from "./store.js";
+
+/** Canonical schema version. Fresh and upgraded DBs carry exactly this value. */
+export const M1_USER_VERSION = SCHEMA_VERSION;
 
 /**
  * Fixed safe startup error for legacy approval-schema databases. Emitted on
@@ -43,7 +50,7 @@ function readUserVersion(db: DatabaseSync): number {
 /**
  * M1 SQLite foundation: open/create the DB file, set busy_timeout from
  * startup config, seed allowed scopes additively (never delete rows),
- * create the M1 v2 schema, stamp PRAGMA user_version=2.
+ * create the current additive schema, stamp PRAGMA user_version=SCHEMA_VERSION.
  *
  * Legacy approval-schema databases (candidates table, candidateId records,
  * or any unexpected user_version) FAIL STARTUP with the fixed legacy error
@@ -85,7 +92,9 @@ export function initDb(
     db.exec(`PRAGMA busy_timeout = ${busy};`);
 
     const uv = readUserVersion(db);
-    if (uv !== 0 && uv !== M1_USER_VERSION) {
+    // 0 = fresh; 2 = original M1 stamp (upgraded in place); SCHEMA_VERSION =
+    // already current. Anything else is an unrelated/legacy file.
+    if (uv !== 0 && uv !== LEGACY_M1_USER_VERSION && uv !== SCHEMA_VERSION) {
       throw new Error(LEGACY_DB_MESSAGE);
     }
     // Any trace of the old candidate/approval architecture is legacy,
@@ -111,20 +120,47 @@ export function initDb(
     // Persistent WAL mode only after the file is approved as M1-compatible,
     // so rejected legacy files are never mutated by startup.
     db.exec(`PRAGMA journal_mode = WAL;`);
-    const initialize = (): void => {
-      db.exec(`CREATE TABLE IF NOT EXISTS scopes(scope TEXT PRIMARY KEY)`);
+    const seedScopes = (ensureTable: boolean): void => {
+      if (ensureTable) {
+        db.exec(`CREATE TABLE IF NOT EXISTS scopes(scope TEXT PRIMARY KEY)`);
+      }
+      // Read first so the already-current fast path performs no write at all
+      // when the configured scopes are already present.
+      const existing = new Set(
+        (db.prepare(`SELECT scope FROM scopes`).all() as Array<{ scope: string }>).map(
+          (r) => r.scope,
+        ),
+      );
       const ins = db.prepare(`INSERT OR IGNORE INTO scopes(scope) VALUES (?)`);
-      for (const s of config.allowedScopes) ins.run(s);
+      for (const s of config.allowedScopes) {
+        if (!existing.has(s)) ins.run(s);
+      }
+    };
+    const initialize = (): void => {
+      seedScopes(true);
       // M1 canonical + derived tables. Additive only; never drops rows.
+      // ensureM1Schema composes with our outer transaction via savepoints.
       ensureM1Schema(db);
     };
-    if (uv === 0) {
-      // Fresh schema creation and its version stamp are one unit: an
-      // interrupted/failed DDL sequence remains a clean version-0 file.
+    if (uv === SCHEMA_VERSION) {
+      // Fast path: the schema is already current, so skip the write lock and
+      // every PRAGMA table_info inspection (scope seeding is read-only when
+      // the configured scopes already exist).
+      seedScopes(false);
+    } else {
+      // ONE write lock spans every inspection, ALTER/TABLE rebuild, index
+      // creation and the version stamp. A concurrent opener waits on
+      // busy_timeout instead of racing its stale table_info snapshot.
       db.exec("BEGIN IMMEDIATE");
       try {
-        initialize();
-        db.exec(`PRAGMA user_version = ${M1_USER_VERSION}`);
+        // Re-check under the lock: another opener may have finished the
+        // upgrade while this connection was waiting.
+        if (readUserVersion(db) === SCHEMA_VERSION) {
+          seedScopes(false);
+        } else {
+          initialize();
+          db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+        }
         db.exec("COMMIT");
       } catch (e) {
         try {
@@ -134,8 +170,6 @@ export function initDb(
         }
         throw e;
       }
-    } else {
-      initialize();
     }
   } catch (e) {
     try {

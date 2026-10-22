@@ -423,7 +423,12 @@ async function main(): Promise<void> {
     };
     let windowCount = 0;
     let windowChecks = 0;
-    const windowRecords: Array<{ recordId: string; eventId: string; kind: "doc" | "session" }> = [];
+    const windowRecords: Array<{
+      recordId: string;
+      eventId: string;
+      kind: "doc" | "session";
+      verbatim: boolean;
+    }> = [];
     for (const kind of ["doc", "session"] as const) {
       const key = kind === "doc" ? DOC_ID : SESSION;
       const r = cli(
@@ -441,7 +446,8 @@ async function main(): Promise<void> {
         const recordId = String(it["recordId"] ?? "");
         const eventId = String(it["eventId"] ?? "");
         const span = it["span"] as { start?: number; end?: number } | undefined;
-        if (recordId) windowRecords.push({ recordId, eventId, kind });
+        const verbatim = it["verbatim"] === true;
+        if (recordId) windowRecords.push({ recordId, eventId, kind, verbatim });
         const cps = eventBody(eventId);
         if (cps === null) {
           check(`window ${recordId} event readable`, false, `event=${eventId}`);
@@ -486,9 +492,8 @@ async function main(): Promise<void> {
     let windowBodiesOk = windowRecords.length > 0;
     for (const w of windowRecords) {
       const info = recordInfo(w.recordId);
-      const verbatim = info.tags.includes("episode-window-verbatim");
       console.log(
-        `summary window kind=${w.kind} event=${w.eventId} id=${w.recordId} mode=${verbatim ? "verbatim" : "model-summary"} ${oneLine(info.body, 2000)}`,
+        `summary window kind=${w.kind} event=${w.eventId} id=${w.recordId} mode=${w.verbatim ? "verbatim" : "model-summary"} ${oneLine(info.body, 2000)}`,
       );
       if (info.body.length === 0) windowBodiesOk = false;
     }
