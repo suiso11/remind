@@ -170,6 +170,8 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 
 旧承認スキーマの DB (candidates 表等) は起動失敗 (stderr 固定文 + 非ゼロ終了) し、変更・削除・移行はしない。旧ファイルを退避し、`dbPath` に新しいファイルを指定すること。
 
+現行スキーマは `user_version=8`。v2〜v7 の既存 DB は単一の `BEGIN IMMEDIATE` 移行でその場で更新する（拒否しない）。v6 からは `record_importance` と `cluster_summaries` の両方が作成され、activation の v7 (`record_importance` 保持) からは既存の重要度行を保ったまま `cluster_summaries` だけを追加する。既に v8 のファイルは DDL を伴わない fast path で開く。
+
 ## テスト
 
 ```powershell

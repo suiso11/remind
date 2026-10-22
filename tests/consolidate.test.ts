@@ -13,8 +13,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { loadConfig, type AppConfig } from "../src/config.js";
-import { initDb } from "../src/db.js";
-import { eventAppend, getRecord, rememberRecord } from "../src/store.js";
+import { initDb, SCHEMA_VERSION } from "../src/db.js";
+import {
+  LEGACY_SCHEMA_VERSION_6,
+  LEGACY_SCHEMA_VERSION_7,
+  eventAppend,
+  getRecord,
+  rememberRecord,
+} from "../src/store.js";
 import { acquireCultivationLease, releaseCultivationLease } from "../src/cultivation.js";
 import { topicSet } from "../src/associate.js";
 import {
@@ -479,6 +485,90 @@ describe("maintain.consolidate topic clusters", () => {
       assert.deepEqual(second.data, first.data);
       assert.equal(calls, 0);
       assert.deepEqual(counts(ctx), before);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("upgrades a v6 database directly to v8 with both importance and cluster ledgers", () => {
+    const ctx = setup();
+    try {
+      // Simulate a production v6 file: neither derived ledger exists.
+      ctx.db.exec(`DROP TABLE record_importance`);
+      ctx.db.exec(`DROP TABLE cluster_summaries`);
+      ctx.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION_6}`);
+      ctx.db.close();
+
+      const reopened = initDb(ctx.config, ctx.configPath);
+      const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
+      assert.equal(uv, SCHEMA_VERSION);
+      assert.equal(SCHEMA_VERSION, 8);
+      for (const table of ["record_importance", "cluster_summaries"]) {
+        const row = reopened.db
+          .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = ?`)
+          .get(table) as { found: number } | undefined;
+        assert.ok(row, `${table} created by the v6->v8 migration`);
+      }
+      reopened.db.close();
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("upgrades a v7 database with stored importance to v8, keeping the row and adding cluster_summaries", () => {
+    const ctx = setup();
+    try {
+      // PR32 lineage: v7 already has record_importance and its data.
+      const stored = member(ctx, "schema7", "schema seven importance");
+      const row = ctx.db.prepare(`SELECT bodyHash FROM records WHERE id = ?`).get(stored.id) as {
+        bodyHash: string;
+      };
+      ctx.db
+        .prepare(
+          `INSERT INTO record_importance(recordId, importance, bodyHash, source, scoredAt) VALUES (?, ?, ?, 'llm', ?)`,
+        )
+        .run(stored.id, 0.75, row.bodyHash, T0);
+      // A PR32 v7 file has no consolidation ledger yet.
+      ctx.db.exec(`DROP TABLE cluster_summaries`);
+      ctx.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION_7}`);
+      ctx.db.close();
+
+      const reopened = initDb(ctx.config, ctx.configPath);
+      const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
+      assert.equal(uv, SCHEMA_VERSION);
+      const kept = reopened.db
+        .prepare(`SELECT recordId, importance, source FROM record_importance WHERE recordId = ?`)
+        .get(stored.id) as { recordId: string; importance: number; source: string } | undefined;
+      assert.equal(kept?.recordId, stored.id);
+      assert.equal(kept?.importance, 0.75);
+      assert.equal(kept?.source, "llm");
+      assert.ok(
+        reopened.db
+          .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = 'cluster_summaries'`)
+          .get(),
+      );
+      reopened.db.close();
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("a second open of the current schema takes the no-migration fast path", () => {
+    const ctx = setup();
+    try {
+      const before = (ctx.db.prepare(`PRAGMA schema_version`).get() as { schema_version: number }).schema_version;
+      ctx.db.close();
+      const reopened = initDb(ctx.config, ctx.configPath);
+      const after = (reopened.db.prepare(`PRAGMA schema_version`).get() as { schema_version: number }).schema_version;
+      assert.equal(after, before, "already-current open must not run DDL");
+      for (const table of ["record_importance", "cluster_summaries"]) {
+        assert.ok(
+          reopened.db
+            .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = ?`)
+            .get(table),
+        );
+      }
+      reopened.db.close();
     } finally {
       ctx.cleanup();
     }

@@ -101,11 +101,12 @@ import {
  * schema; 4 adds record_topics.origin (tag/external/llm precedence); 5 adds
  * the derived association tables to the versioned migration (they are no
  * longer re-created on every open); 6 adds associate_scope_state, the
- * whole-scope edge fingerprint; 7 adds the maintain.consolidate cluster
- * ledger. Older 2- through 6-stamped files are migrated in place (never
- * refused).
+ * whole-scope edge fingerprint; 7 adds the derived record_importance ledger
+ * (activation); 8 adds the maintain.consolidate cluster ledger. Older 2-
+ * through 7-stamped files are migrated in place (never refused), including
+ * v7 files that already hold activation importance data.
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -114,8 +115,10 @@ export const LEGACY_SCHEMA_VERSION_3 = 3;
 export const LEGACY_SCHEMA_VERSION_4 = 4;
 /** Per-record-edge-scan stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_5 = 5;
-/** Pre-consolidation-cluster-ledger stamp; accepted and upgraded in place. */
+/** Pre-record-importance stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_6 = 6;
+/** Pre-consolidation-cluster-ledger stamp (v7 carries record_importance); accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_7 = 7;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -504,6 +507,16 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   db.exec(`CREATE TABLE IF NOT EXISTS usage(
     ts TEXT NOT NULL, recallId TEXT NOT NULL, recordId TEXT NOT NULL, scope TEXT NOT NULL, runId TEXT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS note_heat(recordId TEXT PRIMARY KEY, usedCount INTEGER NOT NULL, lastUsedAt TEXT NOT NULL)`);
+  // Derived importance ledger (rebuildable; never canonical). Added in v7 by
+  // the activation slice; the v6->v8 and v7->v8 paths create it here, and an
+  // existing v7 table (with rows) is left untouched. bodyHash pins the record
+  // revision the score was computed from, so stale scores are ignored.
+  db.exec(`CREATE TABLE IF NOT EXISTS record_importance(
+    recordId TEXT PRIMARY KEY,
+    importance REAL NOT NULL,
+    bodyHash TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('llm','external')),
+    scoredAt TEXT NOT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS projection_queue(recordId TEXT PRIMARY KEY, attempts INTEGER NOT NULL, nextAt TEXT NOT NULL)`);
   // Derived lexical indexes (rebuildable; never canonical).
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);

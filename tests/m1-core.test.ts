@@ -121,7 +121,7 @@ describe("m1 schema: fresh current version and legacy fail-fast", () => {
       const uv = (ctx.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
       assert.equal(uv, M1_USER_VERSION);
       assert.equal(uv, SCHEMA_VERSION);
-      for (const t of ["raw_events", "records", "operations", "audit", "exposures", "projection_queue"]) {
+      for (const t of ["raw_events", "records", "operations", "audit", "exposures", "projection_queue", "record_importance", "cluster_summaries"]) {
         const row = ctx.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(t) as
           | { name: string }
           | undefined;
