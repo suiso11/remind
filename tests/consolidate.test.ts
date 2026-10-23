@@ -17,9 +17,12 @@ import { initDb, SCHEMA_VERSION } from "../src/db.js";
 import {
   LEGACY_SCHEMA_VERSION_6,
   LEGACY_SCHEMA_VERSION_7,
+  LEGACY_SCHEMA_VERSION_8,
+  correctRecord,
   eventAppend,
   getRecord,
   rememberRecord,
+  retireRecord,
 } from "../src/store.js";
 import { acquireCultivationLease, releaseCultivationLease } from "../src/cultivation.js";
 import { topicSet } from "../src/associate.js";
@@ -93,6 +96,7 @@ function member(
   key: string,
   body: string,
   createdAt: string = T0,
+  topic: string = TOPIC,
 ): { id: string; eventId: string } {
   const eventId = `ev-${key}`;
   const er = eventAppend(
@@ -132,7 +136,7 @@ function member(
   const tr = topicSet(
     ctx.db,
     ctx.config,
-    { scope: SCOPE, id, bodyHash: row.bodyHash, topics: [TOPIC] },
+    { scope: SCOPE, id, bodyHash: row.bodyHash, topics: [topic] },
     `ts-${key}-${ctr++}`,
     createdAt,
   );
@@ -440,6 +444,142 @@ describe("maintain.consolidate topic clusters", () => {
     }
   });
 
+  it("follows a user-corrected summary revision instead of creating a duplicate", async () => {
+    const ctx = setup();
+    try {
+      addThreeMembers(ctx);
+      const first = await run(ctx, "c-9a", makeGen());
+      const firstId = data(first).clusters[0]!.recordId as string;
+
+      // The user corrects the generated summary through record.correct; the
+      // cluster ledger still points at the now-superseded revision.
+      const fixed = correctRecord(
+        ctx.db,
+        ctx.config,
+        {
+          recordId: firstId,
+          body: "Alice and Bob still tend the orchard.",
+          kind: "correction",
+          provenance: { source: CLUSTER_SUMMARY_SOURCE, observedAt: RUN1 },
+          scope: SCOPE,
+        },
+        "c-9-user-fix",
+        RUN1,
+      );
+      assert.equal(fixed.ok, true, JSON.stringify(fixed));
+      const correctedId = (fixed.data as { record: { id: string } }).record.id;
+      assert.equal(rec(ctx, correctedId).status, "active");
+      assert.equal(rec(ctx, firstId).status, "superseded");
+      assert.equal(ledger(ctx)[0]!.recordId, firstId);
+
+      member(ctx, "a4", "Dana joined the orchard.");
+      const second = await run(ctx, "c-9b", makeGen(), RUN2);
+      const d = data(second);
+      assert.equal(d.applied, 1);
+      assert.equal(d.clusters[0]!.outcome, "written");
+      const newId = d.clusters[0]!.recordId as string;
+
+      // The corrected revision is superseded, not left active next to a new
+      // summary: exactly one active cluster summary remains.
+      assert.equal(rec(ctx, correctedId).status, "superseded");
+      assert.equal(rec(ctx, newId).status, "active");
+      assert.equal(
+        (
+          ctx.db
+            .prepare(`SELECT COUNT(*) AS n FROM records WHERE source = ? AND status = 'active'`)
+            .get(CLUSTER_SUMMARY_SOURCE) as { n: number }
+        ).n,
+        1,
+      );
+      assert.equal(ledger(ctx)[0]!.recordId, newId);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("rotates past a permanently ungrounded topic under a small limit", async () => {
+    const ctx = setup();
+    try {
+      for (const [i, body] of [
+        "Alice sorted the apples.",
+        "Bob stored the apples.",
+        "Carol washed the apples.",
+      ].entries()) {
+        member(ctx, `p${i}`, body, T0, "apple");
+      }
+      for (const [i, body] of [
+        "Nina tended the zeta orchard.",
+        "Omar pruned the zeta orchard.",
+        "Pia watered the zeta orchard.",
+      ].entries()) {
+        member(ctx, `z${i}`, body, T0, "zeta");
+      }
+      const gen = makeGen({
+        reduce: (prompt) =>
+          /apples/.test(prompt)
+            ? `Zelda tended the apple orchard ${citationsFor(prompt)}`
+            : `Zeta orchard work continued ${citationsFor(prompt)}`,
+      });
+
+      const first = await run(ctx, "c-10a", gen, RUN1, { scope: SCOPE, limit: 1 });
+      const d1 = data(first);
+      assert.equal(d1.applied, 0);
+      assert.equal(d1.clusters.length, 1);
+      assert.equal(d1.clusters[0]!.topic, "apple");
+      assert.equal(d1.clusters[0]!.outcome, "no_grounded_sentences");
+      assert.equal(counts(ctx).summaries, 0);
+
+      // Same bounded limit, fresh key: the cursor must move past the rejected
+      // topic instead of burning the budget on it again.
+      const second = await run(ctx, "c-10b", gen, RUN2, { scope: SCOPE, limit: 1 });
+      const d2 = data(second);
+      assert.equal(d2.applied, 1);
+      assert.equal(d2.clusters.length, 1);
+      assert.equal(d2.clusters[0]!.topic, "zeta");
+      assert.equal(d2.clusters[0]!.outcome, "written");
+      assert.equal(ledger(ctx)[0]!.topic, "zeta");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("defers when cluster membership changes during inference", async () => {
+    const ctx = setup();
+    try {
+      const members = addThreeMembers(ctx);
+      let retired = false;
+      const gen = makeGen({
+        reduce: (prompt) => {
+          if (!retired) {
+            retired = true;
+            // Ordinary record writes do not take the cultivation lease, so a
+            // concurrent retirement is possible while inference is running.
+            const r = retireRecord(
+              ctx.db,
+              ctx.config,
+              { id: members[0]!.id, scope: SCOPE, reasonCode: "OUTDATED" },
+              "c-11-retire",
+              RUN1,
+            );
+            assert.equal(r.ok, true, JSON.stringify(r));
+          }
+          return `Orchard work continued ${citationsFor(prompt)}`;
+        },
+      });
+      const res = await run(ctx, "c-11", gen, RUN1);
+      const d = data(res);
+      assert.equal(d.applied, 0);
+      assert.equal(d.clusters[0]!.outcome, "deferred");
+      assert.equal(d.clusters[0]!.recordId, null);
+      const state = counts(ctx);
+      assert.equal(state.summaries, 0);
+      assert.equal(state.ledger, 0);
+      assert.equal(rec(ctx, members[0]!.id).status, "retired");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("returns CONFLICT while a foreign cultivation lease is live", async () => {
     const ctx = setup();
     try {
@@ -490,7 +630,7 @@ describe("maintain.consolidate topic clusters", () => {
     }
   });
 
-  it("upgrades a v6 database directly to v8 with both importance and cluster ledgers", () => {
+  it("upgrades a v6 database directly to v9 with importance, cluster, and cursor ledgers", () => {
     const ctx = setup();
     try {
       // Simulate a production v6 file: neither derived ledger exists.
@@ -502,12 +642,12 @@ describe("maintain.consolidate topic clusters", () => {
       const reopened = initDb(ctx.config, ctx.configPath);
       const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
       assert.equal(uv, SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 8);
-      for (const table of ["record_importance", "cluster_summaries"]) {
+      assert.equal(SCHEMA_VERSION, 9);
+      for (const table of ["record_importance", "cluster_summaries", "consolidate_scope_state"]) {
         const row = reopened.db
           .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = ?`)
           .get(table) as { found: number } | undefined;
-        assert.ok(row, `${table} created by the v6->v8 migration`);
+        assert.ok(row, `${table} created by the v6->v9 migration`);
       }
       reopened.db.close();
     } finally {
@@ -515,7 +655,7 @@ describe("maintain.consolidate topic clusters", () => {
     }
   });
 
-  it("upgrades a v7 database with stored importance to v8, keeping the row and adding cluster_summaries", () => {
+  it("upgrades a v7 database with stored importance to v9, keeping the row and adding cluster_summaries", () => {
     const ctx = setup();
     try {
       // PR32 lineage: v7 already has record_importance and its data.
@@ -547,6 +687,33 @@ describe("maintain.consolidate topic clusters", () => {
           .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = 'cluster_summaries'`)
           .get(),
       );
+      assert.ok(
+        reopened.db
+          .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = 'consolidate_scope_state'`)
+          .get(),
+      );
+      reopened.db.close();
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("upgrades a v8 database by adding the consolidate rotation cursor", () => {
+    const ctx = setup();
+    try {
+      // A PR33 v8 file has cluster_summaries but no rotation cursor yet.
+      ctx.db.exec(`DROP TABLE consolidate_scope_state`);
+      ctx.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION_8}`);
+      ctx.db.close();
+
+      const reopened = initDb(ctx.config, ctx.configPath);
+      const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
+      assert.equal(uv, SCHEMA_VERSION);
+      assert.ok(
+        reopened.db
+          .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = 'consolidate_scope_state'`)
+          .get(),
+      );
       reopened.db.close();
     } finally {
       ctx.cleanup();
@@ -561,7 +728,7 @@ describe("maintain.consolidate topic clusters", () => {
       const reopened = initDb(ctx.config, ctx.configPath);
       const after = (reopened.db.prepare(`PRAGMA schema_version`).get() as { schema_version: number }).schema_version;
       assert.equal(after, before, "already-current open must not run DDL");
-      for (const table of ["record_importance", "cluster_summaries"]) {
+      for (const table of ["record_importance", "cluster_summaries", "consolidate_scope_state"]) {
         assert.ok(
           reopened.db
             .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = ?`)

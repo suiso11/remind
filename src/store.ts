@@ -102,11 +102,12 @@ import {
  * the derived association tables to the versioned migration (they are no
  * longer re-created on every open); 6 adds associate_scope_state, the
  * whole-scope edge fingerprint; 7 adds the derived record_importance ledger
- * (activation); 8 adds the maintain.consolidate cluster ledger. Older 2-
- * through 7-stamped files are migrated in place (never refused), including
- * v7 files that already hold activation importance data.
+ * (activation); 8 adds the maintain.consolidate cluster ledger; 9 adds the
+ * per-scope consolidate rotation cursor. Older 2- through 8-stamped files are
+ * migrated in place (never refused), including v7 files that already hold
+ * activation importance data and v8 files that already hold cluster ledgers.
  */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -119,6 +120,8 @@ export const LEGACY_SCHEMA_VERSION_5 = 5;
 export const LEGACY_SCHEMA_VERSION_6 = 6;
 /** Pre-consolidation-cluster-ledger stamp (v7 carries record_importance); accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_7 = 7;
+/** Pre-consolidate-rotation-cursor stamp (v8 carries cluster_summaries); accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_8 = 8;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -584,6 +587,14 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
     memberFingerprint TEXT NOT NULL,
     createdAt TEXT NOT NULL,
     PRIMARY KEY(scope, topic))`);
+  // Derived rotation cursor (rebuildable; never canonical). One row per scope
+  // naming the last topic that a bounded maintain.consolidate pass attempted.
+  // The next pass starts just after it, so topics that repeatedly produce no
+  // grounded text or defer cannot starve later topics under a small limit.
+  db.exec(`CREATE TABLE IF NOT EXISTS consolidate_scope_state(
+    scope TEXT PRIMARY KEY,
+    lastTopic TEXT NOT NULL,
+    updatedAt TEXT NOT NULL)`);
   // Explicit per-event completion marker. An event is pending until its last
   // verified/verbatim window transaction (or a no-op "all windows already
   // present" repair) inserts this row. Unlike a createdAt watermark this is
@@ -1850,6 +1861,12 @@ export interface CanonicalWriteFence {
   owner: string;
   /** Timestamp used to evaluate lease liveness. */
   now: string;
+  /**
+   * Runs inside the canonical transaction before any canonical row is
+   * written. Throw to refuse the whole write (callers re-check the inputs
+   * their inference was based on, e.g. cluster membership).
+   */
+  beforeWrite?: (db: DatabaseSync) => void;
   afterInsert?: (db: DatabaseSync, recordId: string) => void;
 }
 
@@ -1861,6 +1878,7 @@ function assertCanonicalWriteFence(
   if (!isCultivationLeaseHeldBy(db, fence.owner, fence.now)) {
     throw new Error("lease lost");
   }
+  fence.beforeWrite?.(db);
 }
 
 export function rememberRecord(
@@ -3111,6 +3129,30 @@ export function getClusterSummary(
     )
     .get(scope, topic) as ClusterSummaryRow | undefined;
   return row ?? null;
+}
+
+/** Read the last attempted cluster topic for one scope (rotation cursor). */
+export function getConsolidateCursor(db: DatabaseSync, scope: string): string | null {
+  const row = db
+    .prepare(`SELECT lastTopic FROM consolidate_scope_state WHERE scope = ?`)
+    .get(scope) as { lastTopic: string } | undefined;
+  return row?.lastTopic ?? null;
+}
+
+/** Persist the last attempted cluster topic for one scope (derived, bounded). */
+export function setConsolidateCursor(
+  db: DatabaseSync,
+  scope: string,
+  lastTopic: string,
+  now: string,
+): void {
+  db.prepare(
+    `INSERT INTO consolidate_scope_state(scope, lastTopic, updatedAt)
+     VALUES (?, ?, ?)
+     ON CONFLICT(scope) DO UPDATE SET
+       lastTopic = excluded.lastTopic,
+       updatedAt = excluded.updatedAt`,
+  ).run(scope, lastTopic, now);
 }
 
 function encodeEpisodeCursor(startAt: string, episodeKey: string): string {

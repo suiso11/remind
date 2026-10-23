@@ -64,8 +64,10 @@ import {
 import {
   correctRecord,
   getClusterSummary,
+  getConsolidateCursor,
   isScopeAuthorized,
   rememberRecord,
+  setConsolidateCursor,
   upsertClusterSummary,
   type CanonicalWriteFence,
 } from "./store.js";
@@ -338,6 +340,17 @@ function fencedWrite(
   }
 }
 
+/** Bounded supersedes walk: the ledger may point at a user-corrected revision. */
+const MAX_SUPERSEDES_WALK = 32;
+
+/**
+ * Resolve the ledger's record id to the currently active revision. A user can
+ * correct a generated summary through record.correct, which supersedes the
+ * ledger's row and creates a new active revision; consolidation must follow
+ * that chain (bounded) so it supersedes the corrected summary instead of
+ * creating a duplicate. Returns null when the ledger has no usable active
+ * revision (retired/archived/missing/cyclic).
+ */
 function activeClusterRecord(
   db: DatabaseSync,
   scope: string,
@@ -345,11 +358,40 @@ function activeClusterRecord(
 ): string | null {
   const row = getClusterSummary(db, scope, topic);
   if (!row) return null;
-  const rec = db
-    .prepare(`SELECT id, status FROM records WHERE id = ? AND scope = ?`)
-    .get(row.recordId, scope) as { id: string; status: string } | undefined;
-  if (!rec || rec.status !== "active") return null;
-  return rec.id;
+  const seen = new Set<string>();
+  let current = row.recordId;
+  for (let i = 0; i < MAX_SUPERSEDES_WALK; i++) {
+    if (seen.has(current)) return null;
+    seen.add(current);
+    const rec = db
+      .prepare(`SELECT id, status FROM records WHERE id = ? AND scope = ?`)
+      .get(current, scope) as { id: string; status: string } | undefined;
+    if (!rec) return null;
+    if (rec.status === "active") return rec.id;
+    if (rec.status !== "superseded") return null;
+    const next = db
+      .prepare(
+        `SELECT id FROM records
+         WHERE supersedes = ? AND scope = ? AND status IN ('active','superseded')
+         ORDER BY revision DESC, id ASC LIMIT 1`,
+      )
+      .get(current, scope) as { id: string } | undefined;
+    if (!next) return null;
+    current = next.id;
+  }
+  return null;
+}
+
+/**
+ * Rotate the alphabetically ordered topic list so a bounded pass starts just
+ * after the last attempted topic. Deterministic, wraps once, and does not
+ * remove any topic.
+ */
+function rotateTopics(topics: string[], after: string | null): string[] {
+  if (after === null || topics.length < 2) return topics;
+  const idx = topics.findIndex((t) => t > after);
+  if (idx < 0) return topics;
+  return topics.slice(idx).concat(topics.slice(0, idx));
 }
 
 /* ------------------------------------------------------------------ */
@@ -459,6 +501,14 @@ export async function maintainConsolidate(
       return budgeted(fail("STORE_UNAVAILABLE"), config);
     }
 
+    let cursor: string | null = null;
+    try {
+      cursor = getConsolidateCursor(db, p.scope);
+    } catch {
+      return budgeted(fail("STORE_UNAVAILABLE"), config);
+    }
+    topics = rotateTopics(topics, cursor);
+
     const results: ClusterResult[] = [];
     let applied = 0;
     let processed = 0;
@@ -501,6 +551,14 @@ export async function maintainConsolidate(
       }
 
       processed++;
+      // Rotation progress is derived and bounded: record the attempted topic
+      // before inference so a permanently rejected or deferred cluster cannot
+      // monopolise every small-limit run.
+      try {
+        setConsolidateCursor(db, p.scope, topic, nowValid);
+      } catch {
+        return budgeted(fail("STORE_UNAVAILABLE"), config);
+      }
 
       let sentencesKept = 0;
       let sentencesDropped = 0;
@@ -702,6 +760,27 @@ export async function maintainConsolidate(
         upsertClusterSummary(txDb, ledgerRow(recordId));
       };
 
+      // Membership can change while inference is in flight (ordinary record
+      // writes do not take the cultivation lease). Re-check inside the
+      // canonical transaction; on any change write nothing and defer.
+      let stale = false;
+      const revalidateMembership = (txDb: DatabaseSync): void => {
+        let current: ClusterMember[];
+        try {
+          current = loadClusterMembers(txDb, p.scope, topic);
+        } catch {
+          stale = true;
+          throw new Error("cluster changed");
+        }
+        if (
+          current.length < bounds.minMembers ||
+          memberFingerprint(current) !== fingerprint
+        ) {
+          stale = true;
+          throw new Error("cluster changed");
+        }
+      };
+
       const prior = activeClusterRecord(db, p.scope, topic);
       let newRecordId: string | null = null;
       if (prior !== null) {
@@ -726,6 +805,7 @@ export async function maintainConsolidate(
           {
             owner: execOwner,
             now: renewNow(),
+            beforeWrite: revalidateMembership,
             afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
           },
         );
@@ -741,7 +821,7 @@ export async function maintainConsolidate(
             );
             if (!okLedger) return budgeted(conflict(), config);
           }
-        } else if (!isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
+        } else if (!stale && !isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
           return budgeted(conflict(), config);
         }
       } else {
@@ -764,6 +844,7 @@ export async function maintainConsolidate(
           {
             owner: execOwner,
             now: renewNow(),
+            beforeWrite: revalidateMembership,
             afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
           },
         );
@@ -779,7 +860,7 @@ export async function maintainConsolidate(
             );
             if (!okLedger) return budgeted(conflict(), config);
           }
-        } else if (!isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
+        } else if (!stale && !isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
           return budgeted(conflict(), config);
         }
       }

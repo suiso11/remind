@@ -11,7 +11,8 @@
  *   resolves decoder sessions as onnx/model_<quant>.onnx)
  * - decoding: greedy (do_sample:false) => deterministic for fixed input
  * - prompts: ChatML (<|im_start|> roles) matching the model's instruction
- *   template; the model answers with one verdict line or one merged sentence
+ *   template; the model answers with one classification label, one verdict
+ *   line, or one merged sentence
  *
  * Why not bloomz-560m: the previously pinned Xenova/bloomz-560m @ e760ef38
  * was probed on the real distill prompts and proved unsuitable — the review
@@ -33,12 +34,13 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AppConfig } from "./config.js";
+import type { AppConfig, LlmBackend } from "./config.js";
 import {
   LLM_DEFAULT_MAX_NEW_TOKENS,
   LLM_DEFAULT_MAX_PROMPT_CHARS,
   LLM_DEFAULT_MODEL_DIR,
   LLM_DEFAULT_TIMEOUT_MS,
+  isLoopbackHttpUrl,
   resolveConfigDirPath,
 } from "./config.js";
 import { containsLoneSurrogateDeep, countCp, hasControl } from "./normalize.js";
@@ -84,6 +86,39 @@ export function llmMaxPromptChars(config: AppConfig): number {
 /** True only when the operator explicitly enabled the llm section. Absent => false (fast, no model). */
 export function llmEnabled(config: AppConfig): boolean {
   return config.llm?.enabled === true;
+}
+
+/** Selected maintenance runtime; absent => "onnx" (existing behavior). */
+export function llmBackend(config: AppConfig): LlmBackend {
+  return config.llm?.backend === "openai" ? "openai" : "onnx";
+}
+
+/**
+ * Model identity to report in maintenance responses. ONNX keeps the pinned
+ * repo id + revision (unchanged contract). OpenAI-compatible reports the
+ * operator-configured model name and no revision, because that backend's
+ * weights are not resolved by this process (the local server owns them).
+ */
+export function activeModelLabel(config: AppConfig): { model: string; revision: string | null } {
+  if (llmBackend(config) === "openai") {
+    return { model: config.llm?.model ?? LLM_MODEL_ID, revision: null };
+  }
+  return { model: LLM_MODEL_ID, revision: LLM_MODEL_REVISION };
+}
+
+/**
+ * True when maintenance may call the configured backend. ONNX needs the
+ * pinned files on disk; OpenAI-compatible needs no files, only an enabled
+ * section with a valid loopback baseUrl (config load already enforces it,
+ * but programmatic configs are re-checked here).
+ */
+export function llmUsable(config: AppConfig, modelDir: string): boolean {
+  if (!llmEnabled(config)) return false;
+  if (llmBackend(config) === "openai") {
+    return isLoopbackHttpUrl(config.llm?.baseUrl) && typeof config.llm?.model === "string" &&
+      config.llm.model.length > 0;
+  }
+  return modelFilesPresent(modelDir);
 }
 
 interface LlmManifestFile {
@@ -204,19 +239,166 @@ function generatedTextOf(out: unknown): string | null {
   }
 }
 
+/* ---------------- OpenAI-compatible loopback backend ---------------- */
+
+export type ChatRole = "system" | "user" | "assistant";
+export interface ChatMessage {
+  role: ChatRole;
+  content: string;
+}
+export interface ChatMlConversion {
+  messages: ChatMessage[];
+  /** Non-empty trailing assistant content (ChatML prefill). */
+  prefill: string;
+}
+
+/**
+ * Convert the existing ChatML prompt strings into OpenAI chat messages.
+ * A trailing, unterminated assistant turn is an assistant prefill: it is sent
+ * as a final assistant message (llama.cpp continuation) and echoed back to the
+ * caller only when the server includes it in `message.content`. Returns null
+ * for malformed role lines or a non-assistant open turn; the caller degrades.
+ */
+export function chatMlToMessages(prompt: string): ChatMlConversion | null {
+  const START = "<|im_start|>";
+  const END = "<|im_end|>";
+  const messages: ChatMessage[] = [];
+  let prefill = "";
+  let pos = 0;
+  while (pos < prompt.length) {
+    const start = prompt.indexOf(START, pos);
+    if (start < 0) break;
+    const roleStart = start + START.length;
+    const nl = prompt.indexOf("\n", roleStart);
+    if (nl < 0) return null;
+    const role = prompt.slice(roleStart, nl);
+    if (role !== "system" && role !== "user" && role !== "assistant") return null;
+    const contentStart = nl + 1;
+    const end = prompt.indexOf(END, contentStart);
+    if (end < 0) {
+      if (role !== "assistant") return null;
+      prefill = prompt.slice(contentStart);
+      pos = prompt.length;
+      break;
+    }
+    messages.push({ role, content: prompt.slice(contentStart, end) });
+    pos = end + END.length;
+  }
+  if (messages.length === 0) return null;
+  if (prefill.length > 0) messages.push({ role: "assistant", content: prefill });
+  return { messages, prefill };
+}
+
+/** Remove any complete think block from model output. */
+export function stripThinkingBlocks(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>\s*/gi, "").trim();
+}
+
+/** baseUrl (origin or origin/v1) -> OpenAI chat completions endpoint. */
+export function openAiChatCompletionsUrl(baseUrl: string): string {
+  const u = new URL(baseUrl);
+  const p = u.pathname.replace(/\/+$/, "");
+  return `${u.origin}${p === "" ? "/v1" : p}/chat/completions`;
+}
+
+async function generateOpenAiCompletion(
+  prompt: string,
+  opts: { timeoutMs: number; maxNewTokens: number; config?: AppConfig },
+): Promise<string | null> {
+  const config = opts.config;
+  const l = config?.llm;
+  if (!config || !l || llmBackend(config) !== "openai") return null;
+  if (!isLoopbackHttpUrl(l.baseUrl) || typeof l.model !== "string" || l.model.length === 0) {
+    return null;
+  }
+  const conv = chatMlToMessages(prompt);
+  if (!conv) return null;
+  const poisonKey = `openai:${l.baseUrl}`;
+  if (poisonedDir !== null && poisonedDir === poisonKey) return null;
+
+  const disableThinking = l.disableThinking !== false;
+  const request: Record<string, unknown> = {
+    model: l.model,
+    messages: conv.messages,
+    temperature: 0,
+    max_tokens: opts.maxNewTokens,
+    seed: 0,
+    stream: false,
+  };
+  if (disableThinking) request["chat_template_kwargs"] = { enable_thinking: false };
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json",
+  };
+  if (l.apiKeyEnv) {
+    const token = process.env[l.apiKeyEnv];
+    if (token) headers["authorization"] = `Bearer ${token}`;
+  }
+
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const ctrl = new AbortController();
+  timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, Math.max(1, opts.timeoutMs));
+  (timer as unknown as { unref?: () => void }).unref?.();
+  try {
+    const res = await fetch(openAiChatCompletionsUrl(l.baseUrl), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(request),
+      signal: ctrl.signal,
+      // A loopback server must not be able to redirect the request to a
+      // non-loopback host; refuse redirects instead of following them.
+      redirect: "error",
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      choices?: Array<{ message?: { content?: unknown } }>;
+    };
+    const raw = json?.choices?.[0]?.message?.content;
+    if (typeof raw !== "string" || raw.length === 0) return null;
+    let text = disableThinking ? stripThinkingBlocks(raw) : raw;
+    // llama.cpp returns only the continuation for a final assistant message,
+    // but some servers echo the prefill. Callers (episodes) strip 要約： as
+    // well; removing it here keeps both server behaviors equivalent to ONNX.
+    if (conv.prefill.length > 0 && text.startsWith(conv.prefill)) {
+      text = text.slice(conv.prefill.length);
+    }
+    if (text.length === 0) return null;
+    if (containsLoneSurrogateDeep(text) || hasControl(text.replace(/\n/g, ""))) return null;
+    return text;
+  } catch {
+    // Only a timeout poisons the backend (same ownership rule as ONNX); an
+    // ordinary network/HTTP error is retryable on the next call.
+    if (timedOut) poisonedDir = poisonKey;
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * Generate a greedy (deterministic) completion with the pinned local model.
  * Offline only. Resolves null on ANY failure (disabled/missing model,
  * timeout, bad output): callers degrade to keep/retry without state change.
  * Never throws for model reasons.
+ *
+ * With opts.config.llm.backend === "openai", dispatch to a loopback-only
+ * OpenAI-compatible server instead of loading ONNX files.
  */
 export async function generateCompletion(
   prompt: string,
   modelDir: string,
-  opts: { timeoutMs: number; maxNewTokens: number },
+  opts: { timeoutMs: number; maxNewTokens: number; config?: AppConfig },
 ): Promise<string | null> {
   try {
     if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 8000) return null;
+    if (opts.config && llmBackend(opts.config) === "openai") {
+      return await generateOpenAiCompletion(prompt, opts);
+    }
     if (!modelFilesPresent(modelDir)) return null;
     // Refuse to start new model work after a timeout for this dir (poison):
     // the timed-out load/generation is still running uncancelled, so piling
@@ -347,28 +529,52 @@ function clampMaxPromptChars(n: unknown): number {
   return m;
 }
 
+/** KEEP-type labels: lasting user content that must not be auto-retired. */
+export const RETIRE_GATE_KEEP_LABELS = [
+  "FACT",
+  "PREFERENCE",
+  "OPINION",
+  "PLAN",
+  "EVENT",
+  "RELATIONSHIP",
+  "PROJECT",
+] as const;
+/** DROP-type labels: low-signal content eligible for auto-retirement. */
+export const RETIRE_GATE_DROP_LABELS = ["GREETING", "TRANSIENT", "CHATOPS"] as const;
+
 /**
- * Retire-gate prompt (stage 1 of a distill review). Generation-style on
- * purpose: single-token verdicts proved unusable on the pinned q4 model
- * (probes: bare RETIRE/KEEP/FEELING/1-way questions always echoed one biased
- * token regardless of content, 4-6/10 at best), while this extraction form
- * scored 10/10 across transient feelings, facts, preferences, uncertainty,
- * plans, and events. The model either states the lasting content it sees or
- * replies NONE; code maps strict-NONE to a retire candidate and any other
- * text to the merge/keep stage. The extracted sentence itself is NEVER
- * stored, audited, or reused — only the NONE-vs-content distinction drives
- * the decision, so no memory text is keyword-scanned and no template text is
- * substituted. General instruction only; no fixture answers.
+ * Retire-gate prompt (stage 1 of a distill review, OpenAI backend only).
+ *
+ * Single-label classification: the model must reply with exactly one label
+ * from RETIRE_GATE_KEEP_LABELS or RETIRE_GATE_DROP_LABELS. The previous
+ * extraction-form gate (state the lasting content, or NONE) still returned
+ * NONE for durable opinions and mis-retired lasting facts under the pinned
+ * ONNX model, so the gate is now an explicit label taxonomy. The prompt is
+ * English with a short definition per label because the labels are the
+ * contract; the memory body stays verbatim (clipped). General instruction
+ * only; no fixture answers. The body is never keyword-scanned and no label
+ * definition is derived from the body.
  */
 export function buildRetireGatePrompt(body: string, maxPromptChars: number): string {
   const max = clampMaxPromptChars(maxPromptChars);
   const head =
-    "<|im_start|>system\nYou judge one memory. Reply with only what is asked and nothing else.<|im_end|>\n" +
+    "<|im_start|>system\nYou classify one memory. Reply with exactly one label and nothing else.<|im_end|>\n" +
     "<|im_start|>user\nMemory: \"\"\"";
   const tail =
     "\"\"\"\n" +
-    "What lasting fact, event, observation, preference, or plan does this memory record? " +
-    "Reply with only that fact in one short sentence, or reply NONE if the memory is only a passing mood or feeling with no lasting content.<|im_end|>\n<|im_start|>assistant\n";
+    "Labels:\n" +
+    "- FACT: a lasting fact about the user, their belongings, or their environment.\n" +
+    "- PREFERENCE: something the user likes, dislikes, or prefers.\n" +
+    "- OPINION: the user's view, belief, or judgment about anything.\n" +
+    "- PLAN: something the user intends to do or is working toward.\n" +
+    "- EVENT: something that happened and matters beyond the day.\n" +
+    "- RELATIONSHIP: a person, group, or relationship that matters to the user.\n" +
+    "- PROJECT: a project, tool, or body of work the user is building.\n" +
+    "- GREETING: only a formulaic exchange such as a greeting, acknowledgement, or goodnight.\n" +
+    "- TRANSIENT: a same-day condition such as health, weather, or mood that will not help later conversation.\n" +
+    "- CHATOPS: conversation management itself, such as a request to search or feedback on tone or persona that carries no lasting preference.\n" +
+    "Anything describing the user's lasting traits, opinions, interests, plans, belongings, projects, or relationships is KEEP-type (FACT, PREFERENCE, OPINION, PLAN, EVENT, RELATIONSHIP, PROJECT).\n" +
+    "Reply with the label only.<|im_end|>\n<|im_start|>assistant\n";
   const budget = Math.max(0, max - cpLen(head) - cpLen(tail));
   const clipped = clip(body, Math.min(600, budget));
   const full = head + clipped + tail;
@@ -380,18 +586,45 @@ export function buildRetireGatePrompt(body: string, maxPromptChars: number): str
 export type RetireGateResult = { kind: "retire" } | { kind: "continue" } | { kind: "uncertain" };
 
 /**
- * Parse retire-gate output. Strict: exactly NONE (case-insensitive,
- * surrounding whitespace allowed) means the model found no lasting content
- * (retire candidate). Any other non-empty text means it saw lasting content
- * (continue to merge/keep). Non-strings and empties are uncertain (caller
- * keeps state unchanged). Never throws. Parses MODEL output only.
+ * Parse retire-gate output as an exact label. Trim, strip trailing
+ * punctuation, compare case-insensitively. DROP-type labels (GREETING,
+ * TRANSIENT, CHATOPS) => retire candidate; KEEP-type labels (FACT,
+ * PREFERENCE, OPINION, PLAN, EVENT, RELATIONSHIP, PROJECT) => continue to the
+ * merge/keep stage. Anything else (narrative text, NONE, empty, non-string)
+ * is uncertain => caller keeps state unchanged. Never throws. Parses MODEL
+ * output only.
  */
 export function parseRetireGate(raw: unknown): RetireGateResult {
   if (typeof raw !== "string") return { kind: "uncertain" };
-  if (/^\s*NONE\s*$/i.test(raw)) return { kind: "retire" };
   if (raw.length === 0 || raw.length > 4000) return { kind: "uncertain" };
   if (hasControl(raw.replace(/\n/g, "")) || containsLoneSurrogateDeep(raw)) return { kind: "uncertain" };
-  return { kind: "continue" };
+  const label = raw
+    .trim()
+    .replace(/[\s.!?,;:。！？、，；：'"`）)\]}]+$/u, "")
+    .trim()
+    .toUpperCase();
+  if (!label) return { kind: "uncertain" };
+  if ((RETIRE_GATE_DROP_LABELS as readonly string[]).includes(label)) return { kind: "retire" };
+  if ((RETIRE_GATE_KEEP_LABELS as readonly string[]).includes(label)) return { kind: "continue" };
+  return { kind: "uncertain" };
+}
+
+export type SharedFactResult = { kind: "shared" } | { kind: "none" } | { kind: "uncertain" };
+
+/**
+ * Parse shared-fact confirmation output (stage 2b). The prompt is
+ * generation-style (state the shared fact, or NONE), so this is deliberately
+ * NOT the label parser: exactly NONE (case-insensitive, optional trailing
+ * punctuation) means the merge is rejected; any other non-empty text is a
+ * stated shared fact; invalid/empty/non-string is uncertain (caller keeps).
+ * Never throws. Parses MODEL output only.
+ */
+export function parseSharedFact(raw: unknown): SharedFactResult {
+  if (typeof raw !== "string") return { kind: "uncertain" };
+  if (raw.length === 0 || raw.length > 4000) return { kind: "uncertain" };
+  if (hasControl(raw.replace(/\n/g, "")) || containsLoneSurrogateDeep(raw)) return { kind: "uncertain" };
+  if (/^\s*NONE\s*[.!?,;:。！？、，；：]*\s*$/iu.test(raw)) return { kind: "none" };
+  return raw.trim().length > 0 ? { kind: "shared" } : { kind: "uncertain" };
 }
 
 export type MergeChoice = { kind: "merge"; index: number } | { kind: "keep" } | { kind: "uncertain" };

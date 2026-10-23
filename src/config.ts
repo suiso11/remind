@@ -54,9 +54,23 @@ export interface CultivationConfig {
   leaseTtlMs: number;
   /** Max retries per queued review before it is marked failed (default 5). */
   reviewMaxAttempts: number;
+  /**
+   * Minimum record age before an auto-retire candidate may actually be
+   * retired (default 86400000 = 24h; 0 disables the grace period). Younger
+   * DROP candidates are deferred without counting a failure.
+   */
+  retireMinAgeMs: number;
 }
 
+export type LlmBackend = "onnx" | "openai";
+
 export interface LlmConfig {
+  /**
+   * Generation runtime. "onnx" (default) keeps the in-process pinned
+   * Qwen2.5-1.5B pipeline; "openai" calls a loopback-only OpenAI-compatible
+   * /v1/chat/completions server (llama.cpp llama-server or LiteLLM).
+   */
+  backend?: LlmBackend;
   modelDir: string;
   timeoutMs: number;
   enabled: boolean;
@@ -64,6 +78,14 @@ export interface LlmConfig {
   maxNewTokens: number;
   /** Max prompt characters per inference (default 2000). */
   maxPromptChars: number;
+  /** OpenAI backend: http(s) origin or origin/v1 on 127.0.0.1, ::1, localhost. */
+  baseUrl?: string;
+  /** OpenAI backend: model name sent in the request (non-empty). */
+  model?: string;
+  /** OpenAI backend: env var NAME holding an optional bearer token. */
+  apiKeyEnv?: string;
+  /** OpenAI backend: send enable_thinking=false and strip think-tag blocks (default true). */
+  disableThinking?: boolean;
 }
 
 export interface MaintenanceConfig {
@@ -192,6 +214,33 @@ const TIMEOUT_KEYS = ["cliMs", "busyMs"] as const;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Loopback-only endpoint guard for the OpenAI-compatible LLM backend. Accepts
+ * http(s) origins whose host is exactly 127.0.0.1, ::1, or localhost, with an
+ * optional /v1 path (trailing slashes allowed). Credentials, query strings,
+ * fragments, and arbitrary paths are rejected so the configured value can
+ * never address a non-local host or smuggle a key in the URL.
+ */
+export function isLoopbackHttpUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) return false;
+  let u: URL;
+  try {
+    u = new URL(value);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  if (u.username.length > 0 || u.password.length > 0 || u.search.length > 0 || u.hash.length > 0) {
+    return false;
+  }
+  const host = u.hostname.toLowerCase();
+  if (host !== "127.0.0.1" && host !== "::1" && host !== "[::1]" && host !== "localhost") {
+    return false;
+  }
+  const p = u.pathname.replace(/\/+$/, "");
+  return p === "" || p === "/v1";
 }
 
 function isInt(n: unknown): n is number {
@@ -398,7 +447,7 @@ export function loadConfig(configPath: string): AppConfig {
     const c = (parsed as Record<string, unknown>)["cultivation"];
     if (!isPlainObject(c)) throw new Error("cultivation must be an object");
     for (const k of Object.keys(c)) {
-      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts"].includes(k)) {
+      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts", "retireMinAgeMs"].includes(k)) {
         throw new Error(`unknown cultivation field: ${k}`);
       }
     }
@@ -414,11 +463,15 @@ export function loadConfig(configPath: string): AppConfig {
     const reviewMaxAttempts = c["reviewMaxAttempts"] ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS;
     const eR = checkRange("cultivation.reviewMaxAttempts", reviewMaxAttempts, 1, 10);
     if (eR) throw new Error(eR);
+    const retireMinAgeMs = c["retireMinAgeMs"] ?? CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS;
+    const eA = checkRange("cultivation.retireMinAgeMs", retireMinAgeMs, 0, 2592000000);
+    if (eA) throw new Error(eA);
     cultivation = {
       queueMax: queueMax as number,
       batchMax: batchMax as number,
       leaseTtlMs: leaseTtlMs as number,
       reviewMaxAttempts: reviewMaxAttempts as number,
+      retireMinAgeMs: retireMinAgeMs as number,
     };
   }
 
@@ -426,10 +479,26 @@ export function loadConfig(configPath: string): AppConfig {
   if ("llm" in parsed && (parsed as Record<string, unknown>)["llm"] !== undefined) {
     const l = (parsed as Record<string, unknown>)["llm"];
     if (!isPlainObject(l)) throw new Error("llm must be an object");
+    const LLM_KEYS = [
+      "backend",
+      "modelDir",
+      "timeoutMs",
+      "enabled",
+      "maxNewTokens",
+      "maxPromptChars",
+      "baseUrl",
+      "model",
+      "apiKeyEnv",
+      "disableThinking",
+    ] as const;
     for (const k of Object.keys(l)) {
-      if (!["modelDir", "timeoutMs", "enabled", "maxNewTokens", "maxPromptChars"].includes(k)) {
+      if (!(LLM_KEYS as readonly string[]).includes(k)) {
         throw new Error(`unknown llm field: ${k}`);
       }
+    }
+    const backend = l["backend"] ?? "onnx";
+    if (backend !== "onnx" && backend !== "openai") {
+      throw new Error('llm.backend must be "onnx" or "openai"');
     }
     const modelDir = l["modelDir"] ?? LLM_DEFAULT_MODEL_DIR;
     if (typeof modelDir !== "string" || modelDir.length === 0 || modelDir.includes("\u0000")) {
@@ -446,13 +515,65 @@ export function loadConfig(configPath: string): AppConfig {
     const maxPromptChars = l["maxPromptChars"] ?? LLM_DEFAULT_MAX_PROMPT_CHARS;
     const eP = checkRange("llm.maxPromptChars", maxPromptChars, 500, 8000);
     if (eP) throw new Error(eP);
-    llm = {
-      modelDir: modelDir as string,
-      timeoutMs: timeoutMs as number,
-      enabled: enabled as boolean,
-      maxNewTokens: maxNewTokens as number,
-      maxPromptChars: maxPromptChars as number,
-    };
+    if (backend === "onnx") {
+      for (const k of ["baseUrl", "model", "apiKeyEnv", "disableThinking"] as const) {
+        if (k in l) throw new Error(`llm.${k} requires llm.backend "openai"`);
+      }
+      llm = {
+        backend: "onnx",
+        modelDir: modelDir as string,
+        timeoutMs: timeoutMs as number,
+        enabled: enabled as boolean,
+        maxNewTokens: maxNewTokens as number,
+        maxPromptChars: maxPromptChars as number,
+      };
+    } else {
+      const baseUrl = l["baseUrl"];
+      if (!isLoopbackHttpUrl(baseUrl)) {
+        throw new Error(
+          "llm.baseUrl must be an http(s) URL on loopback (127.0.0.1, ::1, or localhost)",
+        );
+      }
+      const model = l["model"];
+      if (
+        typeof model !== "string" ||
+        model.length === 0 ||
+        model.length > 200 ||
+        model.includes("\u0000") ||
+        /[\r\n]/.test(model)
+      ) {
+        throw new Error("llm.model must be a non-empty single-line string");
+      }
+      let apiKeyEnv: string | undefined;
+      if (l["apiKeyEnv"] !== undefined) {
+        const v = l["apiKeyEnv"];
+        if (
+          typeof v !== "string" ||
+          v.length === 0 ||
+          v.length > 128 ||
+          !/^[A-Za-z_][A-Za-z0-9_]*$/.test(v)
+        ) {
+          throw new Error("llm.apiKeyEnv must be an environment variable name");
+        }
+        apiKeyEnv = v;
+      }
+      const disableThinking = l["disableThinking"] ?? true;
+      if (typeof disableThinking !== "boolean") {
+        throw new Error("llm.disableThinking must be a boolean");
+      }
+      llm = {
+        backend: "openai",
+        modelDir: modelDir as string,
+        timeoutMs: timeoutMs as number,
+        enabled: enabled as boolean,
+        maxNewTokens: maxNewTokens as number,
+        maxPromptChars: maxPromptChars as number,
+        baseUrl,
+        model,
+        ...(apiKeyEnv !== undefined ? { apiKeyEnv } : {}),
+        disableThinking,
+      };
+    }
   }
 
   let maintenance: MaintenanceConfig | undefined;
@@ -702,13 +823,18 @@ export function episodesBounds(config: AppConfig): Required<EpisodesConfig> {
   };
 }
 
-export function llmBounds(config: AppConfig): Required<LlmConfig> {
+export function llmBounds(config: AppConfig): LlmConfig & { backend: LlmBackend } {
   return {
+    backend: config.llm?.backend ?? "onnx",
     modelDir: config.llm?.modelDir ?? LLM_DEFAULT_MODEL_DIR,
     timeoutMs: config.llm?.timeoutMs ?? LLM_DEFAULT_TIMEOUT_MS,
     enabled: config.llm?.enabled ?? false,
     maxNewTokens: config.llm?.maxNewTokens ?? LLM_DEFAULT_MAX_NEW_TOKENS,
     maxPromptChars: config.llm?.maxPromptChars ?? LLM_DEFAULT_MAX_PROMPT_CHARS,
+    baseUrl: config.llm?.baseUrl,
+    model: config.llm?.model,
+    apiKeyEnv: config.llm?.apiKeyEnv,
+    disableThinking: config.llm?.disableThinking ?? true,
   };
 }
 
@@ -722,6 +848,7 @@ export const CULTIVATION_DEFAULT_QUEUE_MAX = 500;
 export const CULTIVATION_DEFAULT_BATCH_MAX = 20;
 export const CULTIVATION_DEFAULT_LEASE_TTL_MS = 120000;
 export const CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS = 5;
+export const CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS = 86400000;
 
 export function cultivationBounds(config: AppConfig): Required<CultivationConfig> {
   return {
@@ -730,6 +857,7 @@ export function cultivationBounds(config: AppConfig): Required<CultivationConfig
     leaseTtlMs: config.cultivation?.leaseTtlMs ?? CULTIVATION_DEFAULT_LEASE_TTL_MS,
     reviewMaxAttempts:
       config.cultivation?.reviewMaxAttempts ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS,
+    retireMinAgeMs: config.cultivation?.retireMinAgeMs ?? CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS,
   };
 }
 
