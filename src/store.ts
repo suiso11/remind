@@ -101,10 +101,11 @@ import {
  * schema; 4 adds record_topics.origin (tag/external/llm precedence); 5 adds
  * the derived association tables to the versioned migration (they are no
  * longer re-created on every open); 6 adds associate_scope_state, the
- * whole-scope edge fingerprint. Older 2-, 3-, 4-, and 5-stamped files are
- * migrated in place (never refused).
+ * whole-scope edge fingerprint; 7 adds the derived record_importance ledger
+ * used by activation preview/scoring. Older 2-, 3-, 4-, 5-, and 6-stamped
+ * files are migrated in place (never refused).
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -113,6 +114,8 @@ export const LEGACY_SCHEMA_VERSION_3 = 3;
 export const LEGACY_SCHEMA_VERSION_4 = 4;
 /** Per-record-edge-scan stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_5 = 5;
+/** Pre-record-importance schema stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_6 = 6;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -501,6 +504,15 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   db.exec(`CREATE TABLE IF NOT EXISTS usage(
     ts TEXT NOT NULL, recallId TEXT NOT NULL, recordId TEXT NOT NULL, scope TEXT NOT NULL, runId TEXT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS note_heat(recordId TEXT PRIMARY KEY, usedCount INTEGER NOT NULL, lastUsedAt TEXT NOT NULL)`);
+  // Derived importance ledger (rebuildable; never canonical). bodyHash pins
+  // the record revision the score was computed from, so a stale score is
+  // ignored rather than silently applied to corrected text.
+  db.exec(`CREATE TABLE IF NOT EXISTS record_importance(
+    recordId TEXT PRIMARY KEY,
+    importance REAL NOT NULL,
+    bodyHash TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('llm','external')),
+    scoredAt TEXT NOT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS projection_queue(recordId TEXT PRIMARY KEY, attempts INTEGER NOT NULL, nextAt TEXT NOT NULL)`);
   // Derived lexical indexes (rebuildable; never canonical).
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);
@@ -879,7 +891,7 @@ function isDbOverCap(db: DatabaseSync, config: AppConfig): boolean {
   }
 }
 
-function assertDbUnderCap(db: DatabaseSync, config: AppConfig): void {
+export function assertDbUnderCap(db: DatabaseSync, config: AppConfig): void {
   if (isDbOverCap(db, config)) throw new Error("db over cap");
 }
 
@@ -4603,6 +4615,7 @@ function transitionRetirement(
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride: string | undefined,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
   const allowed = new Set(["id", "scope", "reasonCode"]);
@@ -4648,6 +4661,9 @@ function transitionRetirement(
   let committed: ResponseEnvelope;
   try {
     committed = withTransaction(db, (): ResponseEnvelope => {
+      // Ownership fence inside the transition transaction: a stolen/expired
+      // lease cannot commit a maintenance-driven retirement/reactivation.
+      assertCanonicalWriteFence(db, fence);
       let target: { scope: string; status: string } | undefined;
       try {
         target = db.prepare(`SELECT scope, status FROM records WHERE id = ?`).get(id) as
@@ -4701,6 +4717,7 @@ function transitionRetirement(
     if (msg === "missing") return budgeted(fail("NOT_FOUND"), config);
     if (msg === "scope mismatch") return budgeted(fail("FORBIDDEN_SCOPE"), config);
     if (msg === "not reversible") return budgeted(fail("CONFLICT"), config);
+    if (msg === "lease lost") return budgeted(fail("CONFLICT"), config);
     if (/UNIQUE constraint failed: operations/.test(msg)) {
       let again: StoredOp | null = null;
       try {
@@ -4724,8 +4741,9 @@ export function retireRecord(
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride?: string,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
-  return transitionRetirement(db, config, "record.retire", params, idempotencyKey, nowOverride);
+  return transitionRetirement(db, config, "record.retire", params, idempotencyKey, nowOverride, fence);
 }
 
 export function reactivateRecord(
@@ -4734,8 +4752,9 @@ export function reactivateRecord(
   params: Record<string, unknown>,
   idempotencyKey: string,
   nowOverride?: string,
+  fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
-  return transitionRetirement(db, config, "record.reactivate", params, idempotencyKey, nowOverride);
+  return transitionRetirement(db, config, "record.reactivate", params, idempotencyKey, nowOverride, fence);
 }
 
 /* ------------------------------------------------------------------ */

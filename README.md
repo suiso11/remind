@@ -148,6 +148,21 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 - 設定 `associate.*` (任意・起動時のみ): `batchMax` 50 (上限 500)、`topK` 5、`minScore` 0.45、`topicMergeMin` 0.8、`topicBonus` 0.3、`llmTopics` false。`llmTopics` は既定 false。実測では pinned Qwen2.5-1.5B が Ninja H2 を「ゲーム機」、GSX-S1000F を「自転車」と分類したため、SLM による話題抽出を既定で行わない (タグと `topic.set` が優先)。
 - `topic.set` は 1 件の active 記録に外部話題 (最大 3) を設定する。`topic.pending` はタグも外部話題も無い active 記録を返す。どちらも呼出側のより大きなモデルが話題を供給するための口であり、本 CLI 内で生成を強制しない。どちらも heat・露出を変えない。
 
+## 活性化による引退 (maintain.activation / activation.preview)
+
+- 引退は経過時間だけでは決めない。ACT-R の基底活性
+
+  `A = ln( Σ_j max(Δh_j, 1)^(-d) ) + wKind[kind] + wImportance × importance`
+
+  を使う。`Δh_j` は作成・検証済み feedback 利用・訂正・再活性化の各時刻からの経過時間 (時間、1 時間床)、`importance ∈ [0,1]` はモデル採点値 `n/3` (n=0..3)、欠損時は中立 0.5。`kind` は `user_fact / model_inference / summary / correction`。既定値は `decay=0.5`、`tauRetire=-1.5`、`tauReactivate=-0.5`、`minAgeHours=72`、`wImportance=2.0`、`wKind={user_fact:1.0, model_inference:0.0, summary:0.3, correction:1.0}`。
+- `activation.preview {scope, limit?, cursor?, includeRetired?}` は読み取り専用で、`A` 昇順の `{id,status,kind,label,A,importance,uses,ageHours,decision}` と summary を返す。heat・usage・audit・importance・status は一切書かない。`nextCursor` は不透明で、採点時刻を内包して固定するため、後続ページは時間経過に関係なく同じ `A` で安定して頁送りする（`cursor` 破損・時刻欠落は `BAD_REQUEST`）。
+- `maintain.activation {scope, limit?}` (write op、`idempotencyKey` 必須) は (a) 現在の bodyHash に対する重要度が未採点・陳腐化した active+retired 記憶を最大 `limit` 件 (既定 `activation.batchMax=20`、上限 200) だけ `record_importance` に採点する。推論の合間は共有リースを heartbeat し、確定時は現在時刻で lease fence する（期限切れなら `CONFLICT` で無書込み）。ローカル LLM 無効・欠落時は採点をスキップし `degraded:true` を返す。(b) scope 全体の `A` を再計算し、`activation.apply` が true のときだけ判断を適用する。判断スキャンは 1 パス最大 2,000 件のまま、(createdAt,id) の scope 別カーソルを永続化してパスごとに前進し、末尾で先頭へ wrap するので、古い retired 行が窓を占めても新しい行が eventually 評価される。
+- 活性化の書込み tx（importance と operations/audit/cursor）は commit 前に `dbMaxBytes` を検査し、超過時は rollback して `STORE_UNAVAILABLE` を返す（既存 store と同じ cap gate）。
+- 引退は `A < tauRetire` かつ `ageHours >= minAgeHours`。再活性化は `A >= tauReactivate` かつ直近の引退理由が `LOW_ACTIVATION` または旧 `LOW_SIGNAL` (`reconsiderLegacy=true` のときのみ)。適用時は既存の `record.retire` (`reasonCode:"LOW_ACTIVATION"`) / `record.reactivate` (`reasonCode:"STILL_USEFUL"`) 経路を単一 flight リースの fence 付きトランザクション内で使うため、監査・冪等性・可逆性は通常遷移と同一。
+- `activation.protectImportance` (既定 0.66 ≒ 2/3) 以上の重要度を持つ記憶は、通常の `tauRetire` では引退せず `A < tauRetire - 1` の保護マージンを要求する。モデル採点の長期的な事実が頻度・新しさだけで落ちるのを防ぐ。
+- `activation.apply` は既定 **false**。false の間は状態を変えず `wouldRetire / wouldReactivate` だけを返す。`maintain.activation` の応答 data は `{scored, scoreFailed, retired, reactivated, wouldRetire, wouldReactivate, degraded}`。モデル調整が済むまで既定 off とし、チューニング後に明示的に有効化する。
+- 既存の `maintain.distill` の保持ゲートで `LOW_SIGNAL` として引退済みの記録も、`reconsiderLegacy` により活性が戻れば再活性化候補になる。`docs/retention.md` の 2026-10-22 決定を参照。
+
 ## 冪等・エラー
 
 - 全書き込みは `idempotencyKey` 必須。欠落は `BAD_REQUEST`。同一キー + 同一 params の再送は保存済み応答を `deduplicated:true` で返す。params 改変は `CONFLICT`。

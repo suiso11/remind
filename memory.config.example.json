@@ -63,5 +63,22 @@
     "topicBonus": 0.3,
     "llmTopics": false
   },
+  "activation": {
+    "decay": 0.5,
+    "tauRetire": -1.5,
+    "tauReactivate": -0.5,
+    "minAgeHours": 72,
+    "wImportance": 2.0,
+    "wKind": {
+      "user_fact": 1.0,
+      "model_inference": 0.0,
+      "summary": 0.3,
+      "correction": 1.0
+    },
+    "reconsiderLegacy": true,
+    "batchMax": 20,
+    "apply": false,
+    "protectImportance": 0.66
+  },
   "requirePrivacy": false
 }
