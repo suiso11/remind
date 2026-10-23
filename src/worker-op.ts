@@ -42,6 +42,7 @@ import { applyResponseBudget, fail } from "./protocol.js";
 import { normalizeBody } from "./normalize.js";
 import { maintainDistill } from "./distill.js";
 import { maintainAssociate, topicPending, topicSet } from "./associate.js";
+import { maintainConsolidate } from "./consolidate.js";
 import {
   embedTexts,
   resolveModelDir,
@@ -193,6 +194,14 @@ async function runOpAsync(db: DatabaseSync, req: Req, workerStartMs: number) {
     // Importance inference is bounded by maintenance.timeoutMs; transitions
     // share the cultivation single-flight lease with the other maintenance ops.
     return maintainActivation(db, req.config, req.configPath, req.params, req.idempotencyKey);
+  }
+  if (req.op === "maintain.consolidate") {
+    if (typeof req.idempotencyKey !== "string") {
+      return applyResponseBudget(fail("BAD_REQUEST"), req.config.limits.responseMaxBytes);
+    }
+    // Model inference runs outside canonical transactions; the shared
+    // cultivation lease bounds it against the other maintenance ops.
+    return maintainConsolidate(db, req.config, req.configPath, req.params, req.idempotencyKey);
   }
   return runOpSync(db, req, req.op === "record.recall" ? await recallVectorFor(req, workerStartMs) : undefined);
 }

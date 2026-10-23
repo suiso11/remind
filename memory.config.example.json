@@ -63,6 +63,10 @@
     "topicBonus": 0.3,
     "llmTopics": false
   },
+  "consolidate": {
+    "minMembers": 3,
+    "batchMax": 5
+  },
   "activation": {
     "decay": 0.5,
     "tauRetire": -1.5,

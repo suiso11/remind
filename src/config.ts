@@ -122,6 +122,18 @@ export interface AssociateConfig {
 }
 
 /**
+ * P3 topic-cluster consolidation bounds (startup-only, optional). A topic
+ * cluster is consolidated only once it has at least minMembers active member
+ * records; one pass processes at most batchMax clusters.
+ */
+export interface ConsolidateConfig {
+  /** Minimum active member records for a topic to be consolidated (default 3). */
+  minMembers: number;
+  /** Max topic clusters processed per maintain.consolidate run (default 5). */
+  batchMax: number;
+}
+
+/**
  * ACT-R activation model bounds (startup-only, optional). Absent uses the
  * documented defaults. The model/preview are read-only; maintain.activation
  * writes only when `apply` is true.
@@ -189,6 +201,8 @@ export interface AppConfig {
   episodes?: EpisodesConfig;
   /** P3 derived association bounds (optional; absent uses defaults). */
   associate?: AssociateConfig;
+  /** P3 topic-cluster consolidation bounds (optional; absent uses defaults). */
+  consolidate?: ConsolidateConfig;
   /** ACT-R activation model/preview bounds (optional; absent uses defaults). */
   activation?: ActivationConfig;
   /**
@@ -212,6 +226,7 @@ const TOP_KEYS = [
   "maintenance",
   "episodes",
   "associate",
+  "consolidate",
   "activation",
   "requirePrivacy",
 ] as const;
@@ -692,6 +707,27 @@ export function loadConfig(configPath: string): AppConfig {
     };
   }
 
+  let consolidate: ConsolidateConfig | undefined;
+  if ("consolidate" in parsed && (parsed as Record<string, unknown>)["consolidate"] !== undefined) {
+    const c = (parsed as Record<string, unknown>)["consolidate"];
+    if (!isPlainObject(c)) throw new Error("consolidate must be an object");
+    for (const k of Object.keys(c)) {
+      if (!["minMembers", "batchMax"].includes(k)) {
+        throw new Error(`unknown consolidate field: ${k}`);
+      }
+    }
+    const minMembers = c["minMembers"] ?? CONSOLIDATE_DEFAULT_MIN_MEMBERS;
+    const eM = checkRange("consolidate.minMembers", minMembers, 2, 50);
+    if (eM) throw new Error(eM);
+    const batchMax = c["batchMax"] ?? CONSOLIDATE_DEFAULT_BATCH_MAX;
+    const eB = checkRange("consolidate.batchMax", batchMax, 1, 50);
+    if (eB) throw new Error(eB);
+    consolidate = {
+      minMembers: minMembers as number,
+      batchMax: batchMax as number,
+    };
+  }
+
   let activation: ActivationConfig | undefined;
   if ("activation" in parsed && (parsed as Record<string, unknown>)["activation"] !== undefined) {
     const a = (parsed as Record<string, unknown>)["activation"];
@@ -826,6 +862,7 @@ export function loadConfig(configPath: string): AppConfig {
     ...(maintenance ? { maintenance } : {}),
     ...(episodes ? { episodes } : {}),
     ...(associate ? { associate } : {}),
+    ...(consolidate ? { consolidate } : {}),
     ...(activation ? { activation } : {}),
     ...(requirePrivacy !== undefined ? { requirePrivacy } : {}),
   };
@@ -886,6 +923,17 @@ export const ASSOCIATE_DEFAULT_TOPIC_MERGE_MIN = 0.8;
 export const ASSOCIATE_DEFAULT_TOPIC_BONUS = 0.3;
 /** Topic extraction is opt-in; canonical tags and topic.set do not need the SLM. */
 export const ASSOCIATE_DEFAULT_LLM_TOPICS = false;
+
+/** P3 topic-cluster consolidation defaults (startup-only). */
+export const CONSOLIDATE_DEFAULT_MIN_MEMBERS = 3;
+export const CONSOLIDATE_DEFAULT_BATCH_MAX = 5;
+
+export function consolidateBounds(config: AppConfig): Required<ConsolidateConfig> {
+  return {
+    minMembers: config.consolidate?.minMembers ?? CONSOLIDATE_DEFAULT_MIN_MEMBERS,
+    batchMax: config.consolidate?.batchMax ?? CONSOLIDATE_DEFAULT_BATCH_MAX,
+  };
+}
 
 /** ACT-R activation defaults (startup-only; documented in memory.config.example.json). */
 export const ACTIVATION_DEFAULT_DECAY = 0.5;

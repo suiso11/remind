@@ -102,10 +102,15 @@ import {
  * the derived association tables to the versioned migration (they are no
  * longer re-created on every open); 6 adds associate_scope_state, the
  * whole-scope edge fingerprint; 7 adds the derived record_importance ledger
- * used by activation preview/scoring. Older 2-, 3-, 4-, 5-, and 6-stamped
- * files are migrated in place (never refused).
+ * used by activation preview/scoring and maintain.consolidate; 8 adds the
+ * maintain.consolidate cluster ledger; 9 adds the per-scope consolidate
+ * rotation cursor. Older 2- through 8-stamped files are migrated in place
+ * (never refused), including v7 files stamped by PR #32's activation slice
+ * (record_importance already present and preserved) and v8 files that already
+ * hold cluster ledgers. Every CREATE in the sequence is IF NOT EXISTS, so a
+ * re-run of 7 -> 9 is idempotent.
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 9;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -116,6 +121,10 @@ export const LEGACY_SCHEMA_VERSION_4 = 4;
 export const LEGACY_SCHEMA_VERSION_5 = 5;
 /** Pre-record-importance schema stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_6 = 6;
+/** Pre-consolidation-cluster-ledger stamp (v7 carries record_importance; identical to PR #32's activation v7). */
+export const LEGACY_SCHEMA_VERSION_7 = 7;
+/** Pre-consolidate-rotation-cursor stamp (v8 carries cluster_summaries); accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_8 = 8;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -504,9 +513,12 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   db.exec(`CREATE TABLE IF NOT EXISTS usage(
     ts TEXT NOT NULL, recallId TEXT NOT NULL, recordId TEXT NOT NULL, scope TEXT NOT NULL, runId TEXT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS note_heat(recordId TEXT PRIMARY KEY, usedCount INTEGER NOT NULL, lastUsedAt TEXT NOT NULL)`);
-  // Derived importance ledger (rebuildable; never canonical). bodyHash pins
-  // the record revision the score was computed from, so a stale score is
-  // ignored rather than silently applied to corrected text.
+  // Derived importance ledger (rebuildable; never canonical). Added in v7 by
+  // the activation slice; PR #32 introduced the same table at v7, and the two
+  // definitions are unified here (single table, single row per record).
+  // bodyHash pins the record revision the score was computed from, so a stale
+  // score is ignored rather than applied to corrected text. Every migration
+  // path (v6, v7, v8) creates it here and leaves an existing table untouched.
   db.exec(`CREATE TABLE IF NOT EXISTS record_importance(
     recordId TEXT PRIMARY KEY,
     importance REAL NOT NULL,
@@ -568,6 +580,26 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_episode
     ON episode_summaries(scope, kind, episodeKey, level)`);
+  // P3 maintain.consolidate ledger (derived; rebuildable). One active
+  // topic-cluster summary per (scope, topic); recordId points at the active
+  // canonical summary (or its latest revision) and memberFingerprint is the
+  // sorted member ids + bodyHashes the summary was generated from. When the
+  // fingerprint changes, the next pass regenerates and supersedes the record.
+  db.exec(`CREATE TABLE IF NOT EXISTS cluster_summaries(
+    scope TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    recordId TEXT NOT NULL,
+    memberFingerprint TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY(scope, topic))`);
+  // Derived rotation cursor (rebuildable; never canonical). One row per scope
+  // naming the last topic that a bounded maintain.consolidate pass attempted.
+  // The next pass starts just after it, so topics that repeatedly produce no
+  // grounded text or defer cannot starve later topics under a small limit.
+  db.exec(`CREATE TABLE IF NOT EXISTS consolidate_scope_state(
+    scope TEXT PRIMARY KEY,
+    lastTopic TEXT NOT NULL,
+    updatedAt TEXT NOT NULL)`);
   // Explicit per-event completion marker. An event is pending until its last
   // verified/verbatim window transaction (or a no-op "all windows already
   // present" repair) inserts this row. Unlike a createdAt watermark this is
@@ -1834,6 +1866,12 @@ export interface CanonicalWriteFence {
   owner: string;
   /** Timestamp used to evaluate lease liveness. */
   now: string;
+  /**
+   * Runs inside the canonical transaction before any canonical row is
+   * written. Throw to refuse the whole write (callers re-check the inputs
+   * their inference was based on, e.g. cluster membership).
+   */
+  beforeWrite?: (db: DatabaseSync) => void;
   afterInsert?: (db: DatabaseSync, recordId: string) => void;
 }
 
@@ -1845,6 +1883,7 @@ function assertCanonicalWriteFence(
   if (!isCultivationLeaseHeldBy(db, fence.owner, fence.now)) {
     throw new Error("lease lost");
   }
+  fence.beforeWrite?.(db);
 }
 
 export function rememberRecord(
@@ -3057,6 +3096,70 @@ export function listEpisodeSummaries(
   }));
 }
 
+/** One derived topic-cluster ledger row (maintain.consolidate). */
+export interface ClusterSummaryRow {
+  scope: string;
+  topic: string;
+  recordId: string;
+  memberFingerprint: string;
+  createdAt: string;
+}
+
+/**
+ * Upsert one cluster ledger row. No transaction is opened here so the
+ * maintainer can commit it atomically with the canonical summary record
+ * (afterInsert under the cultivation lease fence).
+ */
+export function upsertClusterSummary(db: DatabaseSync, row: ClusterSummaryRow): void {
+  db.prepare(
+    `INSERT INTO cluster_summaries(scope, topic, recordId, memberFingerprint, createdAt)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(scope, topic) DO UPDATE SET
+       recordId = excluded.recordId,
+       memberFingerprint = excluded.memberFingerprint,
+       createdAt = excluded.createdAt`,
+  ).run(row.scope, row.topic, row.recordId, row.memberFingerprint, row.createdAt);
+}
+
+/** Read one cluster ledger row (scope + topic), or null when absent. */
+export function getClusterSummary(
+  db: DatabaseSync,
+  scope: string,
+  topic: string,
+): ClusterSummaryRow | null {
+  const row = db
+    .prepare(
+      `SELECT scope, topic, recordId, memberFingerprint, createdAt
+       FROM cluster_summaries WHERE scope = ? AND topic = ?`,
+    )
+    .get(scope, topic) as ClusterSummaryRow | undefined;
+  return row ?? null;
+}
+
+/** Read the last attempted cluster topic for one scope (rotation cursor). */
+export function getConsolidateCursor(db: DatabaseSync, scope: string): string | null {
+  const row = db
+    .prepare(`SELECT lastTopic FROM consolidate_scope_state WHERE scope = ?`)
+    .get(scope) as { lastTopic: string } | undefined;
+  return row?.lastTopic ?? null;
+}
+
+/** Persist the last attempted cluster topic for one scope (derived, bounded). */
+export function setConsolidateCursor(
+  db: DatabaseSync,
+  scope: string,
+  lastTopic: string,
+  now: string,
+): void {
+  db.prepare(
+    `INSERT INTO consolidate_scope_state(scope, lastTopic, updatedAt)
+     VALUES (?, ?, ?)
+     ON CONFLICT(scope) DO UPDATE SET
+       lastTopic = excluded.lastTopic,
+       updatedAt = excluded.updatedAt`,
+  ).run(scope, lastTopic, now);
+}
+
 function encodeEpisodeCursor(startAt: string, episodeKey: string): string {
   return Buffer.from(JSON.stringify({ s: startAt, k: episodeKey }), "utf8").toString("base64url");
 }
@@ -4250,7 +4353,7 @@ export function correctRecord(
   fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
-  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId", "privacy"]);
+  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "tags", "links", "sourceRefs", "runId", "privacy", "clearPrivacy"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return budgeted(bad(), config);
   }
@@ -4278,38 +4381,42 @@ export function correctRecord(
   if (nRunId === "invalid") return budgeted(bad(), config);
   // F-I01-05 optional privacy on corrections: when absent the new revision
   // inherits the superseded record's privacy (including null); when present
-  // it overrides. Strict shape either way.
+  // it overrides. Strict shape either way. `clearPrivacy: true` is the
+  // explicit way to store NULL/NULL (unknown privacy) instead of inheriting
+  // a superseded summary's known privacy.
   const nPrivacy = parsePrivacyParam(params["privacy"]);
   if (nPrivacy === "invalid") return budgeted(bad(), config);
+  const clearPrivacy = params["clearPrivacy"];
+  if (clearPrivacy !== undefined && typeof clearPrivacy !== "boolean") {
+    return budgeted(bad(), config);
+  }
+  if (clearPrivacy === true && nPrivacy !== null) return budgeted(bad(), config);
+  // Optional tags on corrections: when present they replace the superseded
+  // record's tags (an empty array clears them); when absent the new revision
+  // inherits them, mirroring privacy inheritance. Validated exactly like
+  // record.remember so a derived replacement can never widen the tag bounds.
+  const hasTags = Object.prototype.hasOwnProperty.call(params, "tags");
+  const nTags = hasTags ? parseTags(params["tags"], config.limits.tagsMax) : null;
+  if (nTags === "bad") return budgeted(bad(), config);
+  if (nTags === "over") return budgeted(limitExceeded(), config);
 
-  const reqHash = requestHashFor(
-    "record.correct",
-    nPrivacy === null
-      ? // Legacy compatibility: omit the key entirely when absent (pre-PR hash).
-        {
-          body: body as string,
-          kind: "correction",
-          links: nLinks,
-          observedAt: prov.observedAt,
-          recordId,
-          runId: nRunId,
-          scope: nScope,
-          source: prov.source,
-          sourceRefs: nRefs,
-        }
-      : {
-          body: body as string,
-          kind: "correction",
-          links: nLinks,
-          observedAt: prov.observedAt,
-          privacy: nPrivacy,
-          recordId,
-          runId: nRunId,
-          scope: nScope,
-          source: prov.source,
-          sourceRefs: nRefs,
-        },
-  );
+  const hashParams: Record<string, unknown> = {
+    body: body as string,
+    kind: "correction",
+    links: nLinks,
+    observedAt: prov.observedAt,
+    recordId,
+    runId: nRunId,
+    scope: nScope,
+    source: prov.source,
+    sourceRefs: nRefs,
+  };
+  // Legacy compatibility: omit privacy/tags keys entirely when absent
+  // (pre-PR hash), so existing idempotency keys keep replaying.
+  if (nPrivacy !== null) hashParams["privacy"] = nPrivacy;
+  if (clearPrivacy === true) hashParams["clearPrivacy"] = true;
+  if (nTags !== null) hashParams["tags"] = nTags;
+  const reqHash = requestHashFor("record.correct", hashParams);
 
   let saved: StoredOp | null = null;
   try {
@@ -4360,10 +4467,13 @@ export function correctRecord(
       if (!target) throw new Error("missing");
       if (target.scope !== nScope) throw new Error("scope mismatch");
       if (target.status !== "active") throw new Error("not active");
-      // F-I01-05: explicit privacy overrides; absence inherits the superseded
+      // F-I01-05: explicit privacy overrides; clearPrivacy forces unknown
+      // (NULL/NULL) rather than inheriting; absence inherits the superseded
       // record's privacy (including null for legacy rows).
       const effPrivacy: PrivacyMetadata | null =
-        nPrivacy ?? privacyFromColumns(target.privacySensitivity, target.privacyOrigin);
+        clearPrivacy === true
+          ? null
+          : nPrivacy ?? privacyFromColumns(target.privacySensitivity, target.privacyOrigin);
       verifySourceRefsInTxn(db, nScope, nRefs);
       const probe: ResponseEnvelope = ok({ record: { id: newId, supersedes: recordId } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
@@ -4382,6 +4492,22 @@ export function correctRecord(
          VALUES (?, ?, ?, ?, 'correction', ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
       ).run(newId, rawBody, nBody, bodyHashFor(nBody), prov.source, prov.observedAt, nScope, recordId, target.revision + 1, now,
         effPrivacy === null ? null : effPrivacy.sensitivity, effPrivacy === null ? null : effPrivacy.origin);
+      // Tags: explicit replacement wins; otherwise carry the superseded
+      // revision's tags forward (bounded by the current tagsMax) so a
+      // correction never silently drops derived topic/episode tags.
+      const carriedTags: string[] =
+        nTags !== null
+          ? nTags
+          : (
+              db
+                .prepare(
+                  `SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC LIMIT ?`,
+                )
+                .all(recordId, Math.max(0, config.limits.tagsMax)) as Array<{ tag: string }>
+            ).map((r) => r.tag);
+      for (const t of carriedTags) {
+        db.prepare(`INSERT OR IGNORE INTO record_tags(recordId, tag) VALUES (?, ?)`).run(newId, t);
+      }
       for (const l of nLinks) {
         db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(newId, l);
       }

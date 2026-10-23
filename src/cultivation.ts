@@ -471,6 +471,66 @@ export function isCultivationLeaseHeldBy(db: DatabaseSync, owner: string, now?: 
   }
 }
 
+/**
+ * Heartbeat interval for a lease TTL: a third of the TTL, so at least two
+ * renewals succeed before expiry even if one is delayed.
+ */
+export function leaseHeartbeatIntervalMs(ttlMs: number): number {
+  const ttl =
+    typeof ttlMs === "number" && Number.isFinite(ttlMs) ? Math.floor(ttlMs) : 0;
+  return Math.max(1, Math.floor(ttl / 3));
+}
+
+export type LeaseHeartbeatResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; reason: "lost" };
+
+/**
+ * Run `fn` while keeping the single-flight lease alive during long work
+ * (notably model inference that can outlive `cultivation.leaseTtlMs`).
+ *
+ * Callers renew only *around* model calls, so a slow generation can let the
+ * lease expire and the later fenced canonical write is rejected even when no
+ * other maintenance process ran. `renew` must be the caller's own renewal
+ * function (same owner) and returns false once the lease is no longer held.
+ * Renewal failures abort `signal` so a cooperative generator can cancel the
+ * in-flight work; the helper then resolves `{ok:false}` and the caller must
+ * write nothing. The interval timer is unref'd so it never keeps the process
+ * alive, and it is always cleared before the helper settles.
+ */
+export async function withLeaseHeartbeat<T>(
+  renew: () => boolean,
+  ttlMs: number,
+  fn: (signal: AbortSignal) => Promise<T>,
+): Promise<LeaseHeartbeatResult<T>> {
+  const controller = new AbortController();
+  let lost = false;
+  const timer = setInterval(() => {
+    if (lost) return;
+    let held = false;
+    try {
+      held = renew();
+    } catch {
+      held = false;
+    }
+    if (!held) {
+      lost = true;
+      controller.abort();
+    }
+  }, leaseHeartbeatIntervalMs(ttlMs));
+  (timer as unknown as { unref?: () => void }).unref?.();
+  try {
+    const value = await fn(controller.signal);
+    if (lost || controller.signal.aborted) return { ok: false, reason: "lost" };
+    return { ok: true, value };
+  } catch (e) {
+    if (lost || controller.signal.aborted) return { ok: false, reason: "lost" };
+    throw e;
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 /** Release the lease; only the owning holder can release. Never throws. */
 export function releaseCultivationLease(
   db: DatabaseSync,

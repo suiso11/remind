@@ -58,7 +58,7 @@ npm run build
 
 - `record.get` は status によらず同一 scope の 1 件を返す。`record.list` は既定 active のみ。順序 `createdAt DESC, id ASC`。`since` inclusive、`until` exclusive。
 - `record.feedback` は引用・採用の明示報告のみ熱を加算する。見るだけでは加算しない。露出集合外の ID は全体拒否。
-- `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。
+- `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。任意の `tags[]` は `record.remember` と同じ検証 (`tagsMax` 超過は `LIMIT_EXCEEDED`、非配列・不正要素は `BAD_REQUEST`) を受け、省略時は訂正対象 (supersede 対象) の旧版 tags を `tagsMax` まで継承し、明示時は置換、`[]` は全消去する。
 - `record.archive` は `active -> archived` の終端遷移 (復帰なし)。`reasonCode` は `USER_ARCHIVED / OBSOLETE / DUPLICATE` の固定コードのみ。行は保持され、削除ではない。
 - `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード)。`record.list` に `status:"retired"` を指定すると引退済みを一覧できる。`record.search` は active + retired の明示的検索。
 - `graph.page` は同一 scope の active (+任意 `includeRetired`) を `createdAt DESC, id ASC` で不透明 cursor 頁送りし、`nodes[{id, status, kind, label, tags, topics, createdAt, episode, out, danglingOut}] + nextCursor + version` を返す。`label` は空白畳み後の先頭 `snippetMaxCp` code point、`topics` は現在の派生 topic (sort 済み・最大 3)、`out` は同一 scope で status が対象に含まれる node のみ (それ以外は `danglingOut` 件数)。`out` の `kind` は `related / consolidation / similar` で、`similar` は派生 similar edge を小さい側の endpoint からのみ列挙する (対称な二重辺なし)。`limit` 既定は `limitDefault`、`limit < 1` は `BAD_REQUEST`、`limit > graphLimitMax` は `LIMIT_EXCEEDED`、不正 cursor は `BAD_REQUEST`。応答が `graphResponseMaxBytes` を超える場合は頁を縮め、1 件も収まらない場合のみ `LIMIT_EXCEEDED`。heat/exposure/usage は増やさない。
@@ -148,6 +148,17 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 - 設定 `associate.*` (任意・起動時のみ): `batchMax` 50 (上限 500)、`topK` 5、`minScore` 0.45、`topicMergeMin` 0.8、`topicBonus` 0.3、`llmTopics` false。`llmTopics` は既定 false。実測では pinned Qwen2.5-1.5B が Ninja H2 を「ゲーム機」、GSX-S1000F を「自転車」と分類したため、SLM による話題抽出を既定で行わない (タグと `topic.set` が優先)。
 - `topic.set` は 1 件の active 記録に外部話題 (最大 3) を設定する。`topic.pending` はタグも外部話題も無い active 記録を返す。どちらも呼出側のより大きなモデルが話題を供給するための口であり、本 CLI 内で生成を強制しない。どちらも heat・露出を変えない。
 
+## 話題クラスタ統合 (maintain.consolidate)
+
+```powershell
+'{"v":1,"op":"maintain.consolidate","idempotencyKey":"cons-001","params":{"scope":"personal/default"}}' | node dist/src/cli.js --config ./memory.config.json
+```
+
+- `maintain.consolidate` (write op、`idempotencyKey` 必須、`maintenance.timeoutMs` 予算) は `record_topics` の話題を単位に、`consolidate.minMembers` (既定 3) 件以上の active メンバーを持つ話題クラスタを 1 回の grounded summary に統合する。メンバーは現在 bodyHash の topic 行を持ち、この op 自身が書いた summary (`source = cultivation:llm-derived-cluster`) を除く。`limit` (既定 `consolidate.batchMax` 5) は処理する変更済みクラスタ数。scope ごとの回転 cursor (`consolidate_scope_state`) が最後に試行した話題を保持し、次回はその直後から始めるため、`no_grounded_sentences` / `deferred` の話題が小さい `limit` で後続話題を飢餓させない。
+- クラスタの member fingerprint (member id と bodyHash の昇順組) が `cluster_summaries` の保存値と一致する場合はモデルを呼ばず、`unchanged` として返す (変更済みクラスタの処理上限は消費しない)。変更がある場合だけ `createdAt ASC` のメンバーを最大 `EPISODE_FOLD_MAX` (5) 件ずつ cited reduce prompt に渡す。各文は (a) 引用した全メンバー本文に anchor token が存在すること、(b) 引用本文に対する厳密 YES/NO、の両方を通った場合だけ残す。anchor 不在・NO の文は落とし、1 文も残らなければ extractive fallback を書かずに `no_grounded_sentences` として記録する (作り話を書かない)。
+- 生成・文検証が一時的失敗 (null / timeout / 例外) の場合はそのクラスタを `deferred` として何も書かず、次回に再試行する。`requirePrivacy` で引用メンバーの privacy が unknown の場合も defer する。
+- 書込みは `kind: summary`、`tags: [topic]` (`tagsMax` で有界)、`links`: 引用メンバー id (`linksMax` で有界)、`sourceRefs`: 引用メンバーの sourceRefs の和集合 (span 保持、`sourceRefsMax` で有界)、provenance `cultivation:llm-derived-cluster`、privacy は `deriveConsolidationPrivacy` (sensitive 優先・全 known なら normal・unknown を含めば null)。同一 topic の active summary がある場合は `record.correct` で旧版を `superseded` にして履歴を残す。ledger が `record.correct` で訂正済みの revision を指す場合は supersedes 連鎖を有界に辿り、現行 active revision を訂正する (二重 summary を作らない)。canonical record と `cluster_summaries` 行は同じ transaction で lease fence 下に書き、その transaction 内でメンバーの active 状態・topic bodyHash・fingerprint を再検証する。変化していれば何も書かず `deferred` を返す。
+- 応答 `clusters[{topic, members, sentencesKept, sentencesDropped, recordId, outcome}] + applied + degraded`。`outcome` は `written / unchanged / no_grounded_sentences / deferred`。LLM 無効・欠落時は `{clusters:[], applied:0, degraded:true}` を返し、状態を変えない。設定 `consolidate{minMembers=3, batchMax=5}` は起動時のみ (任意)。
 ## 活性化による引退 (maintain.activation / activation.preview)
 
 - 引退は経過時間だけでは決めない。ACT-R の基底活性
@@ -172,6 +183,8 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 ## 旧 DB の扱い
 
 旧承認スキーマの DB (candidates 表等) は起動失敗 (stderr 固定文 + 非ゼロ終了) し、変更・削除・移行はしない。旧ファイルを退避し、`dbPath` に新しいファイルを指定すること。
+
+現行スキーマは `user_version=9`。v2〜v8 の既存 DB は単一の `BEGIN IMMEDIATE` 移行でその場で更新する（拒否しない）。v6 からは `record_importance` と `cluster_summaries` の両方が作成され、activation の v7 (`record_importance` 保持) からは既存の重要度行を保ったまま `cluster_summaries` だけを追加する。v8 (`cluster_summaries` 保持) からは既存行を保ったまま回転 cursor の `consolidate_scope_state` だけを追加する。既に v9 のファイルは DDL を伴わない fast path で開く。
 
 ## テスト
 

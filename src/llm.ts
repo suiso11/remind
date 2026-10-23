@@ -193,6 +193,17 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   }) as Promise<T>;
 }
 
+/** Reject as soon as `signal` aborts; the underlying work is left to settle. */
+function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(new Error("llm aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error("llm aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 async function loadGenerator(modelDir: string, timeoutMs: number): Promise<Generator> {
   if (cachedGenerator && cachedDir === modelDir) return cachedGenerator;
   if (inflightLoad && inflightLoad.dir === modelDir) return inflightLoad.promise;
@@ -303,7 +314,12 @@ export function openAiChatCompletionsUrl(baseUrl: string): string {
 
 async function generateOpenAiCompletion(
   prompt: string,
-  opts: { timeoutMs: number; maxNewTokens: number; config?: AppConfig },
+  opts: {
+    timeoutMs: number;
+    maxNewTokens: number;
+    config?: AppConfig;
+    signal?: AbortSignal;
+  },
 ): Promise<string | null> {
   const config = opts.config;
   const l = config?.llm;
@@ -339,6 +355,12 @@ async function generateOpenAiCompletion(
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   const ctrl = new AbortController();
+  const external = opts.signal;
+  const onExternalAbort = (): void => ctrl.abort();
+  if (external) {
+    if (external.aborted) ctrl.abort();
+    else external.addEventListener("abort", onExternalAbort, { once: true });
+  }
   timer = setTimeout(() => {
     timedOut = true;
     ctrl.abort();
@@ -377,6 +399,7 @@ async function generateOpenAiCompletion(
     return null;
   } finally {
     if (timer) clearTimeout(timer);
+    if (external) external.removeEventListener("abort", onExternalAbort);
   }
 }
 
@@ -392,7 +415,13 @@ async function generateOpenAiCompletion(
 export async function generateCompletion(
   prompt: string,
   modelDir: string,
-  opts: { timeoutMs: number; maxNewTokens: number; config?: AppConfig },
+  opts: {
+    timeoutMs: number;
+    maxNewTokens: number;
+    config?: AppConfig;
+    /** Optional external cancellation (e.g. a lost maintenance lease). */
+    signal?: AbortSignal;
+  },
 ): Promise<string | null> {
   try {
     if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 8000) return null;
@@ -407,14 +436,17 @@ export async function generateCompletion(
     const generator = await loadGenerator(modelDir, opts.timeoutMs);
     let out: unknown;
     try {
-      out = await withTimeout(
-        generator(prompt, {
-          max_new_tokens: opts.maxNewTokens,
-          do_sample: false,
-          return_full_text: false,
-        } as unknown as Record<string, unknown>),
-        opts.timeoutMs,
-        "llm generate timeout",
+      out = await abortable(
+        withTimeout(
+          generator(prompt, {
+            max_new_tokens: opts.maxNewTokens,
+            do_sample: false,
+            return_full_text: false,
+          } as unknown as Record<string, unknown>),
+          opts.timeoutMs,
+          "llm generate timeout",
+        ),
+        opts.signal,
       );
     } catch (e) {
       if (e instanceof Error && e.message === "llm generate timeout") poisonedDir = modelDir;

@@ -83,6 +83,7 @@ export const WRITE_OPS = new Set([
   "maintain.episodes",
   "maintain.associate",
   "maintain.activation",
+  "maintain.consolidate",
   "topic.set",
 ]);
 /** Read ops: no idempotency key. */
