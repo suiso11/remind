@@ -4353,7 +4353,7 @@ export function correctRecord(
   fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
-  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId", "privacy", "clearPrivacy"]);
+  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "tags", "links", "sourceRefs", "runId", "privacy", "clearPrivacy"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return budgeted(bad(), config);
   }
@@ -4391,6 +4391,14 @@ export function correctRecord(
     return budgeted(bad(), config);
   }
   if (clearPrivacy === true && nPrivacy !== null) return budgeted(bad(), config);
+  // Optional tags on corrections: when present they replace the superseded
+  // record's tags (an empty array clears them); when absent the new revision
+  // inherits them, mirroring privacy inheritance. Validated exactly like
+  // record.remember so a derived replacement can never widen the tag bounds.
+  const hasTags = Object.prototype.hasOwnProperty.call(params, "tags");
+  const nTags = hasTags ? parseTags(params["tags"], config.limits.tagsMax) : null;
+  if (nTags === "bad") return budgeted(bad(), config);
+  if (nTags === "over") return budgeted(limitExceeded(), config);
 
   const hashParams: Record<string, unknown> = {
     body: body as string,
@@ -4403,9 +4411,11 @@ export function correctRecord(
     source: prov.source,
     sourceRefs: nRefs,
   };
-  // Legacy compatibility: omit privacy keys entirely when absent (pre-PR hash).
+  // Legacy compatibility: omit privacy/tags keys entirely when absent
+  // (pre-PR hash), so existing idempotency keys keep replaying.
   if (nPrivacy !== null) hashParams["privacy"] = nPrivacy;
   if (clearPrivacy === true) hashParams["clearPrivacy"] = true;
+  if (nTags !== null) hashParams["tags"] = nTags;
   const reqHash = requestHashFor("record.correct", hashParams);
 
   let saved: StoredOp | null = null;
@@ -4482,6 +4492,22 @@ export function correctRecord(
          VALUES (?, ?, ?, ?, 'correction', ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
       ).run(newId, rawBody, nBody, bodyHashFor(nBody), prov.source, prov.observedAt, nScope, recordId, target.revision + 1, now,
         effPrivacy === null ? null : effPrivacy.sensitivity, effPrivacy === null ? null : effPrivacy.origin);
+      // Tags: explicit replacement wins; otherwise carry the superseded
+      // revision's tags forward (bounded by the current tagsMax) so a
+      // correction never silently drops derived topic/episode tags.
+      const carriedTags: string[] =
+        nTags !== null
+          ? nTags
+          : (
+              db
+                .prepare(
+                  `SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC LIMIT ?`,
+                )
+                .all(recordId, Math.max(0, config.limits.tagsMax)) as Array<{ tag: string }>
+            ).map((r) => r.tag);
+      for (const t of carriedTags) {
+        db.prepare(`INSERT OR IGNORE INTO record_tags(recordId, tag) VALUES (?, ?)`).run(newId, t);
+      }
       for (const l of nLinks) {
         db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run(newId, l);
       }

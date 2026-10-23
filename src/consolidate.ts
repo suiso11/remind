@@ -402,6 +402,42 @@ function activeClusterRecord(
   return null;
 }
 
+/** Bounded attempts when a replayed generation key names an inactive record. */
+const MAX_REPLAY_GENERATION_ATTEMPTS = 4;
+
+/**
+ * True when `recordId` is the usable active head this pass wanted to produce:
+ * same scope, cluster-summary provenance, active status, and the exact
+ * normalized body. Internal remember/correct keys are content-addressed, so a
+ * membership round-trip can replay a historical operation whose record has
+ * since been superseded, retired, or archived; such a replay must never be
+ * reported as a written active summary.
+ */
+function isUsableSummaryRevision(
+  db: DatabaseSync,
+  scope: string,
+  recordId: string,
+  bodyNorm: string,
+): boolean {
+  const row = db
+    .prepare(`SELECT status, scope, source, bodyNorm FROM records WHERE id = ?`)
+    .get(recordId) as
+    | { status: string; scope: string; source: string; bodyNorm: string }
+    | undefined;
+  return (
+    row !== undefined &&
+    row.status === "active" &&
+    row.scope === scope &&
+    row.source === CLUSTER_SUMMARY_SOURCE &&
+    row.bodyNorm === bodyNorm
+  );
+}
+
+/** Deterministic follow-up key: same base, generation-scoped by the replayed id. */
+function staleReplayKey(baseKey: string, replayedId: string): string {
+  return `${baseKey}-r${shaHex(replayedId).slice(0, 16)}`;
+}
+
 /**
  * Rotate the alphabetically ordered topic list so a bounded pass starts just
  * after the last attempted topic. Deterministic, wraps once, and does not
@@ -822,85 +858,137 @@ export async function maintainConsolidate(
 
       const prior = activeClusterRecord(db, p.scope, topic);
       let newRecordId: string | null = null;
+      // The replacement must carry the same bounded topic tag as a fresh
+      // create: the tag is the recall/search seed for the derived summary.
+      const summaryTags = boundTags([topic], config.limits.tagsMax);
+      const bodyNorm = normalizeBody(finalSummary);
       if (prior !== null) {
-        const correctKey = `clsc-${shaHex(
+        const baseKey = `clsc-${shaHex(
           [generationKey, prior].join("\u0000"),
         ).slice(0, 48)}`;
-        const cr = correctRecord(
-          db,
-          config,
-          {
-            recordId: prior,
-            body: finalSummary,
-            kind: "correction",
-            provenance,
-            scope: p.scope,
-            links,
-            sourceRefs: refs,
-            ...correctionPrivacy,
-          },
-          correctKey,
-          nowValid,
-          {
-            owner: execOwner,
-            now: renewNow(),
-            beforeWrite: revalidateMembership,
-            afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
-          },
-        );
-        if (cr.ok) {
-          newRecordId =
-            ((cr.data as { record?: { id?: unknown } } | null)?.record?.id as string | undefined) ??
-            null;
-          if (newRecordId !== null && cr.deduplicated) {
-            const okLedger = fencedWrite(
-              db,
-              { owner: execOwner, now: renewNow() },
-              (txDb) => writeLedger(txDb, newRecordId as string),
-            );
-            if (!okLedger) return budgeted(conflict(), config);
+        let correctKey = baseKey;
+        const seenReplays = new Set<string>();
+        for (let attempt = 0; attempt < MAX_REPLAY_GENERATION_ATTEMPTS; attempt++) {
+          const cr = correctRecord(
+            db,
+            config,
+            {
+              recordId: prior,
+              body: finalSummary,
+              kind: "correction",
+              provenance,
+              scope: p.scope,
+              tags: summaryTags,
+              links,
+              sourceRefs: refs,
+              ...correctionPrivacy,
+            },
+            correctKey,
+            nowValid,
+            {
+              owner: execOwner,
+              now: renewNow(),
+              beforeWrite: revalidateMembership,
+              afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
+            },
+          );
+          if (cr.ok) {
+            const id =
+              ((cr.data as { record?: { id?: unknown } } | null)?.record?.id as
+                | string
+                | undefined) ?? null;
+            if (id === null) break;
+            if (
+              !cr.deduplicated ||
+              isUsableSummaryRevision(db, p.scope, id, bodyNorm)
+            ) {
+              newRecordId = id;
+              if (cr.deduplicated) {
+                const okLedger = fencedWrite(
+                  db,
+                  { owner: execOwner, now: renewNow() },
+                  (txDb) => writeLedger(txDb, id),
+                );
+                if (!okLedger) return budgeted(conflict(), config);
+              }
+              break;
+            }
+            // Replayed operation produced a record that is no longer the
+            // active head (retired/archived/superseded elsewhere): never
+            // mirror it into the ledger. Correct the still-active prior under
+            // a fresh generation key instead.
+            if (seenReplays.has(id)) break;
+            seenReplays.add(id);
+            correctKey = staleReplayKey(baseKey, id);
+            continue;
           }
-        } else if (!stale && !isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
-          return budgeted(conflict(), config);
+          if (!stale && !isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
+            return budgeted(conflict(), config);
+          }
+          break;
         }
       } else {
-        const rememberKey = `cls-${generationKey}`;
-        const rr = rememberRecord(
-          db,
-          config,
-          {
-            body: finalSummary,
-            kind: "summary",
-            provenance,
-            scope: p.scope,
-            tags: boundTags([topic], config.limits.tagsMax),
-            links,
-            sourceRefs: refs,
-            ...privacyParam,
-          },
-          rememberKey,
-          nowValid,
-          {
-            owner: execOwner,
-            now: renewNow(),
-            beforeWrite: revalidateMembership,
-            afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
-          },
-        );
-        if (rr.ok) {
-          newRecordId =
-            ((rr.data as { record?: { id?: unknown } } | null)?.record?.id as string | undefined) ??
-            null;
-          if (newRecordId !== null && rr.deduplicated) {
-            const okLedger = fencedWrite(
-              db,
-              { owner: execOwner, now: renewNow() },
-              (txDb) => writeLedger(txDb, newRecordId as string),
-            );
-            if (!okLedger) return budgeted(conflict(), config);
+        const baseKey = `cls-${generationKey}`;
+        let rememberKey = baseKey;
+        const seenReplays = new Set<string>();
+        for (let attempt = 0; attempt < MAX_REPLAY_GENERATION_ATTEMPTS; attempt++) {
+          const rr = rememberRecord(
+            db,
+            config,
+            {
+              body: finalSummary,
+              kind: "summary",
+              provenance,
+              scope: p.scope,
+              tags: summaryTags,
+              links,
+              sourceRefs: refs,
+              ...privacyParam,
+            },
+            rememberKey,
+            nowValid,
+            {
+              owner: execOwner,
+              now: renewNow(),
+              beforeWrite: revalidateMembership,
+              afterInsert: (txDb, recordId) => writeLedger(txDb, recordId),
+            },
+          );
+          if (rr.ok) {
+            const id =
+              ((rr.data as { record?: { id?: unknown } } | null)?.record?.id as
+                | string
+                | undefined) ?? null;
+            if (id === null) break;
+            if (
+              !rr.deduplicated ||
+              isUsableSummaryRevision(db, p.scope, id, bodyNorm)
+            ) {
+              newRecordId = id;
+              if (rr.deduplicated) {
+                const okLedger = fencedWrite(
+                  db,
+                  { owner: execOwner, now: renewNow() },
+                  (txDb) => writeLedger(txDb, id),
+                );
+                if (!okLedger) return budgeted(conflict(), config);
+              }
+              break;
+            }
+            // The historical generation key replays a record that is no
+            // longer active (e.g. membership returned to a pre-retirement
+            // fingerprint). Derive a fresh, still-deterministic generation
+            // key from the replayed id so a genuine retry of this pass
+            // replays the new active summary instead of duplicating it.
+            if (seenReplays.has(id)) break;
+            seenReplays.add(id);
+            rememberKey = staleReplayKey(baseKey, id);
+            continue;
           }
-        } else if (!stale && !isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
-          return budgeted(conflict(), config);
+          if (!stale && !isCultivationLeaseHeldBy(db, execOwner, renewNow())) {
+            return budgeted(conflict(), config);
+          }
+          break;
         }
       }
 

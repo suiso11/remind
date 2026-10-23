@@ -43,6 +43,8 @@ const TOPIC = "orchard";
 const T0 = "2026-09-01T00:00:00.000Z";
 const RUN1 = "2026-09-02T00:00:00.000Z";
 const RUN2 = "2026-09-02T01:00:00.000Z";
+const RUN3 = "2026-09-02T02:00:00.000Z";
+const RUN4 = "2026-09-02T03:00:00.000Z";
 
 interface Ctx {
   dir: string;
@@ -302,6 +304,7 @@ interface Rec {
   id: string;
   body: string;
   kind: string;
+  source: string;
   status: string;
   tags: string[];
   links: string[];
@@ -1044,6 +1047,94 @@ describe("maintain.consolidate review regressions", () => {
       assert.notEqual(replaced, prior);
       assert.equal(rec(ctx, prior).status, "superseded");
       assert.equal(rec(ctx, replaced).privacy, null);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("preserves the cluster topic tag on a replacement summary", async () => {
+    const ctx = setup();
+    try {
+      addThreeMembers(ctx);
+      const first = data(await run(ctx, "c-tag-1", makeGen(), RUN1));
+      const firstId = first.clusters[0]!.recordId as string;
+      assert.deepEqual(rec(ctx, firstId).tags, [TOPIC]);
+
+      member(ctx, "a-tag-4", "Dana joined the orchard.");
+      const second = data(await run(ctx, "c-tag-2", makeGen(), RUN2));
+      assert.equal(second.applied, 1);
+      const newId = second.clusters[0]!.recordId as string;
+      assert.notEqual(newId, firstId);
+      assert.equal(rec(ctx, firstId).status, "superseded");
+      const replacement = rec(ctx, newId);
+      assert.equal(replacement.status, "active");
+      // Same metadata as the create path: the bounded topic tag is the
+      // recall/search seed and must not be dropped by the replacement.
+      assert.deepEqual(replacement.tags, [TOPIC]);
+      assert.equal(ledger(ctx)[0]!.recordId, newId);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("never replays a retired historical summary when membership returns", async () => {
+    const ctx = setup();
+    try {
+      addThreeMembers(ctx);
+      const first = data(await run(ctx, "c-gen-1", makeGen(), RUN1));
+      const firstId = first.clusters[0]!.recordId as string;
+
+      const fourth = member(ctx, "a-gen-4", "Dana joined the orchard.");
+      const second = data(await run(ctx, "c-gen-2", makeGen(), RUN2));
+      const secondId = second.clusters[0]!.recordId as string;
+      assert.notEqual(secondId, firstId);
+
+      // Retire the replacement and the fourth member: membership and model
+      // output return to the exact state of the first consolidation, so the
+      // internal generation key collides with the historical operation.
+      const rs = retireRecord(
+        ctx.db,
+        ctx.config,
+        { id: secondId, scope: SCOPE, reasonCode: "OUTDATED" },
+        "c-gen-retire-summary",
+        RUN2,
+      );
+      assert.equal(rs.ok, true, JSON.stringify(rs));
+      const rm = retireRecord(
+        ctx.db,
+        ctx.config,
+        { id: fourth.id, scope: SCOPE, reasonCode: "OUTDATED" },
+        "c-gen-retire-member",
+        RUN2,
+      );
+      assert.equal(rm.ok, true, JSON.stringify(rm));
+
+      const third = data(await run(ctx, "c-gen-3", makeGen(), RUN3));
+      assert.equal(third.applied, 1);
+      assert.equal(third.clusters[0]!.outcome, "written");
+      const thirdId = third.clusters[0]!.recordId as string;
+      // A fresh active generation, never the now-superseded first summary.
+      assert.notEqual(thirdId, firstId);
+      assert.equal(rec(ctx, thirdId).status, "active");
+      assert.equal(rec(ctx, thirdId).source, CLUSTER_SUMMARY_SOURCE);
+      assert.equal(ledger(ctx)[0]!.recordId, thirdId);
+      assert.equal(
+        (
+          ctx.db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM records WHERE source = ? AND status = 'active'`,
+            )
+            .get(CLUSTER_SUMMARY_SOURCE) as { n: number }
+        ).n,
+        1,
+      );
+
+      // A genuine retry of the same pass must still be idempotent: the
+      // unchanged fingerprint reports the active replacement, never null.
+      const fourthRun = data(await run(ctx, "c-gen-4", makeGen(), RUN4));
+      assert.equal(fourthRun.applied, 0);
+      assert.equal(fourthRun.clusters[0]!.outcome, "unchanged");
+      assert.equal(fourthRun.clusters[0]!.recordId, thirdId);
     } finally {
       ctx.cleanup();
     }
