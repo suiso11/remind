@@ -45,17 +45,15 @@ import {
 } from "./episodes.js";
 import {
   generateCompletion,
-  llmEnabled,
   llmMaxPromptChars,
   llmTimeoutMs,
-  modelFilesPresent,
+  llmUsable,
   parseSummaryBody,
   resolveLlmDir,
 } from "./llm.js";
 import { countCp, hasControl, normalizeBody, requestHashFor } from "./normalize.js";
 import { deriveConsolidationPrivacy } from "./privacy.js";
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
-import { clipTextToNormalizedCp } from "./split.js";
 import {
   sourceRefFromColumns,
   sourceRefKey,
@@ -458,7 +456,11 @@ export async function maintainConsolidate(
 
   try {
     const modelDir = resolveLlmDir(config, configPath);
-    const modelUsable = llmEnabled(config) && modelFilesPresent(modelDir);
+    // Production degrades when the configured backend is unusable (an
+    // explicitly configured but unusable llm section never runs, even with an
+    // injected generator). A generator injected against a config that has no
+    // llm section is the test model itself, so no model files are required.
+    const modelUsable = llmUsable(config, modelDir);
     const usable =
       modelUsable || (generateOverride !== undefined && config.llm === undefined);
     if (!usable) {
@@ -492,7 +494,7 @@ export async function maintainConsolidate(
     const generate: ConsolidateGenerate =
       generateOverride ??
       ((prompt, tokens) =>
-        generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens: tokens }));
+        generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens: tokens, config }));
 
     let topics: string[];
     try {
@@ -663,22 +665,24 @@ export async function maintainConsolidate(
         continue;
       }
 
-      // Budget the joined body in BOTH raw and normalized code points.
+      // Budget the joined body in BOTH raw and normalized code points. A
+      // verified sentence is atomic: never clip it after verification (the
+      // unchecked prefix could drop a qualifying condition). Sentences that
+      // do not fit either budget are dropped whole and are not stored.
       const bodyMaxCp = config.limits.bodyMaxCp;
       const parts: string[] = [];
       const budgets = { raw: 0, norm: 0 };
       const citedMemberIds: string[] = [];
       const citedSeen = new Set<string>();
       for (const k of kept) {
-        const text = clipTextToNormalizedCp(k.text, bodyMaxCp);
         const sep = parts.length === 0 ? 0 : 1;
-        const rawCp = countCp(text);
-        const normCp = countCp(normalizeBody(text));
+        const rawCp = countCp(k.text);
+        const normCp = countCp(normalizeBody(k.text));
         if (budgets.raw + sep + rawCp > bodyMaxCp || budgets.norm + sep + normCp > bodyMaxCp) {
-          sentencesDropped += kept.length - sentencesKept;
-          break;
+          sentencesDropped++;
+          continue;
         }
-        parts.push(text);
+        parts.push(k.text);
         budgets.raw += sep + rawCp;
         budgets.norm += sep + normCp;
         sentencesKept++;
@@ -746,6 +750,10 @@ export async function maintainConsolidate(
       );
       const provenance = { source: CLUSTER_SUMMARY_SOURCE, observedAt };
       const privacyParam = privacy !== null ? { privacy } : {};
+      // correctRecord inherits the superseded record's privacy when the param
+      // is absent, so an unknown-privacy replacement must clear it explicitly
+      // instead of silently inheriting the previous summary's metadata.
+      const correctionPrivacy = privacy !== null ? { privacy } : { clearPrivacy: true };
       const generationKey = shaHex(
         [p.scope, topic, fingerprint, finalSummary].join("\u0000"),
       ).slice(0, 48);
@@ -798,7 +806,7 @@ export async function maintainConsolidate(
             scope: p.scope,
             links,
             sourceRefs: refs,
-            ...privacyParam,
+            ...correctionPrivacy,
           },
           correctKey,
           nowValid,

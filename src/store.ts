@@ -4348,7 +4348,7 @@ export function correctRecord(
   fence?: CanonicalWriteFence,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
-  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId", "privacy"]);
+  const allowed = new Set(["recordId", "body", "kind", "provenance", "scope", "links", "sourceRefs", "runId", "privacy", "clearPrivacy"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return budgeted(bad(), config);
   }
@@ -4376,38 +4376,32 @@ export function correctRecord(
   if (nRunId === "invalid") return budgeted(bad(), config);
   // F-I01-05 optional privacy on corrections: when absent the new revision
   // inherits the superseded record's privacy (including null); when present
-  // it overrides. Strict shape either way.
+  // it overrides. Strict shape either way. `clearPrivacy: true` is the
+  // explicit way to store NULL/NULL (unknown privacy) instead of inheriting
+  // a superseded summary's known privacy.
   const nPrivacy = parsePrivacyParam(params["privacy"]);
   if (nPrivacy === "invalid") return budgeted(bad(), config);
+  const clearPrivacy = params["clearPrivacy"];
+  if (clearPrivacy !== undefined && typeof clearPrivacy !== "boolean") {
+    return budgeted(bad(), config);
+  }
+  if (clearPrivacy === true && nPrivacy !== null) return budgeted(bad(), config);
 
-  const reqHash = requestHashFor(
-    "record.correct",
-    nPrivacy === null
-      ? // Legacy compatibility: omit the key entirely when absent (pre-PR hash).
-        {
-          body: body as string,
-          kind: "correction",
-          links: nLinks,
-          observedAt: prov.observedAt,
-          recordId,
-          runId: nRunId,
-          scope: nScope,
-          source: prov.source,
-          sourceRefs: nRefs,
-        }
-      : {
-          body: body as string,
-          kind: "correction",
-          links: nLinks,
-          observedAt: prov.observedAt,
-          privacy: nPrivacy,
-          recordId,
-          runId: nRunId,
-          scope: nScope,
-          source: prov.source,
-          sourceRefs: nRefs,
-        },
-  );
+  const hashParams: Record<string, unknown> = {
+    body: body as string,
+    kind: "correction",
+    links: nLinks,
+    observedAt: prov.observedAt,
+    recordId,
+    runId: nRunId,
+    scope: nScope,
+    source: prov.source,
+    sourceRefs: nRefs,
+  };
+  // Legacy compatibility: omit privacy keys entirely when absent (pre-PR hash).
+  if (nPrivacy !== null) hashParams["privacy"] = nPrivacy;
+  if (clearPrivacy === true) hashParams["clearPrivacy"] = true;
+  const reqHash = requestHashFor("record.correct", hashParams);
 
   let saved: StoredOp | null = null;
   try {
@@ -4458,10 +4452,13 @@ export function correctRecord(
       if (!target) throw new Error("missing");
       if (target.scope !== nScope) throw new Error("scope mismatch");
       if (target.status !== "active") throw new Error("not active");
-      // F-I01-05: explicit privacy overrides; absence inherits the superseded
+      // F-I01-05: explicit privacy overrides; clearPrivacy forces unknown
+      // (NULL/NULL) rather than inheriting; absence inherits the superseded
       // record's privacy (including null for legacy rows).
       const effPrivacy: PrivacyMetadata | null =
-        nPrivacy ?? privacyFromColumns(target.privacySensitivity, target.privacyOrigin);
+        clearPrivacy === true
+          ? null
+          : nPrivacy ?? privacyFromColumns(target.privacySensitivity, target.privacyOrigin);
       verifySourceRefsInTxn(db, nScope, nRefs);
       const probe: ResponseEnvelope = ok({ record: { id: newId, supersedes: recordId } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");

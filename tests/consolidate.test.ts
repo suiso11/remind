@@ -9,10 +9,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
-import { loadConfig, type AppConfig } from "../src/config.js";
+import { loadConfig, type AppConfig, type LlmConfig } from "../src/config.js";
 import { initDb, SCHEMA_VERSION } from "../src/db.js";
 import {
   LEGACY_SCHEMA_VERSION_6,
@@ -34,6 +36,7 @@ import {
   type ConsolidateGenerate,
 } from "../src/consolidate.js";
 import type { ResponseEnvelope } from "../src/protocol.js";
+import { countCp, normalizeBody } from "../src/normalize.js";
 
 const SCOPE = "personal/default";
 const TOPIC = "orchard";
@@ -49,14 +52,14 @@ interface Ctx {
   cleanup: () => void;
 }
 
-function setup(): Ctx {
+function setup(opts: { bodyMaxCp?: number; llm?: LlmConfig } = {}): Ctx {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "consolidate-"));
   const config: AppConfig = {
     dbPath: path.join(dir, "t.db"),
     vaultPath: path.join(dir, "vault"),
     allowedScopes: [SCOPE],
     limits: {
-      bodyMaxCp: 2000,
+      bodyMaxCp: opts.bodyMaxCp ?? 2000,
       queryMaxCp: 500,
       tagsMax: 5,
       linksMax: 10,
@@ -69,6 +72,7 @@ function setup(): Ctx {
     timeouts: { cliMs: 5000, busyMs: 2000 },
     dbMaxBytes: 104857600,
     consolidate: { minMembers: 3, batchMax: 5 },
+    ...(opts.llm === undefined ? {} : { llm: opts.llm }),
   };
   const configPath = path.join(dir, "memory.config.json");
   const { db } = initDb(config, configPath);
@@ -142,6 +146,102 @@ function member(
   );
   assert.equal(tr.ok, true, JSON.stringify(tr));
   return { id, eventId };
+}
+
+/** Member with legacy/unknown privacy (rememberRecord without the param). */
+function memberUnknown(
+  ctx: Ctx,
+  key: string,
+  body: string,
+  createdAt: string = T0,
+  topic: string = TOPIC,
+): { id: string; eventId: string } {
+  const eventId = `ev-${key}`;
+  const er = eventAppend(
+    ctx.db,
+    ctx.config,
+    {
+      eventId,
+      sessionId: "s1",
+      turnId: `t-${key}`,
+      body: `raw ${key}`,
+      provenance: { source: "session:s1:turn:1", observedAt: createdAt },
+      scope: SCOPE,
+    },
+    `evk-${key}-${ctr++}`,
+    createdAt,
+  );
+  assert.equal(er.ok, true, JSON.stringify(er));
+  const rr = rememberRecord(
+    ctx.db,
+    ctx.config,
+    {
+      body,
+      kind: "user_fact",
+      provenance: { source: "session:s1:turn:1", observedAt: createdAt },
+      scope: SCOPE,
+      sourceRefs: [eventId],
+    },
+    `rem-${key}-${ctr++}`,
+    createdAt,
+  );
+  assert.equal(rr.ok, true, JSON.stringify(rr));
+  const id = (rr.data as { record: { id: string } }).record.id;
+  const row = ctx.db.prepare(`SELECT bodyHash FROM records WHERE id = ?`).get(id) as {
+    bodyHash: string;
+  };
+  const tr = topicSet(
+    ctx.db,
+    ctx.config,
+    { scope: SCOPE, id, bodyHash: row.bodyHash, topics: [topic] },
+    `ts-${key}-${ctr++}`,
+    createdAt,
+  );
+  assert.equal(tr.ok, true, JSON.stringify(tr));
+  return { id, eventId };
+}
+
+function openAiLlm(baseUrl: string): LlmConfig {
+  return {
+    backend: "openai",
+    modelDir: path.join("/nonexistent", "onnx-model"),
+    baseUrl,
+    model: "ornith-test",
+    enabled: true,
+    timeoutMs: 5000,
+    maxNewTokens: 48,
+    maxPromptChars: 2000,
+  };
+}
+
+/** Loopback OpenAI-compatible server (pattern from tests/llm-openai.test.ts). */
+async function withLlmServer<T>(
+  script: (prompt: string) => string,
+  fn: (baseUrl: string, prompts: string[]) => Promise<T>,
+): Promise<T> {
+  const prompts: string[] = [];
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => {
+      raw += c;
+    });
+    req.on("end", () => {
+      const body = JSON.parse(raw) as { messages?: Array<{ content: string }> };
+      const prompt = (body.messages ?? []).map((m) => m.content).join("\n");
+      prompts.push(prompt);
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ choices: [{ message: { content: script(prompt) } }] }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    return await fn(`http://127.0.0.1:${port}`, prompts);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 }
 
 function citationsFor(prompt: string): string {
@@ -774,6 +874,82 @@ describe("maintain.consolidate topic clusters", () => {
         /unknown consolidate field/,
       );
       assert.throws(() => loadConfig(write("high.json", { batchMax: 99 })), /batchMax/);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("maintain.consolidate review regressions", () => {
+  it("uses the configured openai backend without local ONNX files", async () => {
+    await withLlmServer(
+      (prompt) => {
+        if (/You verify a claim/.test(prompt)) return "YES";
+        return `Orchard work continued ${citationsFor(prompt)}`;
+      },
+      async (baseUrl, prompts) => {
+        const ctx = setup({ llm: openAiLlm(baseUrl) });
+        try {
+          addThreeMembers(ctx);
+          const d = data(await run(ctx, "c-openai", undefined));
+          assert.equal(d.degraded, false);
+          assert.equal(d.applied, 1);
+          assert.ok(prompts.length >= 2, "consolidation must call the loopback backend");
+          assert.equal(d.clusters[0]!.outcome, "written");
+        } finally {
+          ctx.cleanup();
+        }
+      },
+    );
+  });
+
+  it("stores unknown privacy when replacing a summary with an unknown-privacy member", async () => {
+    const ctx = setup();
+    try {
+      addThreeMembers(ctx);
+      const first = data(await run(ctx, "c-priv-1", makeGen(), RUN1));
+      const prior = first.clusters[0]!.recordId as string;
+      assert.deepEqual(rec(ctx, prior).privacy, {
+        sensitivity: "normal",
+        origin: "self_activity",
+      });
+
+      memberUnknown(ctx, "a4", "Dora inspected the orchard.");
+      const second = data(await run(ctx, "c-priv-2", makeGen(), RUN2));
+      assert.equal(second.applied, 1);
+      const replaced = second.clusters[0]!.recordId as string;
+      assert.notEqual(replaced, prior);
+      assert.equal(rec(ctx, prior).status, "superseded");
+      assert.equal(rec(ctx, replaced).privacy, null);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("drops a verified sentence that exceeds the normalized body budget instead of clipping it", async () => {
+    // Raw 90 cp, NFKC 109 cp: fits the raw budget but not the normalized one.
+    const claimText =
+      "Oﬃce staﬀ aﬀected ﬁles, oﬃce staﬀ aﬀected ﬁles, oﬃce staﬀ aﬀected ﬁles and oﬃce staﬀ ﬁles.";
+    assert.ok(countCp(claimText) <= 100);
+    assert.ok(countCp(normalizeBody(claimText)) > 100);
+
+    const ctx = setup({ bodyMaxCp: 100 });
+    try {
+      member(ctx, "b1", "Office staff affected files.");
+      member(ctx, "b2", "Office staff affected files.");
+      member(ctx, "b3", "Office staff affected files.");
+      const d = data(
+        await run(
+          ctx,
+          "c-budget",
+          makeGen({ reduce: () => `${claimText} [1]`, claim: "YES" }),
+        ),
+      );
+      assert.equal(d.applied, 0);
+      assert.equal(d.clusters[0]!.outcome, "no_grounded_sentences");
+      assert.equal(d.clusters[0]!.recordId, null);
+      assert.ok(d.clusters[0]!.sentencesDropped >= 1);
+      assert.equal(counts(ctx).summaries, 0);
     } finally {
       ctx.cleanup();
     }
