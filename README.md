@@ -58,7 +58,7 @@ npm run build
 
 - `record.get` は status によらず同一 scope の 1 件を返す。`record.list` は既定 active のみ。順序 `createdAt DESC, id ASC`。`since` inclusive、`until` exclusive。
 - `record.feedback` は引用・採用の明示報告のみ熱を加算する。見るだけでは加算しない。露出集合外の ID は全体拒否。
-- `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。
+- `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。任意の `tags[]` は `record.remember` と同じ検証 (`tagsMax` 超過は `LIMIT_EXCEEDED`、非配列・不正要素は `BAD_REQUEST`) を受け、省略時は訂正対象 (supersede 対象) の旧版 tags を `tagsMax` まで継承し、明示時は置換、`[]` は全消去する。
 - `record.archive` は `active -> archived` の終端遷移 (復帰なし)。`reasonCode` は `USER_ARCHIVED / OBSOLETE / DUPLICATE` の固定コードのみ。行は保持され、削除ではない。
 - `record.retire / record.reactivate` は `active <-> retired` の可逆遷移 (冪等、固定理由コード)。`record.list` に `status:"retired"` を指定すると引退済みを一覧できる。`record.search` は active + retired の明示的検索。
 - `graph.page` は同一 scope の active (+任意 `includeRetired`) を `createdAt DESC, id ASC` で不透明 cursor 頁送りし、`nodes[{id, status, kind, label, tags, topics, createdAt, episode, out, danglingOut}] + nextCursor + version` を返す。`label` は空白畳み後の先頭 `snippetMaxCp` code point、`topics` は現在の派生 topic (sort 済み・最大 3)、`out` は同一 scope で status が対象に含まれる node のみ (それ以外は `danglingOut` 件数)。`out` の `kind` は `related / consolidation / similar` で、`similar` は派生 similar edge を小さい側の endpoint からのみ列挙する (対称な二重辺なし)。`limit` 既定は `limitDefault`、`limit < 1` は `BAD_REQUEST`、`limit > graphLimitMax` は `LIMIT_EXCEEDED`、不正 cursor は `BAD_REQUEST`。応答が `graphResponseMaxBytes` を超える場合は頁を縮め、1 件も収まらない場合のみ `LIMIT_EXCEEDED`。heat/exposure/usage は増やさない。
