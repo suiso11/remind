@@ -733,9 +733,12 @@ describe("maintain.consolidate topic clusters", () => {
   it("upgrades a v6 database directly to v9 with importance, cluster, and cursor ledgers", () => {
     const ctx = setup();
     try {
-      // Simulate a production v6 file: neither derived ledger exists.
+      // Simulate a production v6 file: none of the later derived ledgers
+      // exists (record_importance arrived in v7, the cluster ledger in v8,
+      // and the rotation cursor in v9).
       ctx.db.exec(`DROP TABLE record_importance`);
       ctx.db.exec(`DROP TABLE cluster_summaries`);
+      ctx.db.exec(`DROP TABLE consolidate_scope_state`);
       ctx.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION_6}`);
       ctx.db.close();
 
@@ -768,14 +771,22 @@ describe("maintain.consolidate topic clusters", () => {
           `INSERT INTO record_importance(recordId, importance, bodyHash, source, scoredAt) VALUES (?, ?, ?, 'llm', ?)`,
         )
         .run(stored.id, 0.75, row.bodyHash, T0);
-      // A PR32 v7 file has no consolidation ledger yet.
+      // A PR32 v7 file has record_importance but neither consolidation
+      // ledger (and it never had the v9 rotation cursor).
       ctx.db.exec(`DROP TABLE cluster_summaries`);
+      ctx.db.exec(`DROP TABLE consolidate_scope_state`);
       ctx.db.exec(`PRAGMA user_version = ${LEGACY_SCHEMA_VERSION_7}`);
       ctx.db.close();
 
       const reopened = initDb(ctx.config, ctx.configPath);
       const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
       assert.equal(uv, SCHEMA_VERSION);
+      // record_importance is defined once by the unified chain; the v7 rows
+      // survive and the table has a single canonical definition.
+      const defs = reopened.db
+        .prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name = 'record_importance'`)
+        .get() as { n: number };
+      assert.equal(defs.n, 1);
       const kept = reopened.db
         .prepare(`SELECT recordId, importance, source FROM record_importance WHERE recordId = ?`)
         .get(stored.id) as { recordId: string; importance: number; source: string } | undefined;
@@ -792,7 +803,18 @@ describe("maintain.consolidate topic clusters", () => {
           .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = 'consolidate_scope_state'`)
           .get(),
       );
+      // Re-running the migration sequence is idempotent (every CREATE is IF
+      // NOT EXISTS) and the second open takes the no-DDL fast path.
+      const schemaBefore = (reopened.db.prepare(`PRAGMA schema_version`).get() as { schema_version: number }).schema_version;
       reopened.db.close();
+      const again = initDb(ctx.config, ctx.configPath);
+      const schemaAfter = (again.db.prepare(`PRAGMA schema_version`).get() as { schema_version: number }).schema_version;
+      assert.equal(schemaAfter, schemaBefore);
+      const keptAgain = again.db
+        .prepare(`SELECT importance FROM record_importance WHERE recordId = ?`)
+        .get(stored.id) as { importance: number } | undefined;
+      assert.equal(keptAgain?.importance, 0.75);
+      again.db.close();
     } finally {
       ctx.cleanup();
     }

@@ -36,6 +36,7 @@ import {
   type RecallVectorInput,
 } from "./store.js";
 import { episodeWindows, maintainEpisodes } from "./episodes.js";
+import { maintainActivation, activationPreview } from "./activation.js";
 import { drainProjection } from "./projection.js";
 import { applyResponseBudget, fail } from "./protocol.js";
 import { normalizeBody } from "./normalize.js";
@@ -155,6 +156,8 @@ function runOpSync(db: DatabaseSync, req: Req, vector?: RecallVectorInput) {
       return topicSet(db, cfg, req.params, req.idempotencyKey);
     case "topic.pending":
       return topicPending(db, cfg, req.params);
+    case "activation.preview":
+      return activationPreview(db, cfg, req.params);
     default:
       return applyResponseBudget(fail("BAD_REQUEST"), cfg.limits.responseMaxBytes);
   }
@@ -183,6 +186,14 @@ async function runOpAsync(db: DatabaseSync, req: Req, workerStartMs: number) {
     // Embedding happens outside the edge/state transactions; the shared
     // cultivation lease bounds it against maintain.distill/episodes.
     return maintainAssociate(db, req.config, req.configPath, req.params, req.idempotencyKey);
+  }
+  if (req.op === "maintain.activation") {
+    if (typeof req.idempotencyKey !== "string") {
+      return applyResponseBudget(fail("BAD_REQUEST"), req.config.limits.responseMaxBytes);
+    }
+    // Importance inference is bounded by maintenance.timeoutMs; transitions
+    // share the cultivation single-flight lease with the other maintenance ops.
+    return maintainActivation(db, req.config, req.configPath, req.params, req.idempotencyKey);
   }
   if (req.op === "maintain.consolidate") {
     if (typeof req.idempotencyKey !== "string") {

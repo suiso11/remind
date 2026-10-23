@@ -100,10 +100,10 @@ export function initDb(
     const uv = readUserVersion(db);
     // 0 = fresh; 2 = original M1 stamp; 3 = pre-topic-origin; 4 = pre-derived
     // association tables; 5 = pre-whole-scope edge fingerprint; 6 = pre-record-
-    // importance; 7 = pre-consolidation-cluster-ledger (activation importance
-    // already present); 8 = pre-consolidate-rotation-cursor (6, 7, and 8 are
-    // upgraded in place); SCHEMA_VERSION = already current. Anything else is
-    // an unrelated/legacy file.
+    // importance; 7 = pre-consolidation-cluster-ledger (record_importance,
+    // i.e. PR #32's activation v7, already present); 8 = pre-consolidate-
+    // rotation-cursor (6, 7, and 8 are upgraded in place); SCHEMA_VERSION =
+    // already current. Anything else is an unrelated/legacy file.
     if (
       uv !== 0 &&
       uv !== LEGACY_M1_USER_VERSION &&

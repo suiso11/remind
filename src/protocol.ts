@@ -82,6 +82,7 @@ export const WRITE_OPS = new Set([
   "maintain.distill",
   "maintain.episodes",
   "maintain.associate",
+  "maintain.activation",
   "maintain.consolidate",
   "topic.set",
 ]);
@@ -100,6 +101,7 @@ export const READ_OPS = new Set([
   "graph.local",
   "graph.version",
   "topic.pending",
+  "activation.preview",
 ]);
 
 export interface ValidRequest {
