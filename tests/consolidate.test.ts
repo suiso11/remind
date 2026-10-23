@@ -597,6 +597,107 @@ describe("maintain.consolidate topic clusters", () => {
     }
   });
 
+  it("reports the active corrected revision for an unchanged cluster", async () => {
+    const ctx = setup();
+    try {
+      addThreeMembers(ctx);
+      const first = await run(ctx, "c-10a", makeGen());
+      const firstId = data(first).clusters[0]!.recordId as string;
+
+      // User correction keeps the member set identical but supersedes the
+      // ledger's record; the ledger still points at the old revision.
+      const fixed = correctRecord(
+        ctx.db,
+        ctx.config,
+        {
+          recordId: firstId,
+          body: "Alice, Bob, and Carol still tend the orchard.",
+          kind: "correction",
+          provenance: { source: "user:annotation", observedAt: RUN1 },
+          scope: SCOPE,
+        },
+        "c-10-user-fix",
+        RUN1,
+      );
+      assert.equal(fixed.ok, true, JSON.stringify(fixed));
+      const correctedId = (fixed.data as { record: { id: string } }).record.id;
+      assert.equal(ledger(ctx)[0]!.recordId, firstId);
+
+      let calls = 0;
+      const second = await run(
+        ctx,
+        "c-10b",
+        makeGen({ onCall: () => calls++ }),
+        RUN2,
+      );
+      const d = data(second);
+      assert.equal(calls, 0);
+      assert.equal(d.clusters[0]!.outcome, "unchanged");
+      // The unchanged path must resolve through the supersedes chain exactly
+      // like the replacement path: never return the obsolete revision id.
+      assert.equal(d.clusters[0]!.recordId, correctedId);
+      assert.notEqual(d.clusters[0]!.recordId, firstId);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("keeps a user-corrected summary revision out of its own cluster", async () => {
+    const ctx = setup();
+    try {
+      addThreeMembers(ctx);
+      const first = await run(ctx, "c-11a", makeGen());
+      const firstId = data(first).clusters[0]!.recordId as string;
+
+      // The user rewrites the summary with their own provenance (so the
+      // generated source is gone) and restores its topic.
+      const fixed = correctRecord(
+        ctx.db,
+        ctx.config,
+        {
+          recordId: firstId,
+          body: "Alice, Bob, and Carol still tend the orchard.",
+          kind: "correction",
+          provenance: { source: "user:annotation", observedAt: RUN1 },
+          scope: SCOPE,
+        },
+        "c-11-user-fix",
+        RUN1,
+      );
+      assert.equal(fixed.ok, true, JSON.stringify(fixed));
+      const correctedId = (fixed.data as { record: { id: string } }).record.id;
+      const row = ctx.db.prepare(`SELECT bodyHash FROM records WHERE id = ?`).get(correctedId) as {
+        bodyHash: string;
+      };
+      const tr = topicSet(
+        ctx.db,
+        ctx.config,
+        { scope: SCOPE, id: correctedId, bodyHash: row.bodyHash, topics: [TOPIC] },
+        "c-11-topic",
+        RUN1,
+      );
+      assert.equal(tr.ok, true, JSON.stringify(tr));
+
+      let calls = 0;
+      const second = await run(
+        ctx,
+        "c-11b",
+        makeGen({ onCall: () => calls++ }),
+        RUN2,
+      );
+      const d = data(second);
+      // Membership is still the three original records; the corrected
+      // revision belongs to the cluster's supersedes chain, not its inputs.
+      assert.equal(d.clusters[0]!.members, 3);
+      assert.equal(d.clusters[0]!.outcome, "unchanged");
+      assert.equal(d.clusters[0]!.recordId, correctedId);
+      assert.equal(calls, 0);
+      assert.equal(ledger(ctx)[0]!.recordId, firstId);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("rotates past a permanently ungrounded topic under a small limit", async () => {
     const ctx = setup();
     try {

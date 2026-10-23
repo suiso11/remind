@@ -241,10 +241,26 @@ function shaHex(s: string): string {
 /* ------------------------------------------------------------------ */
 
 /**
+ * Record ids that belong to a cluster-summary revision chain for a scope: the
+ * ledger's recordId plus every revision created by correcting it (record.correct
+ * sets supersedes). A user can correct a generated summary (dropping its
+ * CLUSTER_SUMMARY_SOURCE provenance) and then restore its topic via topic.set;
+ * excluding only by source would let that revision re-enter its own cluster.
+ * The recursive CTE is deduplicated by UNION, so a cyclic supersedes chain
+ * terminates instead of looping.
+ */
+const CLUSTER_CHAIN_CTE = `WITH RECURSIVE cluster_chain(id) AS (
+    SELECT recordId FROM cluster_summaries WHERE scope = ?
+    UNION
+    SELECT r.id FROM records r JOIN cluster_chain c ON r.supersedes = c.id
+    WHERE r.scope = ?
+  )`;
+
+/**
  * Topics with at least minMembers active member records. Membership requires
  * a current record_topics row (bodyHash still matches the canonical body) and
- * excludes summaries produced by this op, so a cluster summary can never
- * recursively feed its own cluster.
+ * excludes summaries produced by this op and any revision in their correction
+ * chains, so a cluster summary can never recursively feed its own cluster.
  */
 function listClusterTopics(
   db: DatabaseSync,
@@ -253,17 +269,21 @@ function listClusterTopics(
 ): string[] {
   const rows = db
     .prepare(
-      `SELECT t.topic AS topic
+      `${CLUSTER_CHAIN_CTE}
+       SELECT t.topic AS topic
        FROM record_topics t
        JOIN records r ON r.id = t.recordId
        WHERE r.scope = ? AND r.status = 'active'
          AND t.bodyHash = r.bodyHash
          AND r.source <> ?
+         AND r.id NOT IN (SELECT id FROM cluster_chain)
        GROUP BY t.topic
        HAVING COUNT(*) >= ?
        ORDER BY t.topic ASC`,
     )
-    .all(scope, CLUSTER_SUMMARY_SOURCE, minMembers) as Array<{ topic: string }>;
+    .all(scope, scope, scope, CLUSTER_SUMMARY_SOURCE, minMembers) as Array<{
+    topic: string;
+  }>;
   return rows.map((r) => r.topic);
 }
 
@@ -275,7 +295,8 @@ function loadClusterMembers(
 ): ClusterMember[] {
   return db
     .prepare(
-      `SELECT r.id AS id, r.body AS body, r.bodyHash AS bodyHash,
+      `${CLUSTER_CHAIN_CTE}
+       SELECT r.id AS id, r.body AS body, r.bodyHash AS bodyHash,
               r.createdAt AS createdAt, r.observedAt AS observedAt,
               r.privacySensitivity AS privacySensitivity
        FROM record_topics t
@@ -283,9 +304,10 @@ function loadClusterMembers(
        WHERE r.scope = ? AND t.topic = ? AND r.status = 'active'
          AND t.bodyHash = r.bodyHash
          AND r.source <> ?
+         AND r.id NOT IN (SELECT id FROM cluster_chain)
        ORDER BY r.createdAt ASC, r.id ASC`,
     )
-    .all(scope, topic, CLUSTER_SUMMARY_SOURCE) as unknown as ClusterMember[];
+    .all(scope, scope, scope, topic, CLUSTER_SUMMARY_SOURCE) as unknown as ClusterMember[];
 }
 
 function memberFingerprint(members: ClusterMember[]): string {
@@ -539,13 +561,22 @@ export async function maintainConsolidate(
         // it (bounded) so callers can distinguish "nothing to do" from a
         // fully empty scope, but never consume the changed-cluster budget.
         if (unchangedReported < p.limit) {
+          // The ledger may point at a revision the user corrected; report the
+          // currently active revision (same resolution as the write path) so
+          // callers do not fetch a superseded summary.
+          let activeId: string | null;
+          try {
+            activeId = activeClusterRecord(db, p.scope, topic);
+          } catch {
+            return budgeted(fail("STORE_UNAVAILABLE"), config);
+          }
           unchangedReported++;
           results.push({
             topic,
             members: members.length,
             sentencesKept: 0,
             sentencesDropped: 0,
-            recordId: storedLedger.recordId,
+            recordId: activeId,
             outcome: "unchanged",
           });
         }
