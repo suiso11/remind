@@ -40,6 +40,7 @@ import type { AppConfig } from "./config.js";
 import {
   ACTIVATION_BATCH_MAX_CAP,
   activationBounds,
+  cultivationBounds,
   maintenanceTimeoutMs,
   type ActivationConfig,
 } from "./config.js";
@@ -47,6 +48,7 @@ import {
   acquireCultivationLease,
   isCultivationLeaseHeldBy,
   releaseCultivationLease,
+  withLeaseHeartbeat,
   RETIRE_REASONS,
 } from "./cultivation.js";
 import {
@@ -79,6 +81,7 @@ export const ACTIVATION_OP = "maintain.activation";
 export type ActivationGenerate = (
   prompt: string,
   maxNewTokens: number,
+  signal?: AbortSignal,
 ) => Promise<string | null>;
 
 export type ActivationKind =
@@ -1108,28 +1111,48 @@ export async function maintainActivation(
       }
       const generate: ActivationGenerate =
         generateOverride ??
-        ((prompt, tokens) =>
+        ((prompt, tokens, signal) =>
           generateCompletion(prompt, llmModelDir, {
             timeoutMs: llmTimeoutMs(config),
             maxNewTokens: tokens,
+            signal,
           }));
       const maxPromptChars = llmMaxPromptChars(config);
+      const leaseTtlMs = cultivationBounds(config).leaseTtlMs;
+      // One inference under the lease heartbeat. A generator exception stays a
+      // scoring failure (raw=null); a lost lease must drop every pending write.
+      const heartbeatGenerate = async (
+        prompt: string,
+      ): Promise<{ lost: boolean; raw: string | null }> => {
+        try {
+          const run = await withLeaseHeartbeat(
+            renew,
+            leaseTtlMs,
+            (signal) => generate(prompt, IMPORTANCE_TOKEN_BUDGET, signal),
+          );
+          return run.ok ? { lost: false, raw: run.value } : { lost: true, raw: null };
+        } catch {
+          return { lost: false, raw: null };
+        }
+      };
       const writes: ImportanceWrite[] = [];
       for (const row of candidates) {
         if (overDeadline()) {
           degraded = true;
           break;
         }
-        // Heartbeat between inference calls: each model call can be long, so
-        // renew the shared lease before starting the next one. A stolen or
-        // expired lease aborts the pass before any importance commit.
+        // Renew before each model call (belt and braces: the heartbeat below
+        // covers the call itself). A stolen or expired lease aborts the pass
+        // before any importance commit.
         if (!renew()) return budgeted(conflict(), config);
-        let raw: string | null = null;
-        try {
-          raw = await generate(buildImportancePrompt(row.bodyNorm, maxPromptChars), IMPORTANCE_TOKEN_BUDGET);
-        } catch {
-          raw = null;
+        // Keep the lease alive while this inference runs; a slow scoring call
+        // must not expire the lease before writeImportance's fence.
+        const run = await heartbeatGenerate(buildImportancePrompt(row.bodyNorm, maxPromptChars));
+        if (run.lost) {
+          // Lease stolen/expired mid-inference: drop every pending write.
+          return budgeted(conflict(), config);
         }
+        const raw: string | null = run.raw;
         const digit = parseImportance(raw);
         if (digit === null) {
           scoreFailed++;

@@ -24,6 +24,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { AppConfig } from "./config.js";
 import {
   consolidateBounds,
+  cultivationBounds,
   episodesBounds,
   maintenanceTimeoutMs,
   requirePrivacyEnabled,
@@ -32,6 +33,7 @@ import {
   acquireCultivationLease,
   isCultivationLeaseHeldBy,
   releaseCultivationLease,
+  withLeaseHeartbeat,
 } from "./cultivation.js";
 import {
   buildEpisodeCitedReducePrompt,
@@ -75,7 +77,11 @@ export const CONSOLIDATE_OP = "maintain.consolidate";
 export const CLUSTER_SUMMARY_SOURCE = "cultivation:llm-derived-cluster";
 
 export interface ConsolidateGenerate {
-  (prompt: string, maxNewTokens: number): Promise<string | null>;
+  (
+    prompt: string,
+    maxNewTokens: number,
+    signal?: AbortSignal,
+  ): Promise<string | null>;
 }
 
 export interface ConsolidateParams {
@@ -535,6 +541,7 @@ export async function maintainConsolidate(
     const maxPromptChars = llmMaxPromptChars(config);
     const timeoutMs = llmTimeoutMs(config);
     const maxNewTokens = episodesBounds(config).maxNewTokens;
+    const leaseTtlMs = cultivationBounds(config).leaseTtlMs;
     const maintenanceMs = maintenanceTimeoutMs(config);
     const startedMs = Date.now();
     const overDeadline = (): boolean => Date.now() - startedMs > maintenanceMs;
@@ -551,8 +558,26 @@ export async function maintainConsolidate(
     };
     const generate: ConsolidateGenerate =
       generateOverride ??
-      ((prompt, tokens) =>
-        generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens: tokens, config }));
+      ((prompt, tokens, signal) =>
+        generateCompletion(prompt, modelDir, { timeoutMs, maxNewTokens: tokens, config, signal }));
+    // Runs one inference under the lease heartbeat. A generator exception is
+    // still a transient failure (raw=null); a lost lease is `lost` and no
+    // write may follow.
+    const heartbeatGenerate = async (
+      prompt: string,
+      tokens: number,
+    ): Promise<{ lost: boolean; raw: string | null }> => {
+      try {
+        const run = await withLeaseHeartbeat(
+          () => renewOrAbort() === "ok",
+          leaseTtlMs,
+          (signal) => generate(prompt, tokens, signal),
+        );
+        return run.ok ? { lost: false, raw: run.value } : { lost: true, raw: null };
+      } catch {
+        return { lost: false, raw: null };
+      }
+    };
 
     let topics: string[];
     try {
@@ -643,19 +668,22 @@ export async function maintainConsolidate(
           break;
         }
         const sourceText = group.map((m) => m.body).join("\n");
-        let rawMerge: string | null = null;
-        try {
-          rawMerge = await generate(
-            buildEpisodeCitedReducePrompt(
-              group.map((m) => m.body),
-              maxPromptChars,
-              sourceText,
-            ),
-            maxNewTokens,
-          );
-        } catch {
-          rawMerge = null;
+        // The lease is renewed while the generation runs: a slow model call
+        // must not let the lease expire before the fenced write below.
+        const merge = await heartbeatGenerate(
+          buildEpisodeCitedReducePrompt(
+            group.map((m) => m.body),
+            maxPromptChars,
+            sourceText,
+          ),
+          maxNewTokens,
+        );
+        if (merge.lost) {
+          // Lease stolen/expired mid-inference: abort without writing.
+          aborted = true;
+          break;
         }
+        let rawMerge: string | null = merge.raw;
         if (rawMerge === null) {
           // Transient generation failure: defer the whole cluster (no write).
           deferred = true;
@@ -693,12 +721,12 @@ export async function maintainConsolidate(
             sentencesDropped++;
             continue;
           }
-          let rawVerify: string | null = null;
-          try {
-            rawVerify = await generate(claimPrompt, Math.min(maxNewTokens, 16));
-          } catch {
-            rawVerify = null;
+          const verify = await heartbeatGenerate(claimPrompt, Math.min(maxNewTokens, 16));
+          if (verify.lost) {
+            aborted = true;
+            break;
           }
+          const rawVerify: string | null = verify.raw;
           if (rawVerify === null) {
             // Transient verification failure: defer, never treat as a
             // content rejection.

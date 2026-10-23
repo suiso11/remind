@@ -869,7 +869,7 @@ describe("activation: maintain.activation", () => {
     }
   });
 
-  it("fences importance writes against the current lease clock, not the pre-inference time", async () => {
+  it("heartbeats the lease through inference longer than leaseTtlMs", async () => {
     const ctx = setup();
     try {
       ctx.config.cultivation = { leaseTtlMs: 1000 } as unknown as NonNullable<
@@ -877,11 +877,12 @@ describe("activation: maintain.activation", () => {
       >;
       remember(ctx.db, ctx.config, "slow scoring note", "m-lease-clock", "2025-06-01T00:00:00.000Z");
       const generate = async (): Promise<string> => {
+        // Longer than the 1s lease: without the heartbeat the fenced write
+        // would be rejected as CONFLICT even though no other process ran.
         await new Promise((r) => setTimeout(r, 1100));
         return "3";
       };
-      // No nowOverride: renewNow() uses the wall clock, so the 1s lease is
-      // expired by the time the slow inference returns.
+      // No nowOverride: renewNow() uses the wall clock.
       const res = await maintainActivation(
         ctx.db,
         ctx.config,
@@ -890,10 +891,50 @@ describe("activation: maintain.activation", () => {
         "act-lease-clock",
         generate,
       );
+      const data = res.data as { scored: number };
+      assert.equal(res.ok, true, JSON.stringify(res));
+      assert.equal(data.scored, 1);
+      const rows = ctx.db.prepare(`SELECT COUNT(*) AS n FROM record_importance`).get() as { n: number };
+      assert.equal(rows.n, 1, "heartbeat keeps the lease live for the commit");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("writes nothing when the lease is stolen mid-inference", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.cultivation = { leaseTtlMs: 1000 } as unknown as NonNullable<
+        AppConfig["cultivation"]
+      >;
+      remember(ctx.db, ctx.config, "stolen lease note", "m-lease-steal", "2025-06-01T00:00:00.000Z");
+      let signal: AbortSignal | undefined;
+      const generate = async (_p: string, _t: number, s?: AbortSignal): Promise<string> => {
+        signal = s;
+        // Steal by presenting a clock past the current expiry; the heartbeat
+        // then renews under a foreign owner and must abort.
+        const stolen = acquireCultivationLease(ctx.db, ctx.config, {
+          owner: "thief",
+          scope: SCOPE,
+          now: new Date(Date.now() + 60000).toISOString(),
+        });
+        assert.equal(stolen.acquired, true);
+        await new Promise((r) => setTimeout(r, 900));
+        return "3";
+      };
+      const res = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        path.join(ctx.dir, "memory.config.json"),
+        { scope: SCOPE },
+        "act-lease-steal",
+        generate,
+      );
       assert.equal(res.ok, false);
       assert.equal(res.code, "CONFLICT");
+      assert.equal(signal?.aborted, true, "lost lease aborts the in-flight generation");
       const rows = ctx.db.prepare(`SELECT COUNT(*) AS n FROM record_importance`).get() as { n: number };
-      assert.equal(rows.n, 0, "expired lease must not commit importance");
+      assert.equal(rows.n, 0, "a stolen lease must not commit importance");
     } finally {
       ctx.cleanup();
     }

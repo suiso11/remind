@@ -810,6 +810,86 @@ describe("maintain.consolidate topic clusters", () => {
     }
   });
 
+  it("heartbeats the lease through verification longer than leaseTtlMs", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.cultivation = { leaseTtlMs: 1000 } as unknown as NonNullable<
+        AppConfig["cultivation"]
+      >;
+      addThreeMembers(ctx);
+      const base = makeGen();
+      const gen: ConsolidateGenerate = async (prompt, tokens, signal) => {
+        // The claim check is the last inference before the fenced write:
+        // without a heartbeat the 1s lease is expired when it returns.
+        if (/You verify a claim|主張を検証/.test(prompt)) {
+          await new Promise((r) => setTimeout(r, 1600));
+        }
+        return base(prompt, tokens, signal);
+      };
+      // No nowOverride: renewal uses the wall clock, so the lease expires
+      // during the slow call unless it is heartbeaten.
+      const res = await maintainConsolidate(
+        ctx.db,
+        ctx.config,
+        ctx.configPath,
+        { scope: SCOPE },
+        "c-heartbeat",
+        gen,
+      );
+      const d = data(res);
+      assert.equal(d.applied, 1);
+      assert.equal(d.clusters[0]!.outcome, "written");
+      const state = counts(ctx);
+      assert.equal(state.summaries, 1);
+      assert.equal(state.ledger, 1);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("aborts and writes nothing when the lease is stolen mid-inference", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.cultivation = { leaseTtlMs: 1000 } as unknown as NonNullable<
+        AppConfig["cultivation"]
+      >;
+      addThreeMembers(ctx);
+      const base = makeGen();
+      let signal: AbortSignal | undefined;
+      const gen: ConsolidateGenerate = async (prompt, tokens, s) => {
+        if (/You verify a claim|主張を検証/.test(prompt)) {
+          signal = s;
+          // Steal with a clock past the current expiry; the heartbeat's next
+          // renewal then fails under a foreign owner and aborts this call.
+          const stolen = acquireCultivationLease(ctx.db, ctx.config, {
+            owner: "thief",
+            scope: SCOPE,
+            now: new Date(Date.now() + 60000).toISOString(),
+          });
+          assert.equal(stolen.acquired, true);
+          await new Promise((r) => setTimeout(r, 900));
+        }
+        return base(prompt, tokens, s);
+      };
+      const res = await maintainConsolidate(
+        ctx.db,
+        ctx.config,
+        ctx.configPath,
+        { scope: SCOPE },
+        "c-heartbeat-steal",
+        gen,
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.code, "CONFLICT");
+      assert.equal(signal?.aborted, true, "lost lease aborts the in-flight generation");
+      const state = counts(ctx);
+      assert.equal(state.summaries, 0);
+      assert.equal(state.ledger, 0);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("replays the stored envelope for the same key and params", async () => {
     const ctx = setup();
     try {
