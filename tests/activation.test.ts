@@ -374,6 +374,61 @@ describe("activation.preview", () => {
     }
   });
 
+  it("pins the scoring clock in the cursor so tied pages do not vanish", () => {
+    const ctx = setup();
+    try {
+      const ids = ["a", "b", "c"].map((k) =>
+        remember(ctx.db, ctx.config, `tied note ${k}`, `p-tie-${k}`, "2026-01-01T00:00:00.000Z"),
+      );
+      const first = activationPreview(ctx.db, ctx.config, { scope: SCOPE, limit: 1 }, NOW);
+      assert.equal(first.ok, true, JSON.stringify(first));
+      const firstData = first.data as { items: Array<{ id: string }>; nextCursor: string | null };
+      assert.equal(firstData.items.length, 1);
+      assert.ok(firstData.nextCursor);
+
+      // A later wall-clock must not re-score against the previous page's A:
+      // the cursor's pinned `now` is authoritative.
+      const later = "2026-01-11T00:00:01.000Z";
+      const second = activationPreview(
+        ctx.db,
+        ctx.config,
+        { scope: SCOPE, limit: 1, cursor: firstData.nextCursor as string },
+        later,
+      );
+      const secondData = second.data as { items: Array<{ id: string }>; nextCursor: string | null };
+      assert.equal(secondData.items.length, 1, "continuation must not be empty after clock drift");
+      assert.ok(secondData.nextCursor);
+      const third = activationPreview(
+        ctx.db,
+        ctx.config,
+        { scope: SCOPE, limit: 1, cursor: secondData.nextCursor as string },
+        later,
+      );
+      const thirdData = third.data as { items: Array<{ id: string }> };
+      assert.equal(thirdData.items.length, 1);
+      assert.deepEqual(
+        [firstData.items[0].id, secondData.items[0].id, thirdData.items[0].id].sort(),
+        [...ids].sort(),
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("rejects a cursor without its pinned scoring timestamp", () => {
+    const ctx = setup();
+    try {
+      remember(ctx.db, ctx.config, "cursor note", "p-cursor", "2026-01-01T00:00:00.000Z");
+      const legacy = Buffer.from(JSON.stringify({ a: -1, id: "rec_x" }), "utf8").toString("base64url");
+      assert.equal(
+        activationPreview(ctx.db, ctx.config, { scope: SCOPE, cursor: legacy }, NOW).code,
+        "BAD_REQUEST",
+      );
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("reactivates a recently retired LOW_ACTIVATION record and honors includeRetired", () => {
     const ctx = setup();
     try {
@@ -705,9 +760,20 @@ describe("activation: maintain.activation", () => {
         enabled: true,
         maxNewTokens: 48,
         maxPromptChars: 2000,
+        // master gates auto-retirement on the OpenAI-compatible backend; the
+        // decisions are still injected, so loopback+model just satisfy the
+        // usability gate.
+        backend: "openai",
+        baseUrl: "http://127.0.0.1:1234/v1",
+        model: "test-model",
       };
+      // master's #35 grace period defaults to 24h; this fixture retires a
+      // one-hour-old record on purpose, so disable only the delay.
+      ctx.config.cultivation = { retireMinAgeMs: 0 } as unknown as NonNullable<
+        AppConfig["cultivation"]
+      >;
       const decide = async (prompt: string): Promise<string | null> =>
-        prompt.includes("What lasting fact") ? "NONE" : "KEEP";
+        prompt.includes("You classify one memory") ? "TRANSIENT" : "KEEP";
       const distilled = await maintainDistill(
         ctx.db,
         ctx.config,
@@ -798,6 +864,139 @@ describe("activation: maintain.activation", () => {
       assert.equal(res.ok, false);
       assert.equal(res.code, "CONFLICT");
       releaseCultivationLease(ctx.db, "other-owner");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("fences importance writes against the current lease clock, not the pre-inference time", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.cultivation = { leaseTtlMs: 1000 } as unknown as NonNullable<
+        AppConfig["cultivation"]
+      >;
+      remember(ctx.db, ctx.config, "slow scoring note", "m-lease-clock", "2025-06-01T00:00:00.000Z");
+      const generate = async (): Promise<string> => {
+        await new Promise((r) => setTimeout(r, 1100));
+        return "3";
+      };
+      // No nowOverride: renewNow() uses the wall clock, so the 1s lease is
+      // expired by the time the slow inference returns.
+      const res = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        path.join(ctx.dir, "memory.config.json"),
+        { scope: SCOPE },
+        "act-lease-clock",
+        generate,
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.code, "CONFLICT");
+      const rows = ctx.db.prepare(`SELECT COUNT(*) AS n FROM record_importance`).get() as { n: number };
+      assert.equal(rows.n, 0, "expired lease must not commit importance");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("aborts activation writes over dbMaxBytes with STORE_UNAVAILABLE", async () => {
+    const ctx = setup();
+    try {
+      remember(ctx.db, ctx.config, "cap probe note", "m-cap", "2025-06-01T00:00:00.000Z");
+      ctx.config.dbMaxBytes = 1;
+      const scored = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        path.join(ctx.dir, "memory.config.json"),
+        { scope: SCOPE },
+        "act-cap-score",
+        async () => "3",
+        NOW,
+      );
+      assert.equal(scored.ok, false);
+      assert.equal(scored.code, "STORE_UNAVAILABLE");
+      const importance = ctx.db.prepare(`SELECT COUNT(*) AS n FROM record_importance`).get() as {
+        n: number;
+      };
+      assert.equal(importance.n, 0, "importance rows roll back with the cap rejection");
+
+      // Preview-only (model disabled) must also refuse the operations/audit
+      // write when the cap is already exceeded.
+      const previewOnly = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        path.join(ctx.dir, "memory.config.json"),
+        { scope: SCOPE },
+        "act-cap-preview",
+        undefined,
+        NOW,
+      );
+      assert.equal(previewOnly.ok, false);
+      assert.equal(previewOnly.code, "STORE_UNAVAILABLE");
+      const ops = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM operations WHERE op = 'maintain.activation'`)
+        .get() as { n: number };
+      assert.equal(ops.n, 0);
+      const audit = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM audit WHERE op = 'maintain.activation'`)
+        .get() as { n: number };
+      assert.equal(audit.n, 0);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("advances the bounded maintenance scan past the oldest 2,000 records and wraps", async () => {
+    const ctx = setup();
+    try {
+      // 2,000 older retired rows fill the window; the newer active row is
+      // only reachable via the persisted (createdAt, id) continuation.
+      const insert = ctx.db.prepare(
+        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt)
+         VALUES (?, ?, ?, ?, 'user_fact', 'test', ?, ?, 'retired', NULL, 1, ?)`,
+      );
+      ctx.db.exec("BEGIN");
+      for (let i = 0; i < 2000; i++) {
+        const id = `rec-old-${String(i).padStart(4, "0")}`;
+        const body = `old retired ${i}`;
+        insert.run(id, body, body, `hash-${i}`, OBS, SCOPE, "2020-01-01T00:00:00.000Z");
+      }
+      ctx.db.exec("COMMIT");
+      const newId = remember(ctx.db, ctx.config, "new low signal note", "m-scan-new", "2025-06-01T00:00:00.000Z");
+
+      const run = (key: string) =>
+        maintainActivation(
+          ctx.db,
+          ctx.config,
+          path.join(ctx.dir, "memory.config.json"),
+          { scope: SCOPE },
+          key,
+          undefined,
+          NOW,
+        );
+      const first = await run("act-scan-1");
+      assert.equal(first.ok, true, JSON.stringify(first));
+      assert.equal((first.data as { wouldRetire: number }).wouldRetire, 0);
+
+      const second = await run("act-scan-2");
+      assert.equal(second.ok, true, JSON.stringify(second));
+      assert.equal(
+        (second.data as { wouldRetire: number }).wouldRetire,
+        1,
+        "newer record must be examined after the cursor advances",
+      );
+
+      const third = await run("act-scan-3");
+      assert.equal(third.ok, true, JSON.stringify(third));
+      assert.equal(
+        (third.data as { wouldRetire: number }).wouldRetire,
+        0,
+        "scan wraps to the oldest window after reaching the end",
+      );
+      const status = (ctx.db.prepare(`SELECT status FROM records WHERE id = ?`).get(newId) as {
+        status: string;
+      }).status;
+      assert.equal(status, "active");
     } finally {
       ctx.cleanup();
     }

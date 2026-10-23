@@ -22,6 +22,7 @@
 - 重要度はローカル LLM が 0..3 で採点し、`record_importance` に `importance = n/3`、`source='llm'`、現在の `bodyHash` とともに保存する。本文が訂正され bodyHash が変わった採点は陳腐化として無視する。モデル無効・欠落時は採点をスキップし、中立 0.5 として扱う（嘘の 0 を入れない）。
 - 引退は可逆である。`active <-> retired` の既存遷移経路（監査付き）を使い、`LOW_ACTIVATION` で引退、活性が `tauReactivate` 以上に戻れば再活性化する。旧 `LOW_SIGNAL` 引退も `reconsiderLegacy` で再検討する。
 - 重要度が `activation.protectImportance`（既定 0.66 ≒ 2/3）以上の記憶は、通常の `tauRetire` では引退せず `A < tauRetire - 1` の保護マージンを要求する。
+- maintenance は 1 パス 2,000 件の有界スキャンを維持しつつ、scope 別の `(createdAt,id)` continuation cursor を永続化して次のパスで続きから評価し、末尾で先頭へ wrap する。これにより古い retired 行がスキャン窓を占め続けても、新しい active 行が永久に未評価にならない。`activation.preview` の `nextCursor` は採点時刻を固定して頁間の `A` を一致させる。importance/operations/audit の各 commit は `dbMaxBytes` 超過時に rollback して `STORE_UNAVAILABLE` を返す。
 - `activation.apply` は**既定 false**。false の間は状態を変えず `wouldRetire / wouldReactivate` を報告するだけに留め、モデルと閾値の調整が済むまで自動適用しない。有効化は起動時 config の明示指定のみで行う。
 
 ## 保持するもの・保持しないもの（実装済み範囲）

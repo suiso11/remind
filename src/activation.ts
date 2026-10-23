@@ -66,6 +66,7 @@ import {
 } from "./normalize.js";
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
 import {
+  assertDbUnderCap,
   isScopeAuthorized,
   reactivateRecord,
   retireRecord,
@@ -314,11 +315,22 @@ interface RecordRow {
   supersedes: string | null;
 }
 
+export interface ActivationAfter {
+  createdAt: string;
+  id: string;
+}
+
 export interface LoadActivationOptions {
   /** Include retired rows (default true). Active-only scans pass false. */
   includeRetired?: boolean;
   /** Hard candidate cap (default ACTIVATION_MAX_RECORDS). */
   maxRecords?: number;
+  /**
+   * Keyset continuation: return records strictly after (createdAt, id) in
+   * scan order. Used by maintain.activation to advance past the oldest
+   * bounded window across passes.
+   */
+  after?: ActivationAfter;
 }
 
 /**
@@ -335,15 +347,28 @@ export function loadActivationInputs(
   const includeRetired = options.includeRetired ?? true;
   const maxRecords = Math.max(1, Math.floor(options.maxRecords ?? ACTIVATION_MAX_RECORDS));
   const statuses = includeRetired ? "('active','retired')" : "('active')";
+  const after =
+    options.after &&
+    typeof options.after.createdAt === "string" &&
+    Number.isFinite(Date.parse(options.after.createdAt)) &&
+    typeof options.after.id === "string" &&
+    options.after.id.length > 0
+      ? options.after
+      : null;
+  const keyset = after ? "AND (createdAt > ? OR (createdAt = ? AND id > ?))" : "";
   const rows = db
     .prepare(
       `SELECT id, body, bodyHash, kind, status, createdAt, supersedes
          FROM records
-        WHERE scope = ? AND status IN ${statuses}
+        WHERE scope = ? AND status IN ${statuses} ${keyset}
         ORDER BY createdAt ASC, id ASC
         LIMIT ?`,
     )
-    .all(scope, maxRecords) as unknown as RecordRow[];
+    .all(
+      ...(after
+        ? [scope, after.createdAt, after.createdAt, after.id, maxRecords]
+        : [scope, maxRecords]),
+    ) as unknown as RecordRow[];
   const candidates = rows.filter(
     (r) => isRecordKind(r.kind) && isRecordStatus(r.status),
   );
@@ -537,6 +562,8 @@ export function loadActivationInputs(
 interface PreviewCursor {
   a: number;
   id: string;
+  /** Pinned evaluation clock so later pages use the exact same scores. */
+  now: string;
 }
 
 function encodeCursor(c: PreviewCursor): string {
@@ -551,9 +578,12 @@ function decodeCursor(raw: string): PreviewCursor | null {
     const o = parsed as Record<string, unknown>;
     const a = o["a"];
     const id = o["id"];
+    const now = o["now"];
     if (typeof a !== "number" || !Number.isFinite(a)) return null;
     if (typeof id !== "string" || id.length < 1 || id.length > 256) return null;
-    return { a, id };
+    if (typeof now !== "string" || now.length < 1 || now.length > 64) return null;
+    if (!Number.isFinite(Date.parse(now))) return null;
+    return { a, id, now };
   } catch {
     return null;
   }
@@ -653,7 +683,7 @@ export function activationPreview(
   const denied = scopeDenied(db, config, scope);
   if (denied) return applyResponseBudget(denied, config.limits.responseMaxBytes);
 
-  const now = nowOverride ?? nowIso();
+  const now = cursor?.now ?? nowOverride ?? nowIso();
   if (!Number.isFinite(Date.parse(now))) {
     return applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
   }
@@ -714,7 +744,14 @@ export function activationPreview(
     ok({
       items,
       summary,
-      nextCursor: hasMore && items.length > 0 ? encodeCursor({ a: items[items.length - 1].A, id: items[items.length - 1].id }) : null,
+      nextCursor:
+        hasMore && items.length > 0
+          ? encodeCursor({
+              a: items[items.length - 1].A,
+              id: items[items.length - 1].id,
+              now,
+            })
+          : null,
     });
   let res = applyResponseBudget(build(page, remaining.length > page.length), config.limits.responseMaxBytes);
   while (!res.ok && page.length > 0) {
@@ -793,15 +830,38 @@ function readOperation(db: DatabaseSync, key: string): StoredOp | null {
   return row ?? null;
 }
 
+/** Per-scope continuation for the bounded maintenance scan. */
+function ensureActivationScanSchema(db: DatabaseSync): void {
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS activation_scan(
+       scope TEXT PRIMARY KEY,
+       createdAt TEXT NOT NULL,
+       id TEXT NOT NULL,
+       updatedAt TEXT NOT NULL)`,
+  );
+}
+
+function readScanCursor(db: DatabaseSync, scope: string): ActivationAfter | null {
+  ensureActivationScanSchema(db);
+  const row = db
+    .prepare(`SELECT createdAt, id FROM activation_scan WHERE scope = ?`)
+    .get(scope) as { createdAt: string; id: string } | undefined;
+  if (!row || !Number.isFinite(Date.parse(row.createdAt)) || row.id.length === 0) return null;
+  return { createdAt: row.createdAt, id: row.id };
+}
+
 function storeActivationResult(
   db: DatabaseSync,
+  config: AppConfig,
   key: string,
   reqHash: string,
   stored: ResponseEnvelope,
   scope: string,
   now: string,
   limitN: number,
+  scanAfter: ActivationAfter | null,
 ): void {
+  ensureActivationScanSchema(db);
   db.exec("BEGIN IMMEDIATE");
   try {
     db.prepare(
@@ -818,6 +878,20 @@ function storeActivationResult(
       Buffer.byteLength(JSON.stringify(stored), "utf8"),
       limitN,
     );
+    // Persist the scan continuation in the same transaction as the ledger
+    // rows so a committed pass always advances (or wraps) atomically.
+    if (scanAfter) {
+      db.prepare(
+        `INSERT INTO activation_scan(scope, createdAt, id, updatedAt) VALUES (?, ?, ?, ?)
+         ON CONFLICT(scope) DO UPDATE SET
+           createdAt = excluded.createdAt,
+           id = excluded.id,
+           updatedAt = excluded.updatedAt`,
+      ).run(scope, scanAfter.createdAt, scanAfter.id, now);
+    } else {
+      db.prepare(`DELETE FROM activation_scan WHERE scope = ?`).run(scope);
+    }
+    assertDbUnderCap(db, config);
     db.exec("COMMIT");
   } catch (e) {
     try {
@@ -888,6 +962,7 @@ interface ImportanceWrite {
 
 function writeImportance(
   db: DatabaseSync,
+  config: AppConfig,
   writes: ImportanceWrite[],
   now: string,
   fenceOwner: string,
@@ -905,6 +980,7 @@ function writeImportance(
          scoredAt = excluded.scoredAt`,
     );
     for (const w of writes) stmt.run(w.recordId, w.importance, w.bodyHash, now);
+    assertDbUnderCap(db, config);
     db.exec("COMMIT");
   } catch (e) {
     try {
@@ -1005,6 +1081,17 @@ export async function maintainActivation(
     let scoreFailed = 0;
     let degraded = false;
 
+    // Bounded scan continuation: each pass examines at most the same
+    // ACTIVATION_MAX_RECORDS window, advancing (createdAt, id) and wrapping
+    // to the start once the end is reached, so newer records are eventually
+    // evaluated even when the oldest rows stay eligible.
+    let scanAfter: ActivationAfter | null;
+    try {
+      scanAfter = readScanCursor(db, p.scope);
+    } catch {
+      return budgeted(fail("STORE_UNAVAILABLE"), config);
+    }
+
     const llmModelDir = resolveLlmDir(config, configPath);
     const modelUsable = llmEnabled(config) && llmModelFilesPresent(llmModelDir);
     // An injected generator against a config without an llm section is the
@@ -1033,6 +1120,10 @@ export async function maintainActivation(
           degraded = true;
           break;
         }
+        // Heartbeat between inference calls: each model call can be long, so
+        // renew the shared lease before starting the next one. A stolen or
+        // expired lease aborts the pass before any importance commit.
+        if (!renew()) return budgeted(conflict(), config);
         let raw: string | null = null;
         try {
           raw = await generate(buildImportancePrompt(row.bodyNorm, maxPromptChars), IMPORTANCE_TOKEN_BUDGET);
@@ -1048,7 +1139,9 @@ export async function maintainActivation(
       }
       if (writes.length > 0) {
         try {
-          writeImportance(db, writes, nowValid, execOwner);
+          // Fence with the execution clock *now*, not the pre-inference
+          // timestamp: a long generation must not commit after lease expiry.
+          writeImportance(db, config, writes, renewNow(), execOwner);
           scored = writes.length;
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
@@ -1059,10 +1152,18 @@ export async function maintainActivation(
     }
 
     let inputs: ActivationInput[];
+    let nextScanAfter: ActivationAfter | null = null;
     try {
-      inputs = loadActivationInputs(db, p.scope, { includeRetired: true });
+      inputs = loadActivationInputs(db, p.scope, {
+        includeRetired: true,
+        ...(scanAfter ? { after: scanAfter } : {}),
+      });
     } catch {
       return budgeted(fail("STORE_UNAVAILABLE"), config);
+    }
+    if (inputs.length >= ACTIVATION_MAX_RECORDS) {
+      const last = inputs[inputs.length - 1];
+      nextScanAfter = { createdAt: last.createdAt, id: last.recordId };
     }
 
     const decisions: ActivationDecisionItem[] = inputs.map((input) => {
@@ -1087,12 +1188,14 @@ export async function maintainActivation(
 
     if (bounds.apply && (wouldRetire > 0 || wouldReactivate > 0)) {
       // Heartbeat before applying; each transition re-checks the lease inside
-      // its own transaction via CanonicalWriteFence.
+      // its own transaction via CanonicalWriteFence. The fence timestamp is
+      // the current execution clock (not the pre-inference `nowValid`), so an
+      // expired lease aborts instead of committing a transition.
       if (!renew()) return budgeted(conflict(), config);
-      const fence: CanonicalWriteFence = { owner: execOwner, now: nowValid };
       for (const item of decisions) {
         if (overDeadline()) break;
         if (item.decision !== "retire" && item.decision !== "reactivate") continue;
+        const fence: CanonicalWriteFence = { owner: execOwner, now: renewNow() };
         const innerKey = sha256HexUtf8(`${ACTIVATION_OP}:${idempotencyKey}:${item.id}`);
         const transitionParams = {
           id: item.id,
@@ -1135,7 +1238,17 @@ export async function maintainActivation(
       config,
     );
     try {
-      storeActivationResult(db, idempotencyKey, reqHash, stored, p.scope, nowValid, p.limit);
+      storeActivationResult(
+        db,
+        config,
+        idempotencyKey,
+        reqHash,
+        stored,
+        p.scope,
+        nowValid,
+        p.limit,
+        nextScanAfter,
+      );
     } catch (e) {
       return handleStoreRace(db, config, idempotencyKey, reqHash, e);
     }

@@ -891,7 +891,7 @@ function isDbOverCap(db: DatabaseSync, config: AppConfig): boolean {
   }
 }
 
-function assertDbUnderCap(db: DatabaseSync, config: AppConfig): void {
+export function assertDbUnderCap(db: DatabaseSync, config: AppConfig): void {
   if (isDbOverCap(db, config)) throw new Error("db over cap");
 }
 
