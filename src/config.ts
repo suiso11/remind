@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { NatureLabel } from "./activation.js";
 
 export interface LimitsConfig {
   bodyMaxCp: number;
@@ -54,12 +55,6 @@ export interface CultivationConfig {
   leaseTtlMs: number;
   /** Max retries per queued review before it is marked failed (default 5). */
   reviewMaxAttempts: number;
-  /**
-   * Minimum record age before an auto-retire candidate may actually be
-   * retired (default 86400000 = 24h; 0 disables the grace period). Younger
-   * DROP candidates are deferred without counting a failure.
-   */
-  retireMinAgeMs: number;
 }
 
 export type LlmBackend = "onnx" | "openai";
@@ -156,8 +151,18 @@ export interface ActivationConfig {
     summary: number;
     correction: number;
   };
-  /** Reconsider legacy LOW_SIGNAL retirements for reactivation (default true). */
-  reconsiderLegacy: boolean;
+  /** Per-nature additive weights (missing nature contributes nothing). */
+  wNature: Record<NatureLabel, number>;
+  /** Weight of ln(1 + canonical active links + 0.5 * similar edges) (default 0.8). */
+  wLinks: number;
+  /** Days after the latest absolute date before a dated PLAN/EVENT/TRANSIENT expires (default 3). */
+  expiryGraceDays: number;
+  /** Penalty when an absolute date is past the expiry grace (default 2.0). */
+  wExpired: number;
+  /** Penalty when an active cluster summary cites the record with importance < 2/3 (default 0.5). */
+  wConsolidated: number;
+  /** Per-nature minimum retirement age overrides (defaults GREETING/CHATOPS 24, EMOTION/TRANSIENT 72). */
+  minAgeHoursByNature: Partial<Record<NatureLabel, number>>;
   /** Max records scored per maintain.activation run (default 20, cap 200). */
   batchMax: number;
   /** Apply retirement/reactivation decisions (default false: report only). */
@@ -483,7 +488,7 @@ export function loadConfig(configPath: string): AppConfig {
     const c = (parsed as Record<string, unknown>)["cultivation"];
     if (!isPlainObject(c)) throw new Error("cultivation must be an object");
     for (const k of Object.keys(c)) {
-      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts", "retireMinAgeMs"].includes(k)) {
+      if (!["queueMax", "batchMax", "leaseTtlMs", "reviewMaxAttempts"].includes(k)) {
         throw new Error(`unknown cultivation field: ${k}`);
       }
     }
@@ -499,15 +504,11 @@ export function loadConfig(configPath: string): AppConfig {
     const reviewMaxAttempts = c["reviewMaxAttempts"] ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS;
     const eR = checkRange("cultivation.reviewMaxAttempts", reviewMaxAttempts, 1, 10);
     if (eR) throw new Error(eR);
-    const retireMinAgeMs = c["retireMinAgeMs"] ?? CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS;
-    const eA = checkRange("cultivation.retireMinAgeMs", retireMinAgeMs, 0, 2592000000);
-    if (eA) throw new Error(eA);
     cultivation = {
       queueMax: queueMax as number,
       batchMax: batchMax as number,
       leaseTtlMs: leaseTtlMs as number,
       reviewMaxAttempts: reviewMaxAttempts as number,
-      retireMinAgeMs: retireMinAgeMs as number,
     };
   }
 
@@ -741,7 +742,12 @@ export function loadConfig(configPath: string): AppConfig {
           "minAgeHours",
           "wImportance",
           "wKind",
-          "reconsiderLegacy",
+          "wNature",
+          "wLinks",
+          "expiryGraceDays",
+          "wExpired",
+          "wConsolidated",
+          "minAgeHoursByNature",
           "batchMax",
           "apply",
           "protectImportance",
@@ -790,9 +796,51 @@ export function loadConfig(configPath: string): AppConfig {
       summary: (wKindRaw["summary"] as number | undefined) ?? ACTIVATION_DEFAULT_W_KIND.summary,
       correction: (wKindRaw["correction"] as number | undefined) ?? ACTIVATION_DEFAULT_W_KIND.correction,
     };
-    const reconsiderLegacy = a["reconsiderLegacy"] ?? ACTIVATION_DEFAULT_RECONSIDER_LEGACY;
-    if (typeof reconsiderLegacy !== "boolean") {
-      throw new Error("activation.reconsiderLegacy must be a boolean");
+    const wNatureRaw = a["wNature"] ?? {};
+    if (!isPlainObject(wNatureRaw)) throw new Error("activation.wNature must be an object");
+    for (const k of Object.keys(wNatureRaw)) {
+      if (!(ACTIVATION_NATURES as readonly string[]).includes(k)) {
+        throw new Error(`unknown activation.wNature field: ${k}`);
+      }
+      const w = wNatureRaw[k];
+      if (typeof w !== "number" || !Number.isFinite(w) || w < -10 || w > 10) {
+        throw new Error(`activation.wNature.${k} must be a number in -10..10`);
+      }
+    }
+    const wNature = { ...ACTIVATION_DEFAULT_W_NATURE };
+    for (const label of ACTIVATION_NATURES) {
+      const raw = wNatureRaw[label];
+      if (raw !== undefined) wNature[label] = raw as number;
+    }
+    const wLinks = a["wLinks"] ?? ACTIVATION_DEFAULT_W_LINKS;
+    if (typeof wLinks !== "number" || !Number.isFinite(wLinks) || wLinks < 0 || wLinks > 10) {
+      throw new Error("activation.wLinks must be a number in 0..10");
+    }
+    const expiryGraceDays = a["expiryGraceDays"] ?? ACTIVATION_DEFAULT_EXPIRY_GRACE_DAYS;
+    const eGrace = checkRange("activation.expiryGraceDays", expiryGraceDays, 0, 87600);
+    if (eGrace) throw new Error(eGrace);
+    const wExpired = a["wExpired"] ?? ACTIVATION_DEFAULT_W_EXPIRED;
+    if (typeof wExpired !== "number" || !Number.isFinite(wExpired) || wExpired < 0 || wExpired > 10) {
+      throw new Error("activation.wExpired must be a number in 0..10");
+    }
+    const wConsolidated = a["wConsolidated"] ?? ACTIVATION_DEFAULT_W_CONSOLIDATED;
+    if (typeof wConsolidated !== "number" || !Number.isFinite(wConsolidated) || wConsolidated < 0 || wConsolidated > 10) {
+      throw new Error("activation.wConsolidated must be a number in 0..10");
+    }
+    const minAgeRaw = a["minAgeHoursByNature"] ?? {};
+    if (!isPlainObject(minAgeRaw)) throw new Error("activation.minAgeHoursByNature must be an object");
+    for (const k of Object.keys(minAgeRaw)) {
+      if (!(ACTIVATION_NATURES as readonly string[]).includes(k)) {
+        throw new Error(`unknown activation.minAgeHoursByNature field: ${k}`);
+      }
+      const h = minAgeRaw[k];
+      const e = checkRange(`activation.minAgeHoursByNature.${k}`, h, 0, 87600);
+      if (e) throw new Error(e);
+    }
+    const minAgeHoursByNature = { ...ACTIVATION_DEFAULT_MIN_AGE_HOURS_BY_NATURE };
+    for (const label of ACTIVATION_NATURES) {
+      const raw = minAgeRaw[label];
+      if (raw !== undefined) minAgeHoursByNature[label] = raw as number;
     }
     const batchMax = a["batchMax"] ?? ACTIVATION_DEFAULT_BATCH_MAX;
     const eBatch = checkRange("activation.batchMax", batchMax, 1, ACTIVATION_BATCH_MAX_CAP);
@@ -817,7 +865,12 @@ export function loadConfig(configPath: string): AppConfig {
       minAgeHours: minAgeHours as number,
       wImportance,
       wKind,
-      reconsiderLegacy,
+      wNature,
+      wLinks,
+      expiryGraceDays: expiryGraceDays as number,
+      wExpired,
+      wConsolidated,
+      minAgeHoursByNature,
       batchMax: batchMax as number,
       apply,
       protectImportance,
@@ -947,7 +1000,43 @@ export const ACTIVATION_DEFAULT_W_KIND = {
   summary: 0.3,
   correction: 1.0,
 } as const;
-export const ACTIVATION_DEFAULT_RECONSIDER_LEGACY = true;
+/** Nature labels accepted by the combined classifier (mirrors NATURE_LABELS). */
+export const ACTIVATION_NATURES = [
+  "FACT",
+  "PREFERENCE",
+  "OPINION",
+  "PLAN",
+  "EVENT",
+  "RELATIONSHIP",
+  "PROJECT",
+  "EMOTION",
+  "TRANSIENT",
+  "GREETING",
+  "CHATOPS",
+] as const;
+export const ACTIVATION_DEFAULT_W_NATURE: Record<NatureLabel, number> = {
+  FACT: 1.0,
+  PREFERENCE: 1.0,
+  RELATIONSHIP: 1.2,
+  PROJECT: 1.0,
+  OPINION: 0.6,
+  PLAN: 0.6,
+  EVENT: 0.4,
+  EMOTION: -0.8,
+  TRANSIENT: -1.5,
+  GREETING: -2.5,
+  CHATOPS: -2.0,
+};
+export const ACTIVATION_DEFAULT_W_LINKS = 0.8;
+export const ACTIVATION_DEFAULT_EXPIRY_GRACE_DAYS = 3;
+export const ACTIVATION_DEFAULT_W_EXPIRED = 2.0;
+export const ACTIVATION_DEFAULT_W_CONSOLIDATED = 0.5;
+export const ACTIVATION_DEFAULT_MIN_AGE_HOURS_BY_NATURE: Partial<Record<NatureLabel, number>> = {
+  GREETING: 24,
+  CHATOPS: 24,
+  EMOTION: 72,
+  TRANSIENT: 72,
+};
 /** Importance scoring batch size per maintain.activation run. */
 export const ACTIVATION_DEFAULT_BATCH_MAX = 20;
 /** Hard cap for one scoring batch (also the op limit cap). */
@@ -972,7 +1061,15 @@ export function activationBounds(config: AppConfig): ActivationConfig {
       summary: kind?.summary ?? ACTIVATION_DEFAULT_W_KIND.summary,
       correction: kind?.correction ?? ACTIVATION_DEFAULT_W_KIND.correction,
     },
-    reconsiderLegacy: a?.reconsiderLegacy ?? ACTIVATION_DEFAULT_RECONSIDER_LEGACY,
+    wNature: { ...ACTIVATION_DEFAULT_W_NATURE, ...(a?.wNature ?? {}) },
+    wLinks: a?.wLinks ?? ACTIVATION_DEFAULT_W_LINKS,
+    expiryGraceDays: a?.expiryGraceDays ?? ACTIVATION_DEFAULT_EXPIRY_GRACE_DAYS,
+    wExpired: a?.wExpired ?? ACTIVATION_DEFAULT_W_EXPIRED,
+    wConsolidated: a?.wConsolidated ?? ACTIVATION_DEFAULT_W_CONSOLIDATED,
+    minAgeHoursByNature: {
+      ...ACTIVATION_DEFAULT_MIN_AGE_HOURS_BY_NATURE,
+      ...(a?.minAgeHoursByNature ?? {}),
+    },
     batchMax: a?.batchMax ?? ACTIVATION_DEFAULT_BATCH_MAX,
     apply: a?.apply ?? ACTIVATION_DEFAULT_APPLY,
     protectImportance: a?.protectImportance ?? ACTIVATION_DEFAULT_PROTECT_IMPORTANCE,
@@ -1025,7 +1122,6 @@ export const CULTIVATION_DEFAULT_QUEUE_MAX = 500;
 export const CULTIVATION_DEFAULT_BATCH_MAX = 20;
 export const CULTIVATION_DEFAULT_LEASE_TTL_MS = 120000;
 export const CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS = 5;
-export const CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS = 86400000;
 
 export function cultivationBounds(config: AppConfig): Required<CultivationConfig> {
   return {
@@ -1034,7 +1130,6 @@ export function cultivationBounds(config: AppConfig): Required<CultivationConfig
     leaseTtlMs: config.cultivation?.leaseTtlMs ?? CULTIVATION_DEFAULT_LEASE_TTL_MS,
     reviewMaxAttempts:
       config.cultivation?.reviewMaxAttempts ?? CULTIVATION_DEFAULT_REVIEW_MAX_ATTEMPTS,
-    retireMinAgeMs: config.cultivation?.retireMinAgeMs ?? CULTIVATION_DEFAULT_RETIRE_MIN_AGE_MS,
   };
 }
 

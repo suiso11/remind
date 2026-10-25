@@ -9,7 +9,7 @@
  * applyCultivationBatch and drains the queue under the lease.
  *
  * U5 implementation choices (fixed here, bounds configurable at startup via
- * `cultivation{queueMax,batchMax,leaseTtlMs,reviewMaxAttempts,retireMinAgeMs}`):
+ * `cultivation{queueMax,batchMax,leaseTtlMs,reviewMaxAttempts}`):
  * - Queue dedup: at most one OPEN (pending/leased) review per record
  *   (partial unique index). Re-triggers while open are duplicates, not new rows.
  * - Queue full: enqueue drops (returns 'dropped_full'); the canonical

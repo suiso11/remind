@@ -12,17 +12,21 @@ import { SCHEMA_VERSION, initDb } from "../src/db.js";
 import type { AppConfig } from "../src/config.js";
 import { loadConfig, type ActivationConfig } from "../src/config.js";
 import { eventAppend, correctRecord, rememberRecord, retireRecord } from "../src/store.js";
-import { acquireCultivationLease, releaseCultivationLease } from "../src/cultivation.js";
+import { acquireCultivationLease, applyCultivationBatch, releaseCultivationLease } from "../src/cultivation.js";
+import { chatMlToMessages } from "../src/llm.js";
 import { maintainDistill } from "../src/distill.js";
 import {
   ACTIVATION_DEFAULTS,
   activationAgeHours,
   activationPreview,
-  buildImportancePrompt,
+  CLASSIFIER_SOURCE,
+  CLASSIFIER_VERSION,
+  NATURE_LABELS,
+  buildClassifierPrompt,
   computeActivation,
   loadActivationInputs,
   maintainActivation,
-  parseImportance,
+  parseNatureClassification,
   retireDecision,
   type ActivationInput,
 } from "../src/activation.js";
@@ -142,6 +146,11 @@ function input(overrides: Partial<ActivationInput> = {}): ActivationInput {
     createdAt: "2026-01-10T00:00:00.000Z",
     body: "x",
     importance: null,
+    nature: null,
+    links: 0,
+    expired: false,
+    consolidated: false,
+    latestReactivationReason: null,
     uses: 0,
     eventTimes: [],
     retireReason: null,
@@ -219,11 +228,9 @@ describe("activation: hysteresis and min-age", () => {
     assert.equal(retireDecision(-1, "retired", "LOW_ACTIVATION", 10, ACTIVATION_DEFAULTS), "keep");
     assert.equal(retireDecision(-0.5, "retired", "LOW_ACTIVATION", 10, ACTIVATION_DEFAULTS), "reactivate");
     assert.equal(retireDecision(0, "retired", "LOW_SIGNAL", 10, ACTIVATION_DEFAULTS), "reactivate");
-    assert.equal(
-      retireDecision(0, "retired", "LOW_SIGNAL", 10, { ...ACTIVATION_DEFAULTS, reconsiderLegacy: false }),
-      "keep",
-    );
-    assert.equal(retireDecision(0, "retired", "OUTDATED", 10, ACTIVATION_DEFAULTS), "keep");
+    assert.equal(retireDecision(0, "retired", "OUTDATED", 10, ACTIVATION_DEFAULTS), "reactivate");
+    assert.equal(retireDecision(0, "retired", "CONSOLIDATED", 10, ACTIVATION_DEFAULTS), "reactivate");
+    assert.equal(retireDecision(0, "retired", "NO_LONGER_USEFUL", 10, ACTIVATION_DEFAULTS), "keep");
   });
 });
 
@@ -287,6 +294,38 @@ describe("activation: data loading", () => {
     }
   });
 
+  it("upgrades a v9 database in place: keeps importance and adds nullable nature", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "v9 migration probe", "a-v9", "2026-01-06T00:00:00.000Z");
+      const row = ctx.db.prepare(`SELECT bodyHash FROM records WHERE id = ?`).get(id) as { bodyHash: string };
+      ctx.db.prepare(`INSERT INTO record_importance(recordId, importance, nature, bodyHash, source, scoredAt) VALUES (?, 0.75, 'FACT', ?, 'llm', ?)`).run(id, row.bodyHash, NOW);
+      // Simulate the pre-v10 ledger: no nature column, version stamp 9.
+      ctx.db.exec(`CREATE TABLE ri_old(recordId TEXT PRIMARY KEY, importance REAL NOT NULL, bodyHash TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('llm','external')), scoredAt TEXT NOT NULL)`);
+      ctx.db.exec(`INSERT INTO ri_old SELECT recordId, importance, bodyHash, source, scoredAt FROM record_importance`);
+      ctx.db.exec(`DROP TABLE record_importance`);
+      ctx.db.exec(`ALTER TABLE ri_old RENAME TO record_importance`);
+      ctx.db.exec(`PRAGMA user_version = 9`);
+      ctx.db.close();
+      const reopened = initDb(ctx.config, path.join(ctx.dir, "memory.config.json"));
+      assert.equal((reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, 10);
+      const cols = reopened.db.prepare(`PRAGMA table_info(record_importance)`).all() as Array<{ name: string; notnull: number }>;
+      const nature = cols.find((c) => c.name === "nature");
+      assert.ok(nature);
+      assert.equal(nature?.notnull, 0, "nature is nullable");
+      const kept = reopened.db.prepare(`SELECT importance, nature FROM record_importance WHERE recordId = ?`).get(id) as { importance: number; nature: string | null };
+      assert.equal(kept.importance, 0.75);
+      assert.equal(kept.nature, null);
+      // The v9 source CHECK is rebuilt so the versioned classifier source fits.
+      reopened.db
+        .prepare(`UPDATE record_importance SET source = ? WHERE recordId = ?`)
+        .run(CLASSIFIER_SOURCE, id);
+      reopened.db.close();
+    } finally {
+      fs.rmSync(ctx.dir, { recursive: true, force: true });
+    }
+  });
+
   it("trusts importance only while bodyHash matches and reads the versioned table", () => {
     const ctx = setup();
     try {
@@ -306,7 +345,7 @@ describe("activation: data loading", () => {
       loaded = loadActivationInputs(ctx.db, SCOPE);
       assert.equal(loaded.find((r) => r.recordId === id)?.importance, null);
 
-      assert.equal(SCHEMA_VERSION, 9);
+      assert.equal(SCHEMA_VERSION, 10);
       assert.throws(
         () =>
           ctx.db
@@ -520,7 +559,13 @@ describe("activation config", () => {
       assert.equal(loaded.activation?.decay, 0.5);
       assert.equal(loaded.activation?.minAgeHours, 72);
       assert.equal(loaded.activation?.wKind.correction, 1);
-      assert.equal(loaded.activation?.reconsiderLegacy, true);
+      assert.equal(loaded.activation?.wNature.GREETING, -2.5);
+      assert.equal(loaded.activation?.wNature.CHATOPS, -2.0);
+      assert.equal(loaded.activation?.wLinks, 0.8);
+      assert.equal(loaded.activation?.expiryGraceDays, 3);
+      assert.equal(loaded.activation?.wExpired, 2.0);
+      assert.equal(loaded.activation?.wConsolidated, 0.5);
+      assert.equal(loaded.activation?.minAgeHoursByNature.GREETING, 24);
 
       assert.throws(
         () => loadConfig(write({ ...base, activation: { tauRetire: -0.5, tauReactivate: -1.5 } })),
@@ -535,8 +580,16 @@ describe("activation config", () => {
         /activation.decay/,
       );
       assert.throws(
-        () => loadConfig(write({ ...base, activation: { reconsiderLegacy: "yes" } })),
-        /reconsiderLegacy must be a boolean/,
+        () => loadConfig(write({ ...base, activation: { reconsiderLegacy: true } })),
+        /unknown activation field: reconsiderLegacy/,
+      );
+      assert.throws(
+        () => loadConfig(write({ ...base, activation: { wNature: { BOGUS: 1 } } })),
+        /unknown activation.wNature field/,
+      );
+      assert.throws(
+        () => loadConfig(write({ ...base, activation: { minAgeHoursByNature: { GREETING: -1 } } })),
+        /activation.minAgeHoursByNature.GREETING/,
       );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -544,24 +597,71 @@ describe("activation config", () => {
   });
 });
 
-describe("activation: importance prompt and strict parsing", () => {
-  it("builds a bounded Japanese ChatML prompt with generic few-shots", () => {
-    const prompt = buildImportancePrompt("コーヒーはブラックが好き", 1200);
+describe("activation: combined classifier prompt and strict parsing", () => {
+  it("builds a bounded Japanese ChatML prompt with the nature contract", () => {
+    const prompt = buildClassifierPrompt("コーヒーはブラックが好き", 2000);
     assert.ok(prompt.startsWith("<|im_start|>system\n"));
-    assert.ok(prompt.includes("重要度評価器"));
+    assert.ok(prompt.includes("分類器"));
     assert.ok(prompt.includes("コーヒーはブラックが好き"));
     assert.ok(prompt.endsWith("<|im_end|>\n<|im_start|>assistant\n"));
-    assert.ok(prompt.includes("→ 3"));
-    const short = buildImportancePrompt("あ".repeat(5000), 700);
-    assert.ok([...short].length <= 700);
+    for (const label of NATURE_LABELS) assert.ok(prompt.includes(label), label);
+    assert.ok(prompt.includes("\"nature\""));
+    for (const max of [500, 1200]) {
+      // Below the fixed instruction size the contract wins over the cap: the
+      // prompt keeps all instructions plus at least 200 body code points.
+      const clipped = buildClassifierPrompt("あ".repeat(5000), max);
+      assert.ok(clipped.startsWith("<|im_start|>system\n"), `keeps system at ${max}`);
+      assert.ok(clipped.includes("分類器"), `keeps instructions at ${max}`);
+      assert.ok(clipped.includes("あ".repeat(200)), `keeps 200cp body at ${max}`);
+      assert.ok(!clipped.includes("あ".repeat(201)), `clips body at ${max}`);
+      assert.ok(clipped.endsWith("<|im_start|>assistant\n"), "keeps assistant cue");
+      // The ChatML must always split into real roles (never cue-only).
+      const conv = chatMlToMessages(clipped);
+      assert.ok(conv, `converts at ${max}`);
+      // The trailing assistant cue is an empty prefill: the conversion must
+      // still yield real system+user messages (never null / cue-only).
+      assert.deepEqual(conv.messages.map((m) => m.role), ["system", "user"]);
+      assert.equal(conv.prefill, "");
+      assert.ok(conv.messages[0]!.content.includes("分類器"));
+      assert.ok(conv.messages[1]!.content.includes("あ".repeat(200)));
+    }
   });
 
-  it("accepts exactly one digit 0..3 and rejects everything else", () => {
-    assert.equal(parseImportance("0"), 0);
-    assert.equal(parseImportance("3"), 3);
-    assert.equal(parseImportance(" 2\n"), 2);
-    for (const raw of ["", "4", "-1", "2.0", "two", "2点", "1 2", "importance: 3", null, undefined]) {
-      assert.equal(parseImportance(raw as string | null | undefined), null, String(raw));
+  it("parses strict combined JSON and tolerates surrounding text", () => {
+    assert.deepEqual(parseNatureClassification('{"nature":"FACT","importance":3}'), { nature: "FACT", importance: 3 });
+    assert.deepEqual(
+      parseNatureClassification('説明です。\n{"nature":"TRANSIENT","importance":0}\n以上'),
+      { nature: "TRANSIENT", importance: 0 },
+    );
+    assert.deepEqual(
+      parseNatureClassification('{"nature":"PREFERENCE","importance":2}'),
+      { nature: "PREFERENCE", importance: 2 },
+    );
+    // Thinking blocks are stripped before the first JSON object is taken.
+    assert.deepEqual(
+      parseNatureClassification('<think>{"nature":"GREETING","importance":0}</think>{"nature":"PLAN","importance":3}'),
+      { nature: "PLAN", importance: 3 },
+    );
+  });
+
+  it("rejects wrong labels, out-of-range/non-integer importance, and malformed output", () => {
+    for (const raw of [
+      "",
+      null,
+      undefined,
+      "not json",
+      '{"nature":"UNKNOWN","importance":2}',
+      '{"nature":"fact","importance":2}',
+      '{"nature":"FACT","importance":4}',
+      '{"nature":"FACT","importance":-1}',
+      '{"nature":"FACT","importance":2.5}',
+      '{"nature":"FACT","importance":"2"}',
+      '{"nature":"FACT"}',
+      '{"nature":"FACT","importance":2,"extra":true}',
+      '["FACT",2]',
+      '{"nature":"FACT","importance":2',
+    ]) {
+      assert.equal(parseNatureClassification(raw as string | null | undefined), null, String(raw));
     }
   });
 });
@@ -575,8 +675,8 @@ describe("activation: maintain.activation", () => {
       let calls = 0;
       const generate = async (prompt: string): Promise<string> => {
         calls++;
-        assert.ok(prompt.includes("重要度"));
-        return "3";
+        assert.ok(prompt.includes("分類器"));
+        return '{"nature":"FACT","importance":3}';
       };
       const first = await maintainActivation(
         ctx.db,
@@ -608,7 +708,7 @@ describe("activation: maintain.activation", () => {
       assert.deepEqual(rows.map((r) => r.recordId).sort(), [a, b].sort());
       for (const row of rows) {
         assert.equal(row.importance, 1);
-        assert.equal(row.source, "llm");
+        assert.equal(row.source, CLASSIFIER_SOURCE);
         const hash = (ctx.db.prepare(`SELECT bodyHash FROM records WHERE id = ?`).get(row.recordId) as { bodyHash: string }).bodyHash;
         assert.equal(row.bodyHash, hash);
       }
@@ -625,6 +725,66 @@ describe("activation: maintain.activation", () => {
       assert.equal(second.ok, true, JSON.stringify(second));
       assert.equal((second.data as { scored: number }).scored, 0);
       assert.equal(calls, 2, "current importance rows are not re-scored");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("rescans rows whose classifier version is stale and stamps the current version", async () => {
+    const ctx = setup({ apply: false });
+    try {
+      const id = remember(ctx.db, ctx.config, "version probe note", "s-ver", "2026-01-01T00:00:00.000Z");
+      let calls = 0;
+      const generate = async (): Promise<string> => {
+        calls++;
+        return calls === 1 ? '{"nature":"FACT","importance":3}' : '{"nature":"PREFERENCE","importance":2}';
+      };
+      const first = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        path.join(ctx.dir, "memory.config.json"),
+        { scope: SCOPE },
+        "act-ver-1",
+        generate,
+        NOW,
+      );
+      assert.equal(first.ok, true, JSON.stringify(first));
+      assert.equal((first.data as { scored: number }).scored, 1);
+      assert.equal(CLASSIFIER_VERSION, "v2");
+
+      // Simulate a row written by the v1 prompt: same body hash and nature,
+      // but an older source. selectUnscored must pick it up exactly once.
+      ctx.db.prepare(`UPDATE record_importance SET source = 'llm' WHERE recordId = ?`).run(id);
+      const second = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        path.join(ctx.dir, "memory.config.json"),
+        { scope: SCOPE },
+        "act-ver-2",
+        generate,
+        NOW,
+      );
+      assert.equal(second.ok, true, JSON.stringify(second));
+      assert.equal((second.data as { scored: number }).scored, 1);
+      const stored = ctx.db
+        .prepare(`SELECT source, nature, importance FROM record_importance WHERE recordId = ?`)
+        .get(id) as { source: string; nature: string; importance: number };
+      assert.equal(stored.source, CLASSIFIER_SOURCE);
+      assert.equal(stored.nature, "PREFERENCE");
+      assert.equal(stored.importance, 2 / 3);
+
+      const third = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        path.join(ctx.dir, "memory.config.json"),
+        { scope: SCOPE },
+        "act-ver-3",
+        generate,
+        NOW,
+      );
+      assert.equal(third.ok, true, JSON.stringify(third));
+      assert.equal((third.data as { scored: number }).scored, 0, "current version is not rescored");
+      assert.equal(calls, 2);
     } finally {
       ctx.cleanup();
     }
@@ -730,103 +890,41 @@ describe("activation: maintain.activation", () => {
     }
   });
 
-  it("reactivates a record retired by the real distill apply path (LOW_SIGNAL provenance)", async () => {
+  it("reactivates a retired LOW_SIGNAL record while the classifier scores it", async () => {
     const ctx = setup({ apply: true });
     try {
-      const id = remember(
-        ctx.db,
-        ctx.config,
-        "passing mood with no lasting content",
-        "m-distill-retire",
-        "2026-01-10T23:00:00.000Z",
-      );
-      // maintain.distill needs a provisioned model to dequeue; the actual
-      // decisions are injected, so the files only satisfy the presence check.
-      const modelDir = path.join(ctx.dir, "fake-llm");
-      fs.mkdirSync(path.join(modelDir, "onnx"), { recursive: true });
-      for (const f of [
-        "config.json",
-        "generation_config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "onnx/model_q4.onnx",
-      ]) {
-        fs.writeFileSync(path.join(modelDir, f), "{}");
-      }
-      ctx.config.llm = {
-        modelDir,
-        timeoutMs: 5000,
-        enabled: true,
-        maxNewTokens: 48,
-        maxPromptChars: 2000,
-        // master gates auto-retirement on the OpenAI-compatible backend; the
-        // decisions are still injected, so loopback+model just satisfy the
-        // usability gate.
-        backend: "openai",
-        baseUrl: "http://127.0.0.1:1234/v1",
-        model: "test-model",
-      };
-      // master's #35 grace period defaults to 24h; this fixture retires a
-      // one-hour-old record on purpose, so disable only the delay.
-      ctx.config.cultivation = { retireMinAgeMs: 0 } as unknown as NonNullable<
-        AppConfig["cultivation"]
-      >;
-      const decide = async (prompt: string): Promise<string | null> =>
-        prompt.includes("You classify one memory") ? "TRANSIENT" : "KEEP";
-      const distilled = await maintainDistill(
-        ctx.db,
-        ctx.config,
-        path.join(ctx.dir, "memory.config.json"),
-        { scope: SCOPE, limit: 5 },
-        "act-distill-retire",
-        decide,
-        NOW,
-      );
-      assert.equal(distilled.ok, true, JSON.stringify(distilled));
-      assert.equal(
-        (distilled.data as { distill: { applied: number } }).distill.applied,
-        1,
-      );
-      const retired = ctx.db
-        .prepare(`SELECT status FROM records WHERE id = ?`)
-        .get(id) as { status: string };
-      assert.equal(retired.status, "retired");
-      const retAudit = ctx.db
-        .prepare(
-          `SELECT op, reasonCode FROM audit WHERE targetId = ? ORDER BY rowid DESC LIMIT 1`,
-        )
-        .get(id) as { op: string; reasonCode: string } | undefined;
-      assert.equal(retAudit?.op, "maintain.cultivate");
-      assert.equal(retAudit?.reasonCode, "LOW_SIGNAL");
-
-      // The loader must read provenance from the cultivate apply audit row,
-      // not only from record.retire.
-      const loaded = loadActivationInputs(ctx.db, SCOPE);
-      assert.equal(loaded.find((r) => r.recordId === id)?.retireReason, "LOW_SIGNAL");
-
+      const id = remember(ctx.db, ctx.config, "passing mood with no lasting content", "m-retire-probe", "2026-01-10T23:00:00.000Z");
+      // Retirement itself is no longer a distill concern; it is decided by the
+      // combined retention score in maintain.activation. Seed a retired row to
+      // exercise the reactivation path.
+      const ret = retireRecord(ctx.db, ctx.config, { id, scope: SCOPE, reasonCode: "LOW_SIGNAL" }, "act-retire-probe", NOW);
+      assert.equal(ret.ok, true, JSON.stringify(ret));
+      let prompts = 0;
       const res = await maintainActivation(
         ctx.db,
         ctx.config,
         path.join(ctx.dir, "memory.config.json"),
         { scope: SCOPE },
-        "act-distill-reactivate",
-        async () => "3",
+        "act-retire-reactivate",
+        async () => {
+          prompts++;
+          return '{"nature":"EMOTION","importance":3}';
+        },
         NOW,
       );
       assert.equal(res.ok, true, JSON.stringify(res));
+      assert.ok(prompts >= 1);
+      const stored = ctx.db.prepare(`SELECT importance, nature FROM record_importance WHERE recordId = ?`).get(id) as { importance: number; nature: string } | undefined;
+      assert.equal(stored?.importance, 1);
+      assert.equal(stored?.nature, "EMOTION");
       const data = res.data as { reactivated: number; wouldReactivate: number; retired: number };
       assert.equal(data.reactivated, 1);
       assert.equal(data.wouldReactivate, 1);
       assert.equal(data.retired, 0);
-      const status = ctx.db
-        .prepare(`SELECT status FROM records WHERE id = ?`)
-        .get(id) as { status: string };
+      const status = ctx.db.prepare(`SELECT status FROM records WHERE id = ?`).get(id) as { status: string };
       assert.equal(status.status, "active");
       const reactAudit = ctx.db
-        .prepare(
-          `SELECT reasonCode FROM audit WHERE op = 'record.reactivate' AND targetId = ? ORDER BY rowid DESC LIMIT 1`,
-        )
+        .prepare(`SELECT reasonCode FROM audit WHERE op = 'record.reactivate' AND targetId = ? ORDER BY rowid DESC LIMIT 1`)
         .get(id) as { reasonCode: string } | undefined;
       assert.equal(reactAudit?.reasonCode, "STILL_USEFUL");
     } finally {
@@ -880,7 +978,7 @@ describe("activation: maintain.activation", () => {
         // Longer than the 1s lease: without the heartbeat the fenced write
         // would be rejected as CONFLICT even though no other process ran.
         await new Promise((r) => setTimeout(r, 1100));
-        return "3";
+        return '{"nature":"FACT","importance":3}';
       };
       // No nowOverride: renewNow() uses the wall clock.
       const res = await maintainActivation(
@@ -920,7 +1018,7 @@ describe("activation: maintain.activation", () => {
         });
         assert.equal(stolen.acquired, true);
         await new Promise((r) => setTimeout(r, 900));
-        return "3";
+        return '{"nature":"FACT","importance":3}';
       };
       const res = await maintainActivation(
         ctx.db,
@@ -951,7 +1049,7 @@ describe("activation: maintain.activation", () => {
         path.join(ctx.dir, "memory.config.json"),
         { scope: SCOPE },
         "act-cap-score",
-        async () => "3",
+        async () => '{"nature":"FACT","importance":3}',
         NOW,
       );
       assert.equal(scored.ok, false);
@@ -1113,6 +1211,400 @@ describe("activation: maintain.activation", () => {
       );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Multi-factor retention score                                        */
+/* ------------------------------------------------------------------ */
+
+function setScore(
+  db: DatabaseSync,
+  id: string,
+  importance: number,
+  nature: string | null,
+): void {
+  const row = db.prepare(`SELECT bodyHash FROM records WHERE id = ?`).get(id) as { bodyHash: string };
+  db.prepare(
+    `INSERT INTO record_importance(recordId, importance, nature, bodyHash, source, scoredAt)
+     VALUES (?, ?, ?, ?, 'llm', ?)
+     ON CONFLICT(recordId) DO UPDATE SET
+       importance = excluded.importance, nature = excluded.nature,
+       bodyHash = excluded.bodyHash, source = excluded.source, scoredAt = excluded.scoredAt`,
+  ).run(id, importance, nature, row.bodyHash, NOW);
+}
+
+function linkRecord(db: DatabaseSync, from: string, to: string): void {
+  db.prepare(`INSERT OR IGNORE INTO record_links(fromId, toRef) VALUES (?, ?)`).run(from, to);
+}
+
+function similarEdge(db: DatabaseSync, x: string, y: string): void {
+  const [a, b] = x < y ? [x, y] : [y, x];
+  db.prepare(
+    `INSERT OR REPLACE INTO similar_edges(scope, a, b, score, computedAt) VALUES (?, ?, ?, 0.9, ?)`,
+  ).run(SCOPE, a, b, NOW);
+}
+
+function previewItems(ctx: { db: DatabaseSync; config: AppConfig }, now = NOW) {
+  const res = activationPreview(ctx.db, ctx.config, { scope: SCOPE }, now);
+  assert.equal(res.ok, true, JSON.stringify(res));
+  return (res.data as {
+    items: Array<{
+      id: string;
+      nature: string | null;
+      A: number;
+      importance: number | null;
+      decision: string;
+      reason: string | null;
+      factors: Record<string, number>;
+    }>;
+  }).items;
+}
+
+function decide(ctx: { db: DatabaseSync; config: AppConfig }, id: string, now = NOW) {
+  return previewItems(ctx, now).find((i) => i.id === id);
+}
+
+/** Stage one transition through applyCultivationBatch (audited as maintain.cultivate). */
+function cultivate(
+  ctx: { db: DatabaseSync; config: AppConfig },
+  key: string,
+  recordId: string,
+  action: "retire" | "reactivate",
+  reasonCode: string,
+  now: string,
+): void {
+  const res = applyCultivationBatch(
+    ctx.db,
+    ctx.config,
+    {
+      scope: SCOPE,
+      idempotencyKey: key,
+      actions: [{ recordId, action, reasonCode }],
+    },
+    now,
+  );
+  assert.equal(res.ok, true, JSON.stringify(res));
+}
+
+describe("activation: multi-factor retention score", () => {
+  it("retires an unlinked 30h-old greeting but keeps an old durable FACT", () => {
+    const ctx = setup();
+    try {
+      const greet = remember(ctx.db, ctx.config, "おはよう", "r-greet", "2026-01-09T18:00:00.000Z");
+      setScore(ctx.db, greet, 0, "GREETING");
+      const fact = remember(
+        ctx.db,
+        ctx.config,
+        "東京在住、自転車通勤",
+        "r-fact",
+        "2026-01-01T00:00:00.000Z",
+      );
+      setScore(ctx.db, fact, 1, "FACT");
+
+      const greeting = decide(ctx, greet);
+      const durable = decide(ctx, fact);
+      assert.equal(greeting?.decision, "retire");
+      assert.equal(greeting?.reason, "LOW_ACTIVATION");
+      assert.equal(durable?.decision, "keep");
+      assert.equal(durable?.importance, 1);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("keeps linked EMOTION but retires the same unlinked EMOTION", () => {
+    const ctx = setup();
+    try {
+      const unlinked = remember(ctx.db, ctx.config, "少し寂しい", "r-emo-u", "2026-01-01T00:00:00.000Z");
+      const linked = remember(ctx.db, ctx.config, "少し寂しい", "r-emo-l", "2026-01-01T00:00:00.000Z");
+      const friend = remember(ctx.db, ctx.config, "親友のA", "r-friend", "2026-01-01T00:00:00.000Z");
+      setScore(ctx.db, unlinked, 0.5, "EMOTION");
+      setScore(ctx.db, linked, 0.5, "EMOTION");
+      setScore(ctx.db, friend, 1, "RELATIONSHIP");
+      linkRecord(ctx.db, linked, friend);
+
+      const u = decide(ctx, unlinked);
+      const l = decide(ctx, linked);
+      assert.equal(u?.decision, "retire");
+      assert.equal(l?.decision, "keep");
+      assert.ok((l?.factors.links ?? 0) > 0);
+      assert.ok((l?.A ?? 0) > (u?.A ?? 0));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("counts a cross-chunk canonical edge once per endpoint (301 candidates)", () => {
+    const ctx = setup();
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 301; i++) {
+        ids.push(
+          remember(ctx.db, ctx.config, `chunk memory ${i}`, `r-chunk-${i}`, "2026-01-01T00:00:00.000Z"),
+        );
+      }
+      // ids[0] and ids[300] land in different SQL chunks (SQL_CHUNK = 300).
+      linkRecord(ctx.db, ids[0]!, ids[300]!);
+      const inputs = loadActivationInputs(ctx.db, SCOPE, { includeRetired: false });
+      const first = inputs.find((i) => i.recordId === ids[0]);
+      const last = inputs.find((i) => i.recordId === ids[300]);
+      assert.equal(first?.links, 1, "edge counted once for from endpoint");
+      assert.equal(last?.links, 1, "edge counted once for to endpoint");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("ignores similar edges whose neighbour is no longer active", () => {
+    const ctx = setup();
+    try {
+      const stale = remember(ctx.db, ctx.config, "古い隣人と似ている", "r-sim-stale", "2026-01-01T00:00:00.000Z");
+      const fresh = remember(ctx.db, ctx.config, "今も使う隣人と似ている", "r-sim-fresh", "2026-01-01T00:00:00.000Z");
+      const retiredPeer = remember(ctx.db, ctx.config, "もう使わない記憶", "r-sim-peer-r", "2026-01-01T00:00:00.000Z");
+      const activePeer = remember(ctx.db, ctx.config, "現役の記憶", "r-sim-peer-a", "2026-01-01T00:00:00.000Z");
+      similarEdge(ctx.db, stale, retiredPeer);
+      similarEdge(ctx.db, fresh, activePeer);
+      const ret = retireRecord(
+        ctx.db,
+        ctx.config,
+        { id: retiredPeer, scope: SCOPE, reasonCode: "LOW_SIGNAL" },
+        "r-sim-retire",
+        NOW,
+      );
+      assert.equal(ret.ok, true, JSON.stringify(ret));
+      // The derived row survives until maintain.associate prunes it.
+      const rows = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM similar_edges WHERE scope = ?`)
+        .get(SCOPE) as { n: number };
+      assert.equal(rows.n, 2);
+
+      const inputs = loadActivationInputs(ctx.db, SCOPE, { includeRetired: false });
+      const staleInput = inputs.find((i) => i.recordId === stale);
+      const freshInput = inputs.find((i) => i.recordId === fresh);
+      assert.equal(staleInput?.links, 0, "edge to a retired neighbour contributes 0");
+      assert.equal(freshInput?.links, 0.5, "edge to an active neighbour still counts");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("counts a cross-chunk similar edge once per endpoint (301 candidates)", () => {
+    const ctx = setup();
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 301; i++) {
+        ids.push(
+          remember(ctx.db, ctx.config, `similar chunk memory ${i}`, `r-simchunk-${i}`, "2026-01-01T00:00:00.000Z"),
+        );
+      }
+      // ids[0] and ids[300] land in different SQL chunks (SQL_CHUNK = 300).
+      similarEdge(ctx.db, ids[0]!, ids[300]!);
+      const inputs = loadActivationInputs(ctx.db, SCOPE, { includeRetired: false });
+      const first = inputs.find((i) => i.recordId === ids[0]);
+      const last = inputs.find((i) => i.recordId === ids[300]);
+      assert.equal(first?.links, 0.5, "edge counted once for endpoint a");
+      assert.equal(last?.links, 0.5, "edge counted once for endpoint b");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("retires a dated PLAN as OUTDATED and keeps the same plan with a future date", () => {
+    const ctx = setup();
+    try {
+      const past = remember(
+        ctx.db,
+        ctx.config,
+        "旅行は2026-01-01に行く",
+        "r-plan-past",
+        "2026-01-08T00:00:00.000Z",
+        "model_inference",
+      );
+      const future = remember(
+        ctx.db,
+        ctx.config,
+        "旅行は2026-02-01に行く",
+        "r-plan-future",
+        "2026-01-08T00:00:00.000Z",
+        "model_inference",
+      );
+      setScore(ctx.db, past, 1 / 3, "PLAN");
+      setScore(ctx.db, future, 1 / 3, "PLAN");
+
+      const p = decide(ctx, past);
+      const f = decide(ctx, future);
+      assert.equal(p?.decision, "retire");
+      assert.equal(p?.reason, "OUTDATED");
+      assert.ok((p?.factors.expired ?? 0) < 0);
+      assert.equal(f?.decision, "keep");
+      assert.equal(f?.factors.expired, 0);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("never reactivates a user-driven NO_LONGER_USEFUL retirement", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "古い住所", "r-user-ret", "2026-01-10T00:00:00.000Z");
+      setScore(ctx.db, id, 1, "FACT");
+      const ret = retireRecord(
+        ctx.db,
+        ctx.config,
+        { id, scope: SCOPE, reasonCode: "NO_LONGER_USEFUL" },
+        "r-user-ret-k",
+        NOW,
+      );
+      assert.equal(ret.ok, true, JSON.stringify(ret));
+      const item = decide(ctx, id);
+      assert.equal(item?.decision, "keep");
+      assert.equal(item?.reason, null);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("never auto-retires after a USER_REQUESTED reactivation", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "また呼んで", "r-user-req", "2026-01-09T18:00:00.000Z");
+      setScore(ctx.db, id, 0, "GREETING");
+      ctx.db
+        .prepare(
+          `INSERT INTO audit(ts, op, targetId, code, scope, bytes, limitN, runId, recallId, reasonCode)
+           VALUES (?, 'record.reactivate', ?, 'OK', ?, NULL, NULL, NULL, NULL, 'USER_REQUESTED')`,
+        )
+        .run("2026-01-10T00:00:00.000Z", id, SCOPE);
+      const item = decide(ctx, id);
+      assert.ok((item?.A ?? 0) < -1.5, "score is below tauRetire");
+      assert.equal(item?.decision, "keep");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("never auto-retires after a USER_REQUESTED reactivation applied by cultivate", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "また呼んで", "r-cult-req", "2026-01-09T18:00:00.000Z");
+      setScore(ctx.db, id, 0, "GREETING");
+      cultivate(ctx, "r-cult-req-ret", id, "retire", "NO_LONGER_USEFUL", "2026-01-10T00:00:00.000Z");
+      cultivate(ctx, "r-cult-req-rea", id, "reactivate", "USER_REQUESTED", "2026-01-10T01:00:00.000Z");
+      const item = decide(ctx, id);
+      assert.ok((item?.A ?? 0) < -1.5, "score is below tauRetire");
+      assert.equal(item?.decision, "keep");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("never reactivates a NO_LONGER_USEFUL retirement applied by cultivate", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "古い住所", "r-cult-ret", "2026-01-10T00:00:00.000Z");
+      setScore(ctx.db, id, 1, "FACT");
+      cultivate(ctx, "r-cult-ret-k", id, "retire", "NO_LONGER_USEFUL", "2026-01-10T01:00:00.000Z");
+      const item = decide(ctx, id);
+      assert.ok((item?.A ?? 0) >= -0.5, "score alone would reactivate");
+      assert.equal(item?.decision, "keep");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("latest transition wins: a later LOW_ACTIVATION retirement is reconsiderable", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "また使う事実", "r-cult-latest", "2026-01-01T00:00:00.000Z");
+      setScore(ctx.db, id, 1, "FACT");
+      cultivate(ctx, "r-cult-latest-ret0", id, "retire", "NO_LONGER_USEFUL", "2026-01-10T00:00:00.000Z");
+      cultivate(ctx, "r-cult-latest-rea", id, "reactivate", "USER_REQUESTED", "2026-01-10T01:00:00.000Z");
+      // While the user reactivation is the latest event it protects the row.
+      assert.equal(decide(ctx, id)?.decision, "keep");
+      cultivate(ctx, "r-cult-latest-ret1", id, "retire", "LOW_ACTIVATION", "2026-01-10T02:00:00.000Z");
+      const item = decide(ctx, id);
+      assert.ok((item?.A ?? 0) >= -0.5, "score alone would reactivate");
+      assert.equal(item?.decision, "reactivate");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("reconsiders legacy LOW_SIGNAL: greeting stays retired, FACT reactivates", () => {
+    const ctx = setup();
+    try {
+      const greet = remember(ctx.db, ctx.config, "こんにちは", "r-leg-g", "2026-01-09T18:00:00.000Z");
+      const fact = remember(ctx.db, ctx.config, "猫を飼っている", "r-leg-f", "2026-01-09T18:00:00.000Z");
+      setScore(ctx.db, greet, 0, "GREETING");
+      setScore(ctx.db, fact, 1, "FACT");
+      for (const id of [greet, fact]) {
+        const ret = retireRecord(
+          ctx.db,
+          ctx.config,
+          { id, scope: SCOPE, reasonCode: "LOW_SIGNAL" },
+          `r-leg-${id}`,
+          NOW,
+        );
+        assert.equal(ret.ok, true, JSON.stringify(ret));
+      }
+      assert.equal(decide(ctx, greet)?.decision, "keep");
+      assert.equal(decide(ctx, fact)?.decision, "reactivate");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("marks a penalty-only retirement as CONSOLIDATED when a cluster summary cites it", () => {
+    const ctx = setup();
+    try {
+      const member = remember(
+        ctx.db,
+        ctx.config,
+        "今日は少し疲れた",
+        "r-cons-m",
+        "2025-12-29T12:00:00.000Z",
+      );
+      setScore(ctx.db, member, 0.5, "EMOTION");
+      const summary = remember(
+        ctx.db,
+        ctx.config,
+        "近況の要約",
+        "r-cons-s",
+        "2026-01-05T00:00:00.000Z",
+        "summary",
+      );
+      ctx.db
+        .prepare(`UPDATE records SET source = 'cultivation:llm-derived-cluster' WHERE id = ?`)
+        .run(summary);
+      linkRecord(ctx.db, summary, member);
+
+      const item = decide(ctx, member);
+      assert.equal(item?.decision, "retire");
+      assert.equal(item?.reason, "CONSOLIDATED");
+      assert.equal(item?.factors.consolidated, -0.5);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("preview factors sum to the reported total A", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "設計プロジェクト", "r-factors", "2026-01-01T00:00:00.000Z");
+      setScore(ctx.db, id, 1, "PROJECT");
+      const item = decide(ctx, id);
+      assert.ok(item);
+      const f = item.factors;
+      const sum =
+        f.base + f.kind + f.importance + f.nature + f.links + f.expired + f.consolidated;
+      assert.ok(Math.abs(sum - f.total) < 1e-12);
+      assert.ok(Math.abs(f.total - item.A) < 1e-12);
+      assert.equal(item.nature, "PROJECT");
+      assert.equal(item.importance, 1);
+    } finally {
+      ctx.cleanup();
     }
   });
 });

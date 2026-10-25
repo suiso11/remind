@@ -35,8 +35,7 @@
     "queueMax": 500,
     "batchMax": 20,
     "leaseTtlMs": 120000,
-    "reviewMaxAttempts": 5,
-    "retireMinAgeMs": 86400000
+    "reviewMaxAttempts": 5
   },
   "llm": {
     "backend": "onnx",
@@ -79,7 +78,29 @@
       "summary": 0.3,
       "correction": 1.0
     },
-    "reconsiderLegacy": true,
+    "wNature": {
+      "FACT": 1.0,
+      "PREFERENCE": 1.0,
+      "OPINION": 0.6,
+      "PLAN": 0.6,
+      "EVENT": 0.4,
+      "RELATIONSHIP": 1.2,
+      "PROJECT": 1.0,
+      "EMOTION": -0.8,
+      "TRANSIENT": -1.5,
+      "GREETING": -2.5,
+      "CHATOPS": -2.0
+    },
+    "wLinks": 0.8,
+    "expiryGraceDays": 3,
+    "wExpired": 2.0,
+    "wConsolidated": 0.5,
+    "minAgeHoursByNature": {
+      "GREETING": 24,
+      "CHATOPS": 24,
+      "EMOTION": 72,
+      "TRANSIENT": 72
+    },
     "batchMax": 20,
     "apply": false,
     "protectImportance": 0.66

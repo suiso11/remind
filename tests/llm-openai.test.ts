@@ -439,14 +439,10 @@ describe("openai generateCompletion", () => {
 });
 
 describe("openai backend maintenance flows", () => {
-  it("runs maintain.distill through the server and applies a retire verdict", async () => {
+  it("never retires from maintain.distill: a low-signal mood review stays active", async () => {
     await withServer(
-      (body) => {
-        const text = systemText(body);
-        if (text.includes("You classify one memory")) return { content: "TRANSIENT" };
-        return { content: "KEEP" };
-      },
-      async (url, requests) => {
+      () => ({ content: "KEEP" }),
+      async (url) => {
         const ctx = setup(openAiLlm(url));
         try {
           const id = remember(ctx.db, ctx.config, "a passing mood with no lasting content", "distill-1");
@@ -464,14 +460,11 @@ describe("openai backend maintenance flows", () => {
             distill: { reviewed: number; applied: number; model: string; revision: string | null };
           }).distill;
           assert.equal(d.reviewed, 1);
-          assert.equal(d.applied, 1);
+          assert.equal(d.applied, 0);
           assert.equal(d.model, "ornith-test");
           assert.equal(d.revision, null);
           const got = getRecord(ctx.db, ctx.config, { id, scope: SCOPE });
-          assert.equal((got.data as { record: { status: string } }).record.status, "retired");
-          assert.ok(requests.length >= 1);
-          assert.equal(requests[0]!.url, "/v1/chat/completions");
-          assert.ok(systemText(requests[0]!.body).includes("You classify one memory"));
+          assert.equal((got.data as { record: { status: string } }).record.status, "active");
         } finally {
           ctx.cleanup();
         }
@@ -480,13 +473,9 @@ describe("openai backend maintenance flows", () => {
     resetLlmRuntime();
   });
 
-  it("defers a young DROP candidate via the server, then retires it after the grace period", async () => {
+  it("runs a young record's review without a grace-period deferral or retirement", async () => {
     await withServer(
-      (body) => {
-        const text = systemText(body);
-        if (text.includes("You classify one memory")) return { content: "TRANSIENT" };
-        return { content: "KEEP" };
-      },
+      () => ({ content: "KEEP" }),
       async (url) => {
         const ctx = setup(openAiLlm(url));
         try {
@@ -496,21 +485,15 @@ describe("openai backend maintenance flows", () => {
             "openai-distill-defer-1", undefined, "2026-09-01T00:10:00.000Z",
           );
           assert.equal(r1.ok, true, JSON.stringify(r1));
-          const d1 = (r1.data as { distill: { deferred: number; applied: number; failed: number } }).distill;
-          assert.equal(d1.deferred, 1);
+          const d1 = (r1.data as { distill: { deferred: number; applied: number; failed: number; reviewed: number } }).distill;
+          assert.equal(d1.reviewed, 1);
+          assert.equal(d1.deferred, 0);
           assert.equal(d1.failed, 0);
           assert.equal(d1.applied, 0);
-          const row = ctx.db.prepare(
-            `SELECT status, attempts, nextAt FROM cultivation_queue WHERE recordId = ?`,
-          ).get(id) as { status: string; attempts: number; nextAt: string };
-          assert.equal(row.status, "pending");
-          assert.equal(row.attempts, 0);
-          assert.equal(row.nextAt, "2026-09-02T00:00:00.000Z");
           assert.equal(
             (getRecord(ctx.db, ctx.config, { id, scope: SCOPE }).data as { record: { status: string } }).record.status,
             "active",
           );
-          // Past the grace period the same gate DROP now retires.
           const r2 = await maintainDistill(
             ctx.db, ctx.config, ctx.configPath, { scope: SCOPE, limit: 5 },
             "openai-distill-defer-2", undefined, "2026-09-02T00:00:01.000Z",
@@ -518,10 +501,10 @@ describe("openai backend maintenance flows", () => {
           assert.equal(r2.ok, true, JSON.stringify(r2));
           const d2 = (r2.data as { distill: { deferred: number; applied: number } }).distill;
           assert.equal(d2.deferred, 0);
-          assert.equal(d2.applied, 1);
+          assert.equal(d2.applied, 0);
           assert.equal(
             (getRecord(ctx.db, ctx.config, { id, scope: SCOPE }).data as { record: { status: string } }).record.status,
-            "retired",
+            "active",
           );
         } finally {
           ctx.cleanup();
