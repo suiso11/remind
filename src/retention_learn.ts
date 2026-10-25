@@ -44,6 +44,7 @@ import {
   type RetentionWeights,
 } from "./retention_model.js";
 import { loadActivationInputs, type ActivationInput } from "./retention_inputs.js";
+import { isCultivationLeaseHeldBy } from "./cultivation.js";
 import { assertDbUnderCap } from "./store.js";
 
 // Re-export the model helpers that belonged to this module before the split.
@@ -215,8 +216,11 @@ function writeHarvestCursor(
  * Progress is tracked in retention_harvest_state per (scope, source), not by
  * the bounded example table: pruning may delete old examples, but the cursor
  * still prevents the same audit/exposure identities from consuming the next
- * candidate budget. Exposures resume at (ts, recallId, recordId), audit rows
- * at (ts, rowid). All writes (inserts, pruning, cursor advance) commit in one
+ * candidate budget. Exposures resume at (ts, recallId, recordId). Audit rows
+ * resume strictly by rowid (insertion order): transition timestamps are
+ * captured before their transaction, so they can commit out of ts order and
+ * a (ts, rowid) cursor would permanently skip the older-timestamped row.
+ * All writes (inserts, pruning, cursor advance) commit in one
  * BEGIN IMMEDIATE transaction only while the database is under dbMaxBytes;
  * a cap breach rolls the whole harvest back so no derived row leaks past the
  * limit that a later canonical write would reject. When
@@ -261,14 +265,16 @@ export function harvestRetentionExamples(
     // non-OK result code, so they must not become labels for a transition that
     // never happened. Harvesting these before exposures guarantees that a
     // large exposure backlog cannot starve explicit user labels.
-    const auditTie =
+    // Audit progress is insertion order only. Rowids are monotonic per table
+    // and audit ts is captured before the writing transaction, so a delayed
+    // writer can legitimately insert an older ts after the cursor advanced.
+    const auditCursorRowid =
       auditCursor !== null && Number.isFinite(Number(auditCursor.lastKey))
-        ? `AND (a.ts > ? OR (a.ts = ? AND a.rowid > ?))`
-        : "";
+        ? Number(auditCursor.lastKey)
+        : null;
+    const auditTie = auditCursorRowid !== null ? `AND a.rowid > ?` : "";
     const auditParams: Array<string | number | null> = [scope, now, ...TRANSITION_OPS];
-    if (auditCursor !== null && Number.isFinite(Number(auditCursor.lastKey))) {
-      auditParams.push(auditCursor.lastTs, auditCursor.lastTs, Number(auditCursor.lastKey));
-    }
+    if (auditCursorRowid !== null) auditParams.push(auditCursorRowid);
     auditParams.push(HARVEST_AUDIT_MAX_NEW);
     const transitions = db
       .prepare(
@@ -285,7 +291,7 @@ export function harvestRetentionExamples(
                WHERE x.recallId = 'audit:' || a.rowid
                  AND x.recordId = a.targetId)
             ${auditTie}
-          ORDER BY a.ts ASC, a.rowid ASC
+          ORDER BY a.rowid ASC
           LIMIT ?`,
       )
       .all(...auditParams) as unknown as Array<{
@@ -1045,12 +1051,20 @@ function skipped(reason: LearnSkipReason, examples = 0, positives = 0): LearnOut
  * holdout log-loss beats the current active weights (a,b refit on train for
  * both sides) by more than 1e-4. Accepted weights are then refit on all
  * examples before being stored.
+ *
+ * Fitting can outlast cultivation.leaseTtlMs, so the publication transaction
+ * re-checks that `owner` still holds the live lease using `clock()` (the
+ * caller's renewal clock) and rolls back with "lease lost" otherwise. A stale
+ * worker must never append an accepted snapshot after a newer worker took
+ * over the lease and the model baseline moved.
  */
 export function maybeLearn(
   db: DatabaseSync,
   config: AppConfig,
   _scope: string,
   now: string,
+  owner: string,
+  clock: () => string = () => new Date().toISOString(),
 ): LearnOutcome {
   const learn = retentionLearnBounds(config);
   if (!learn.enabled) return skipped("disabled");
@@ -1112,6 +1126,9 @@ export function maybeLearn(
   const version = ((): number => {
     db.exec("BEGIN IMMEDIATE");
     try {
+      if (!isCultivationLeaseHeldBy(db, owner, clock())) {
+        throw new Error("lease lost");
+      }
       const res = db
         .prepare(
           `INSERT INTO retention_weights(

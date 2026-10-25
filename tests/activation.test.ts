@@ -10,7 +10,7 @@ import * as path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { SCHEMA_VERSION, initDb } from "../src/db.js";
 import type { AppConfig } from "../src/config.js";
-import { loadConfig, type ActivationConfig } from "../src/config.js";
+import { RETENTION_LEARN_DEFAULTS, loadConfig, type ActivationConfig } from "../src/config.js";
 import { eventAppend, correctRecord, rememberRecord, retireRecord } from "../src/store.js";
 import { acquireCultivationLease, applyCultivationBatch, releaseCultivationLease } from "../src/cultivation.js";
 import { chatMlToMessages } from "../src/llm.js";
@@ -590,6 +590,81 @@ describe("activation config", () => {
       assert.throws(
         () => loadConfig(write({ ...base, activation: { minAgeHoursByNature: { GREETING: -1 } } })),
         /activation.minAgeHoursByNature.GREETING/,
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts fractional learner coefficients and continuous activation fields", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "activation-cfg-frac-"));
+    try {
+      const { config } = baseConfig(dir);
+      const write = (obj: Record<string, unknown>, name: string): string => {
+        const p = path.join(dir, name);
+        fs.writeFileSync(p, JSON.stringify(obj), "utf8");
+        return p;
+      };
+      const fractional = loadConfig(
+        write({ ...config, activation: { learn: { maxDrift: 1.5, lambda: 0.5 } } }, "f.json"),
+      );
+      assert.equal(fractional.activation?.learn?.maxDrift, 1.5);
+      assert.equal(fractional.activation?.learn?.lambda, 0.5);
+
+      // Default-filled configs must load: maxDrift defaults to 1.5.
+      const defaults = loadConfig(write({ ...config, activation: { learn: {} } }, "d.json"));
+      assert.equal(defaults.activation?.learn?.enabled, RETENTION_LEARN_DEFAULTS.enabled);
+      assert.equal(defaults.activation?.learn?.maxDrift, RETENTION_LEARN_DEFAULTS.maxDrift);
+      assert.equal(defaults.activation?.learn?.lambda, RETENTION_LEARN_DEFAULTS.lambda);
+
+      // The documented rollback shape (enabled:false) also keeps defaults.
+      const rollback = loadConfig(
+        write({ ...config, activation: { learn: { enabled: false } } }, "r.json"),
+      );
+      assert.equal(rollback.activation?.learn?.enabled, false);
+      assert.equal(rollback.activation?.learn?.maxDrift, 1.5);
+
+      const continuous = loadConfig(
+        write(
+          {
+            ...config,
+            activation: {
+              minAgeHours: 0.5,
+              expiryGraceDays: 0.25,
+              minAgeHoursByNature: { GREETING: 0.5 },
+              wLinks: 0.8,
+              wNature: { GREETING: -2.25 },
+            },
+          },
+          "c.json",
+        ),
+      );
+      assert.equal(continuous.activation?.minAgeHours, 0.5);
+      assert.equal(continuous.activation?.expiryGraceDays, 0.25);
+      assert.equal(continuous.activation?.minAgeHoursByNature?.GREETING, 0.5);
+      assert.equal(continuous.activation?.wLinks, 0.8);
+      assert.equal(continuous.activation?.wNature?.GREETING, -2.25);
+
+      assert.throws(
+        () => loadConfig(write({ ...config, activation: { learn: { lambda: -1 } } }, "e.json")),
+        /activation.learn.lambda must be a number in 0..10/,
+      );
+      assert.throws(
+        () => loadConfig(write({ ...config, activation: { learn: { maxDrift: "1.5" } } }, "s.json")),
+        /activation.learn.maxDrift must be a number in 0..100/,
+      );
+      assert.throws(
+        () => loadConfig(write({ ...config, activation: { minAgeHours: -0.5 } }, "n.json")),
+        /activation.minAgeHours must be a number in 0..87600/,
+      );
+      // Counts and caps stay integer-only.
+      assert.throws(
+        () => loadConfig(write({ ...config, activation: { learn: { minExamples: 1.5 } } }, "i.json")),
+        /activation.learn.minExamples must be an integer/,
+      );
+      assert.throws(
+        () => loadConfig(write({ ...config, activation: { batchMax: 1.5 } }, "b.json")),
+        /activation.batchMax must be an integer/,
       );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

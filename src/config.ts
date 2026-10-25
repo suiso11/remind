@@ -343,6 +343,24 @@ function checkRange(
 }
 
 /**
+ * Continuous numeric bound check for fractional parameters (learner
+ * coefficients, activation weights/thresholds). Counts and caps must keep
+ * using the integer-only `checkRange`.
+ */
+function checkFiniteRange(
+  name: string,
+  v: unknown,
+  min: number,
+  max: number,
+): string | null {
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    return `${name} must be a number in ${min}..${max}`;
+  }
+  if (v < min || v > max) return `${name} must be a number in ${min}..${max}`;
+  return null;
+}
+
+/**
  * Strict startup config loader (M1). Only the config file supplies values;
  * env vars and request JSON can never override limits. `vaultPath` (local
  * Markdown projection target) is REQUIRED: missing/empty is a startup
@@ -698,27 +716,14 @@ export function loadConfig(configPath: string): AppConfig {
     const eK = checkRange("associate.topK", topK, 1, 50);
     if (eK) throw new Error(eK);
     const minScore = a["minScore"] ?? ASSOCIATE_DEFAULT_MIN_SCORE;
-    if (typeof minScore !== "number" || !Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
-      throw new Error("associate.minScore must be a number in 0..1");
-    }
+    const eMinScore = checkFiniteRange("associate.minScore", minScore, 0, 1);
+    if (eMinScore) throw new Error(eMinScore);
     const topicMergeMin = a["topicMergeMin"] ?? ASSOCIATE_DEFAULT_TOPIC_MERGE_MIN;
-    if (
-      typeof topicMergeMin !== "number" ||
-      !Number.isFinite(topicMergeMin) ||
-      topicMergeMin < 0 ||
-      topicMergeMin > 1
-    ) {
-      throw new Error("associate.topicMergeMin must be a number in 0..1");
-    }
+    const eTopicMerge = checkFiniteRange("associate.topicMergeMin", topicMergeMin, 0, 1);
+    if (eTopicMerge) throw new Error(eTopicMerge);
     const topicBonus = a["topicBonus"] ?? ASSOCIATE_DEFAULT_TOPIC_BONUS;
-    if (
-      typeof topicBonus !== "number" ||
-      !Number.isFinite(topicBonus) ||
-      topicBonus < 0 ||
-      topicBonus > 1
-    ) {
-      throw new Error("associate.topicBonus must be a number in 0..1");
-    }
+    const eTopicBonus = checkFiniteRange("associate.topicBonus", topicBonus, 0, 1);
+    if (eTopicBonus) throw new Error(eTopicBonus);
     const llmTopics = a["llmTopics"] ?? ASSOCIATE_DEFAULT_LLM_TOPICS;
     if (typeof llmTopics !== "boolean") {
       throw new Error("associate.llmTopics must be a boolean");
@@ -798,7 +803,7 @@ export function loadConfig(configPath: string): AppConfig {
       throw new Error("activation.tauRetire must be < activation.tauReactivate");
     }
     const minAgeHours = a["minAgeHours"] ?? ACTIVATION_DEFAULT_MIN_AGE_HOURS;
-    const eAge = checkRange("activation.minAgeHours", minAgeHours, 0, 87600);
+    const eAge = checkFiniteRange("activation.minAgeHours", minAgeHours, 0, 87600);
     if (eAge) throw new Error(eAge);
     const wImportance = a["wImportance"] ?? ACTIVATION_DEFAULT_W_IMPORTANCE;
     if (typeof wImportance !== "number" || !Number.isFinite(wImportance) || wImportance < 0 || wImportance > 10) {
@@ -843,7 +848,7 @@ export function loadConfig(configPath: string): AppConfig {
       throw new Error("activation.wLinks must be a number in 0..10");
     }
     const expiryGraceDays = a["expiryGraceDays"] ?? ACTIVATION_DEFAULT_EXPIRY_GRACE_DAYS;
-    const eGrace = checkRange("activation.expiryGraceDays", expiryGraceDays, 0, 87600);
+    const eGrace = checkFiniteRange("activation.expiryGraceDays", expiryGraceDays, 0, 87600);
     if (eGrace) throw new Error(eGrace);
     const wExpired = a["wExpired"] ?? ACTIVATION_DEFAULT_W_EXPIRED;
     if (typeof wExpired !== "number" || !Number.isFinite(wExpired) || wExpired < 0 || wExpired > 10) {
@@ -860,7 +865,7 @@ export function loadConfig(configPath: string): AppConfig {
         throw new Error(`unknown activation.minAgeHoursByNature field: ${k}`);
       }
       const h = minAgeRaw[k];
-      const e = checkRange(`activation.minAgeHoursByNature.${k}`, h, 0, 87600);
+      const e = checkFiniteRange(`activation.minAgeHoursByNature.${k}`, h, 0, 87600);
       if (e) throw new Error(e);
     }
     const minAgeHoursByNature = { ...ACTIVATION_DEFAULT_MIN_AGE_HOURS_BY_NATURE };
@@ -903,10 +908,10 @@ export function loadConfig(configPath: string): AppConfig {
       const enabled = l["enabled"] ?? RETENTION_LEARN_DEFAULTS.enabled;
       if (typeof enabled !== "boolean") throw new Error("activation.learn.enabled must be a boolean");
       const lambda = l["lambda"] ?? RETENTION_LEARN_DEFAULTS.lambda;
-      const eLambda = checkRange("activation.learn.lambda", lambda, 0, 10);
+      const eLambda = checkFiniteRange("activation.learn.lambda", lambda, 0, 10);
       if (eLambda) throw new Error(eLambda);
       const maxDrift = l["maxDrift"] ?? RETENTION_LEARN_DEFAULTS.maxDrift;
-      const eDrift = checkRange("activation.learn.maxDrift", maxDrift, 0, 100);
+      const eDrift = checkFiniteRange("activation.learn.maxDrift", maxDrift, 0, 100);
       if (eDrift) throw new Error(eDrift);
       const minExamples = l["minExamples"] ?? RETENTION_LEARN_DEFAULTS.minExamples;
       const eMinEx = checkRange("activation.learn.minExamples", minExamples, 0, 1_000_000);

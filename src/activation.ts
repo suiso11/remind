@@ -1050,7 +1050,7 @@ export async function maintainActivation(
       learn.skipped = "deadline";
     } else {
       try {
-        const outcome = maybeLearn(db, config, p.scope, nowValid);
+        const outcome = maybeLearn(db, config, p.scope, nowValid, execOwner, renewNow);
         learn.attempted = outcome.attempted;
         learn.accepted = outcome.accepted;
         learn.version = outcome.version;

@@ -32,7 +32,7 @@ import {
   type RetentionTrainingExample,
   type RetentionWeights,
 } from "../src/retention_learn.js";
-import { applyCultivationBatch } from "../src/cultivation.js";
+import { acquireCultivationLease, applyCultivationBatch } from "../src/cultivation.js";
 import { ACTIVATION_DEFAULTS, activationPreview, maintainActivation } from "../src/activation.js";
 
 const SCOPE = "personal/default";
@@ -281,6 +281,37 @@ describe("retention learner: harvest", () => {
       const again = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-05T00:00:00.000Z");
       assert.equal(again.harvested, 0);
       assert.equal(again.examples, 2);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("advances the audit cursor by insertion order when commits are out of ts order", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "out-of-order", "2026-01-01T00:00:00.000Z");
+      // Successful transition committed first with the later timestamp.
+      audit(ctx.db, "record.retire", id, "NO_LONGER_USEFUL", "2026-01-02T00:00:00.002Z");
+      const first = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-02T01:00:00.000Z");
+      assert.equal(first.harvested, 1);
+
+      // A delayed writer commits a transition whose captured ts precedes the
+      // already-harvested row. Its newer rowid must still be picked up.
+      audit(ctx.db, "maintain.cultivate", id, "USER_REQUESTED", "2026-01-02T00:00:00.001Z");
+      const second = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-02T02:00:00.000Z");
+      assert.equal(second.harvested, 1, "out-of-order audit commit must not be skipped");
+      assert.equal(second.positives, 1);
+
+      const rows = ctx.db
+        .prepare(`SELECT source, label FROM retention_examples ORDER BY rowid`)
+        .all() as Array<{ source: string; label: number }>;
+      assert.deepEqual(
+        rows.map((r) => ({ source: r.source, label: r.label })),
+        [
+          { source: "user_retire", label: 0 },
+          { source: "user_reactivate", label: 1 },
+        ],
+      );
     } finally {
       ctx.cleanup();
     }
@@ -683,6 +714,18 @@ function insertPredictiveExamples(db: DatabaseSync, count = 60): void {
 }
 
 const LEARN_NOW = "2026-01-03T00:00:00.000Z";
+const LEARN_OWNER = "retention-learn-test-owner";
+
+/** Acquire the cultivation lease like maintain.activation and run one fit. */
+function learnNow(
+  ctx: { db: DatabaseSync; config: AppConfig },
+  now = LEARN_NOW,
+  owner = LEARN_OWNER,
+) {
+  const lease = acquireCultivationLease(ctx.db, ctx.config, { owner, scope: SCOPE, now });
+  assert.equal(lease.acquired, true, "test lease acquisition");
+  return maybeLearn(ctx.db, ctx.config, SCOPE, now, owner, () => now);
+}
 
 describe("retention learner: optimizer", () => {
   it("increases wLinks on synthetic data where links predict usage", () => {
@@ -841,7 +884,7 @@ describe("retention learner: gating and acceptance", () => {
     try {
       insertExample(ctx.db, 0, { label: 1 });
       insertExample(ctx.db, 1, { label: 0 });
-      const out = maybeLearn(ctx.db, ctx.config, SCOPE, LEARN_NOW);
+      const out = learnNow(ctx);
       assert.equal(out.attempted, false);
       assert.equal(out.skipped, "no-new-examples");
       const rows = ctx.db.prepare(`SELECT COUNT(*) AS n FROM retention_weights`).get() as { n: number };
@@ -855,14 +898,14 @@ describe("retention learner: gating and acceptance", () => {
     const ctx = setupLearn({ minExamples: 300, minPositives: 30 });
     try {
       insertPredictiveExamples(ctx.db, 60);
-      const minExamples = maybeLearn(ctx.db, ctx.config, SCOPE, LEARN_NOW);
+      const minExamples = learnNow(ctx);
       assert.equal(minExamples.attempted, false);
       assert.equal(minExamples.skipped, "min-examples");
 
       const ctx2 = setupLearn({ minExamples: 40, minPositives: 31 });
       try {
         insertPredictiveExamples(ctx2.db, 60);
-        const minPositives = maybeLearn(ctx2.db, ctx2.config, SCOPE, LEARN_NOW);
+        const minPositives = learnNow(ctx2);
         assert.equal(minPositives.attempted, false);
         assert.equal(minPositives.skipped, "min-positives");
         const rows = ctx2.db.prepare(`SELECT COUNT(*) AS n FROM retention_weights`).get() as { n: number };
@@ -886,7 +929,7 @@ describe("retention learner: gating and acceptance", () => {
     try {
       insertPredictiveExamples(ctx.db, 60);
       const prior = weightsFromParams(activationBounds(ctx.config));
-      const out = maybeLearn(ctx.db, ctx.config, SCOPE, LEARN_NOW);
+      const out = learnNow(ctx);
       assert.equal(out.attempted, true);
       assert.equal(out.accepted, true, JSON.stringify(out));
       assert.ok(out.version !== null);
@@ -939,7 +982,7 @@ describe("retention learner: gating and acceptance", () => {
           insertExample(ctx.db, i, { label: 1, links: 0 });
         }
       }
-      const out = maybeLearn(ctx.db, ctx.config, SCOPE, LEARN_NOW);
+      const out = learnNow(ctx);
       assert.equal(out.attempted, true);
       assert.equal(out.accepted, false, JSON.stringify(out));
       const row = ctx.db
@@ -963,9 +1006,9 @@ describe("retention learner: gating and acceptance", () => {
     });
     try {
       insertPredictiveExamples(ctx.db, 60);
-      const first = maybeLearn(ctx.db, ctx.config, SCOPE, LEARN_NOW);
+      const first = learnNow(ctx);
       assert.equal(first.attempted, true);
-      const second = maybeLearn(ctx.db, ctx.config, SCOPE, "2026-01-03T01:00:00.000Z");
+      const second = learnNow(ctx, "2026-01-03T01:00:00.000Z");
       assert.equal(second.attempted, false);
       assert.equal(second.skipped, "interval");
       const rows = ctx.db.prepare(`SELECT COUNT(*) AS n FROM retention_weights`).get() as { n: number };
@@ -982,12 +1025,68 @@ describe("retention learner: gating and acceptance", () => {
     });
     try {
       insertPredictiveExamples(ctx2.db, 60);
-      assert.equal(maybeLearn(ctx2.db, ctx2.config, SCOPE, LEARN_NOW).attempted, true);
-      const noNew = maybeLearn(ctx2.db, ctx2.config, SCOPE, LEARN_NOW);
+      assert.equal(learnNow(ctx2).attempted, true);
+      const noNew = learnNow(ctx2);
       assert.equal(noNew.attempted, false);
       assert.equal(noNew.skipped, "no-new-examples");
     } finally {
       ctx2.cleanup();
+    }
+  });
+
+  it("rolls back weight publication when the lease expired or was stolen", () => {
+    const ctx = setupLearn({
+      minExamples: 20,
+      minPositives: 10,
+      maxDrift: 10,
+      lambda: 0.01,
+      learnIntervalMs: 0,
+    });
+    try {
+      insertPredictiveExamples(ctx.db, 60);
+      const staleOwner = "stale-fit-owner";
+      const acquired = acquireCultivationLease(ctx.db, ctx.config, {
+        owner: staleOwner,
+        scope: SCOPE,
+        now: LEARN_NOW,
+      });
+      assert.equal(acquired.acquired, true);
+      // The fit outlives the lease: publication must not append a row.
+      const expired = "2026-01-05T00:00:00.000Z";
+      assert.throws(
+        () => maybeLearn(ctx.db, ctx.config, SCOPE, expired, staleOwner, () => expired),
+        /lease lost/,
+      );
+      const afterExpiry = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_weights`)
+        .get() as { n: number };
+      assert.equal(afterExpiry.n, 0, "expired lease must not publish");
+
+      // A newer worker takes the expired lease; the stale worker stays fenced.
+      const newer = acquireCultivationLease(ctx.db, ctx.config, {
+        owner: "newer-fit-owner",
+        scope: SCOPE,
+        now: expired,
+      });
+      assert.equal(newer.acquired, true);
+      assert.throws(
+        () => maybeLearn(ctx.db, ctx.config, SCOPE, expired, staleOwner, () => expired),
+        /lease lost/,
+      );
+      const afterSteal = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_weights`)
+        .get() as { n: number };
+      assert.equal(afterSteal.n, 0, "stolen lease must not publish");
+
+      // The live owner publishes normally.
+      const ok = maybeLearn(ctx.db, ctx.config, SCOPE, expired, "newer-fit-owner", () => expired);
+      assert.equal(ok.attempted, true);
+      const afterLive = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_weights`)
+        .get() as { n: number };
+      assert.equal(afterLive.n, 1);
+    } finally {
+      ctx.cleanup();
     }
   });
 
@@ -1001,7 +1100,7 @@ describe("retention learner: gating and acceptance", () => {
     });
     try {
       insertPredictiveExamples(ctx.db, 60);
-      const out = maybeLearn(ctx.db, ctx.config, SCOPE, LEARN_NOW);
+      const out = learnNow(ctx);
       assert.equal(out.accepted, true, JSON.stringify(out));
       const id = remember(ctx.db, ctx.config, "rollback", "2026-01-01T00:00:00.000Z");
       const enabled = activationPreview(ctx.db, ctx.config, { scope: SCOPE }, "2026-01-03T00:00:00.000Z");
