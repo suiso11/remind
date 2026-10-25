@@ -27,6 +27,16 @@
 - maintenance は 1 パス 2,000 件の有界スキャンを維持しつつ、scope 別の `(createdAt,id)` continuation cursor を永続化して次のパスで続きから評価し、末尾で先頭へ wrap する。これにより古い retired 行がスキャン窓を占め続けても、新しい active 行が永久に未評価にならない。`activation.preview` の `nextCursor` は採点時刻を固定して頁間の `R` を一致させる。importance/operations/audit の各 commit は `dbMaxBytes` 超過時に rollback して `STORE_UNAVAILABLE` を返す。
 - `activation.apply` は**既定 false**。false の間は状態を変えず `wouldRetire / wouldReactivate` を報告するだけに留め、モデルと閾値の調整が済むまで自動適用しない。有効化は起動時 config の明示指定のみで行う。
 
+## Learned retention weights（保持重みの学習）
+
+- **学習データ**: `retention_examples`。露出は horizon (`labelHorizonMs`, 既定 6h) 経過後に、同一 `(recallId,recordId)` の usage 有無で正/負例 (weight 1)。明示遷移は `USER_REQUESTED` 再活性化を正例、`NO_LONGER_USEFUL` 引退を負例 (weight 5)。`audit:<rowid>` を露出 ID と同様の安定キーにし、再実行で再ラベルしない。
+- **リーク規則**: 特徴量は例の `ts` 時点でスナップショットする。`base` は `ts` より前の事象のみを使い、ラベル対象の usage を混入させない。kind/nature/importance/links/expired/consolidated は現在状態の近似である。
+- **モデルと事前分布**: `R_w(x)=base+Σ w_k·φ_k(x)` は既存因子構造と同一。`P(useful)=sigmoid(a·R_w+b)`。θ = {平坦化 w, a, b}。事前重みは現在の config/default で、目的関数は重み付き log-loss + `lambda·Σ(w−prior)²`。`a,b` は正則化せず `a≥0.05` に clamp。決定的 full-batch Adam (lr 0.05, 600 反復、初期値 prior/1/0)。
+- **ガードレール**: 各 step 後に `wImportance,wLinks,wExpired,wConsolidated≥0`、`GREETING/CHATOPS/TRANSIENT/EMOTION≤0`、`|w−prior|≤maxDrift` へ射影する。
+- **受理ゲート**: enabled、`learnIntervalMs` 経過、前回以降の新規例 ≥50、`n≥minExamples`、正例 ≥`minPositives` を満たすときだけ試行。skip 理由 (`disabled/interval/no-new-examples/min-examples/min-positives/deadline/error`) は応答に載せ、行は残さない。試行は時刻順 holdout 20% で比較し、baseline の `a,b` も train のみで fit する。holdout log-loss が `1e-4` 超改善した場合のみ採用し、全例で再 fit して `accepted=1` を保存。試行行は棄却でも損失付きで常に残す。
+- **スコアリングとロールバック**: preview/maintain は最新 accepted 重みを使用 (無ければ config)。preview は `weightsVersion` (null=prior) と `weights`、maintain の `learn` は試行結果と損失を返す (`version` は試行行の版、skip 時は null)。`activation.learn.enabled=false` で採点は config 重みへ戻り、最新 accepted は無視される (行は保持)。
+- **データ量の注意**: 既定 300 例 / 正例 30 / 新規 50 件ゲートのため、履歴が少ない間は試行されず prior のまま。holdout 改善のみを受理条件とする保守的設計であり、データ不足時の過学習を避ける。 合成 20,000 例で `fitRetentionWeights` を実測すると約 925 ms（Node 24、full-batch 600 反復、`dist` 実行）であり、1 回の保守パスの許容範囲に収まる。
+
 ## 保持するもの・保持しないもの（実装済み範囲）
 
 - `raw_events` は不変の追記のみ。更新・削除はない。

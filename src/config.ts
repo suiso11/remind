@@ -169,6 +169,31 @@ export interface ActivationConfig {
   apply: boolean;
   /** Importance at/above which retirement needs the protective margin (default 0.66). */
   protectImportance: number;
+  /** Retention weight learner bounds (optional; absent uses defaults). */
+  learn?: RetentionLearnConfig;
+}
+
+/**
+ * Retention weight learner bounds (startup-only, optional). The learner
+ * harvests labeled recall outcomes during maintain.activation; the optimizer
+ * lands in a later slice. `maxDrift` bounds |new - baseline| per weight when
+ * a candidate is considered for acceptance.
+ */
+export interface RetentionLearnConfig {
+  /** Harvest labels and allow learned weights (default true). */
+  enabled: boolean;
+  /** Base-level decay used for feature snapshots (default 2.0). */
+  lambda: number;
+  /** Maximum absolute drift from the baseline per learned weight (default 1.5). */
+  maxDrift: number;
+  /** Minimum examples required before fitting (default 300). */
+  minExamples: number;
+  /** Minimum positive examples required before fitting (default 30). */
+  minPositives: number;
+  /** Minimum interval between learner runs (default 86400000 = 1 day). */
+  learnIntervalMs: number;
+  /** Exposure label horizon: only older exposures are labeled (default 21600000 = 6h). */
+  labelHorizonMs: number;
 }
 
 /**
@@ -751,6 +776,7 @@ export function loadConfig(configPath: string): AppConfig {
           "batchMax",
           "apply",
           "protectImportance",
+          "learn",
         ].includes(k)
       ) {
         throw new Error(`unknown activation field: ${k}`);
@@ -858,6 +884,52 @@ export function loadConfig(configPath: string): AppConfig {
     ) {
       throw new Error("activation.protectImportance must be a number in 0..1");
     }
+    let learn: RetentionLearnConfig | undefined;
+    if ("learn" in a && a["learn"] !== undefined) {
+      const l = a["learn"];
+      if (!isPlainObject(l)) throw new Error("activation.learn must be an object");
+      const allowed = [
+        "enabled",
+        "lambda",
+        "maxDrift",
+        "minExamples",
+        "minPositives",
+        "learnIntervalMs",
+        "labelHorizonMs",
+      ];
+      for (const k of Object.keys(l)) {
+        if (!allowed.includes(k)) throw new Error(`unknown activation.learn field: ${k}`);
+      }
+      const enabled = l["enabled"] ?? RETENTION_LEARN_DEFAULTS.enabled;
+      if (typeof enabled !== "boolean") throw new Error("activation.learn.enabled must be a boolean");
+      const lambda = l["lambda"] ?? RETENTION_LEARN_DEFAULTS.lambda;
+      const eLambda = checkRange("activation.learn.lambda", lambda, 0, 10);
+      if (eLambda) throw new Error(eLambda);
+      const maxDrift = l["maxDrift"] ?? RETENTION_LEARN_DEFAULTS.maxDrift;
+      const eDrift = checkRange("activation.learn.maxDrift", maxDrift, 0, 100);
+      if (eDrift) throw new Error(eDrift);
+      const minExamples = l["minExamples"] ?? RETENTION_LEARN_DEFAULTS.minExamples;
+      const eMinEx = checkRange("activation.learn.minExamples", minExamples, 0, 1_000_000);
+      if (eMinEx) throw new Error(eMinEx);
+      const minPositives = l["minPositives"] ?? RETENTION_LEARN_DEFAULTS.minPositives;
+      const eMinPos = checkRange("activation.learn.minPositives", minPositives, 0, 1_000_000);
+      if (eMinPos) throw new Error(eMinPos);
+      const learnIntervalMs = l["learnIntervalMs"] ?? RETENTION_LEARN_DEFAULTS.learnIntervalMs;
+      const eInterval = checkRange("activation.learn.learnIntervalMs", learnIntervalMs, 0, 31_536_000_000);
+      if (eInterval) throw new Error(eInterval);
+      const labelHorizonMs = l["labelHorizonMs"] ?? RETENTION_LEARN_DEFAULTS.labelHorizonMs;
+      const eHorizon = checkRange("activation.learn.labelHorizonMs", labelHorizonMs, 0, 31_536_000_000);
+      if (eHorizon) throw new Error(eHorizon);
+      learn = {
+        enabled: enabled,
+        lambda: lambda as number,
+        maxDrift: maxDrift as number,
+        minExamples: minExamples as number,
+        minPositives: minPositives as number,
+        learnIntervalMs: learnIntervalMs as number,
+        labelHorizonMs: labelHorizonMs as number,
+      };
+    }
     activation = {
       decay,
       tauRetire,
@@ -874,6 +946,7 @@ export function loadConfig(configPath: string): AppConfig {
       batchMax: batchMax as number,
       apply,
       protectImportance,
+      ...(learn !== undefined ? { learn } : {}),
     };
   }
 
@@ -1046,6 +1119,22 @@ export const ACTIVATION_DEFAULT_APPLY = false;
 /** protectImportance default (2/3 rounded down); see retireDecision. */
 export const ACTIVATION_DEFAULT_PROTECT_IMPORTANCE = 0.66;
 
+/** Retention learner defaults (see RetentionLearnConfig). */
+export const RETENTION_LEARN_DEFAULTS: RetentionLearnConfig = {
+  enabled: true,
+  lambda: 2.0,
+  maxDrift: 1.5,
+  minExamples: 300,
+  minPositives: 30,
+  learnIntervalMs: 86_400_000,
+  labelHorizonMs: 21_600_000,
+};
+
+/** Resolved learner bounds, filling documented defaults per field. */
+export function retentionLearnBounds(config: AppConfig): RetentionLearnConfig {
+  return { ...RETENTION_LEARN_DEFAULTS, ...(config.activation?.learn ?? {}) };
+}
+
 export function activationBounds(config: AppConfig): ActivationConfig {
   const a = config.activation;
   const kind = a?.wKind;
@@ -1073,6 +1162,7 @@ export function activationBounds(config: AppConfig): ActivationConfig {
     batchMax: a?.batchMax ?? ACTIVATION_DEFAULT_BATCH_MAX,
     apply: a?.apply ?? ACTIVATION_DEFAULT_APPLY,
     protectImportance: a?.protectImportance ?? ACTIVATION_DEFAULT_PROTECT_IMPORTANCE,
+    learn: retentionLearnBounds(config),
   };
 }
 

@@ -110,10 +110,12 @@ import {
  * hold cluster ledgers. Version 10 adds the nullable nature label to the
  * record_importance ledger (combined nature+importance classifier); v9 files
  * keep their scores and gain the column with NULL nature (rescore-on-null).
- * Every CREATE in the sequence is IF NOT EXISTS, so a re-run of 7 -> 10 is
+ * Version 11 adds the retention learning ledgers: harvested
+ * retention_examples and accepted retention_weights snapshots. Both are
+ * derived/rebuildable and created with IF NOT EXISTS, so migration is
  * idempotent.
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -130,6 +132,8 @@ export const LEGACY_SCHEMA_VERSION_7 = 7;
 export const LEGACY_SCHEMA_VERSION_8 = 8;
 /** Pre-nature-ledger stamp (v9 carries record_importance without nature); accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_9 = 9;
+/** Pre-retention-learning schema stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_10 = 10;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -587,6 +591,32 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   // v10 additive migration: nullable nature label for pre-v10 ledgers.
   // ALTER TABLE ADD COLUMN only; idempotent and savepoint-scoped.
   ensureImportanceNatureColumn(db);
+  // v11 retention learning ledgers (derived/rebuildable, never canonical).
+  // retention_examples is keyed by the exposure identity; audit transitions
+  // use 'audit:'+rowid as recallId. retention_weights keeps every accepted
+  // learner snapshot so a regression can roll back to the previous version.
+  db.exec(`CREATE TABLE IF NOT EXISTS retention_examples(
+    recallId TEXT NOT NULL,
+    recordId TEXT NOT NULL,
+    source TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    label REAL NOT NULL,
+    weight REAL NOT NULL,
+    features TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY(recallId, recordId, source))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS retention_weights(
+    version INTEGER PRIMARY KEY AUTOINCREMENT,
+    weights TEXT NOT NULL,
+    scale REAL NOT NULL,
+    intercept REAL NOT NULL,
+    nTrain INTEGER NOT NULL,
+    nPos INTEGER NOT NULL,
+    trainLoss REAL NOT NULL,
+    holdoutLoss REAL NOT NULL,
+    baselineHoldoutLoss REAL NOT NULL,
+    accepted INTEGER NOT NULL,
+    createdAt TEXT NOT NULL)`);
   db.exec(`CREATE TABLE IF NOT EXISTS projection_queue(recordId TEXT PRIMARY KEY, attempts INTEGER NOT NULL, nextAt TEXT NOT NULL)`);
   // Derived lexical indexes (rebuildable; never canonical).
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);

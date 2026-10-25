@@ -308,7 +308,7 @@ describe("activation: data loading", () => {
       ctx.db.exec(`PRAGMA user_version = 9`);
       ctx.db.close();
       const reopened = initDb(ctx.config, path.join(ctx.dir, "memory.config.json"));
-      assert.equal((reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, 10);
+      assert.equal((reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, SCHEMA_VERSION);
       const cols = reopened.db.prepare(`PRAGMA table_info(record_importance)`).all() as Array<{ name: string; notnull: number }>;
       const nature = cols.find((c) => c.name === "nature");
       assert.ok(nature);
@@ -345,7 +345,7 @@ describe("activation: data loading", () => {
       loaded = loadActivationInputs(ctx.db, SCOPE);
       assert.equal(loaded.find((r) => r.recordId === id)?.importance, null);
 
-      assert.equal(SCHEMA_VERSION, 10);
+      assert.equal(SCHEMA_VERSION, 11);
       assert.throws(
         () =>
           ctx.db

@@ -69,12 +69,65 @@ import {
 } from "./normalize.js";
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
 import {
+  harvestRetentionExamples,
+  loadActiveRetentionWeights,
+  maybeLearn,
+  type ActiveRetentionWeights,
+  type LearnSkipReason,
+} from "./retention_learn.js";
+import {
+  NATURE_LABELS,
+  computeRetentionFactors,
+  isExpiredDated,
+  paramsWithWeights,
+  toMs,
+  type ActivationKind,
+  type ActivationParams,
+  type ActivationStatus,
+  type NatureLabel,
+  type RetentionFactors,
+} from "./retention_model.js";
+import {
+  ACTIVATION_CHAIN_MAX,
+  ACTIVATION_MAX_RECORDS,
+  loadActivationInputs,
+  type ActivationAfter,
+  type ActivationInput,
+} from "./retention_inputs.js";
+import {
   assertDbUnderCap,
   isScopeAuthorized,
   reactivateRecord,
   retireRecord,
   type CanonicalWriteFence,
 } from "./store.js";
+
+// Re-export the shared retention model so existing callers keep importing the
+// scoring vocabulary from activation.ts.
+export {
+  ACTIVATION_DEFAULTS,
+  NATURE_LABELS,
+  baseActivationBefore,
+  computeActivation,
+  computeRetentionFactors,
+  isExpiredDated,
+  latestAbsoluteDateMs,
+  paramsWithWeights,
+  type ActivationKind,
+  type ActivationParams,
+  type ActivationStatus,
+  type NatureLabel,
+  type RetentionFactors,
+  type RetentionWeights,
+} from "./retention_model.js";
+export {
+  ACTIVATION_CHAIN_MAX,
+  ACTIVATION_MAX_RECORDS,
+  loadActivationInputs,
+  type ActivationAfter,
+  type ActivationInput,
+  type LoadActivationOptions,
+} from "./retention_inputs.js";
 
 export const ACTIVATION_OP = "maintain.activation";
 
@@ -85,81 +138,7 @@ export type ActivationGenerate = (
   signal?: AbortSignal,
 ) => Promise<string | null>;
 
-export type ActivationKind =
-  | "user_fact"
-  | "model_inference"
-  | "summary"
-  | "correction";
-export type ActivationStatus = "active" | "retired" | "superseded" | "archived";
 export type ActivationDecision = "keep" | "retire" | "reactivate";
-
-export interface ActivationParams {
-  decay: number;
-  tauRetire: number;
-  tauReactivate: number;
-  minAgeHours: number;
-  wImportance: number;
-  wKind: Record<ActivationKind, number>;
-  wNature: Record<NatureLabel, number>;
-  wLinks: number;
-  expiryGraceDays: number;
-  wExpired: number;
-  wConsolidated: number;
-  minAgeHoursByNature: Partial<Record<NatureLabel, number>>;
-}
-
-export const ACTIVATION_DEFAULTS: ActivationParams = {
-  decay: 0.5,
-  tauRetire: -1.5,
-  tauReactivate: -0.5,
-  minAgeHours: 72,
-  wImportance: 2.0,
-  wKind: {
-    user_fact: 1.0,
-    model_inference: 0.0,
-    summary: 0.3,
-    correction: 1.0,
-  },
-  wNature: {
-    FACT: 1.0,
-    PREFERENCE: 1.0,
-    RELATIONSHIP: 1.2,
-    PROJECT: 1.0,
-    OPINION: 0.6,
-    PLAN: 0.6,
-    EVENT: 0.4,
-    EMOTION: -0.8,
-    TRANSIENT: -1.5,
-    GREETING: -2.5,
-    CHATOPS: -2.0,
-  },
-  wLinks: 0.8,
-  expiryGraceDays: 3,
-  wExpired: 2.0,
-  wConsolidated: 0.5,
-  minAgeHoursByNature: {
-    GREETING: 24,
-    CHATOPS: 24,
-    EMOTION: 72,
-    TRANSIENT: 72,
-  },
-};
-
-/** Nature labels produced by the combined retention classifier. */
-export const NATURE_LABELS = [
-  "FACT",
-  "PREFERENCE",
-  "OPINION",
-  "PLAN",
-  "EVENT",
-  "RELATIONSHIP",
-  "PROJECT",
-  "EMOTION",
-  "TRANSIENT",
-  "GREETING",
-  "CHATOPS",
-] as const;
-export type NatureLabel = (typeof NATURE_LABELS)[number];
 
 export interface NatureClassification {
   nature: NatureLabel;
@@ -329,140 +308,9 @@ export function parseNatureClassification(raw: string | null | undefined): Natur
   return { nature: nature as NatureLabel, importance };
 }
 
-/** Maximum candidate records considered by one preview scan. */
-export const ACTIVATION_MAX_RECORDS = 2000;
-/** Maximum supersedes-chain hops followed for predecessor usage. */
-export const ACTIVATION_CHAIN_MAX = 32;
-/** Chunk size for bounded IN queries (well below SQLite's variable limit). */
-const SQL_CHUNK = 300;
 /** Label cap; the preview never returns more than a short body prefix. */
 const LABEL_MAX_CP = 120;
 
-export interface ActivationInput {
-  recordId: string;
-  kind: ActivationKind;
-  status: ActivationStatus;
-  /** Canonical creation time (ISO-8601). */
-  createdAt: string;
-  /** Canonical body, only used to derive a short label in preview. */
-  body: string;
-  /** Derived importance, or null when absent/stale. */
-  importance: number | null;
-  /** Combined-classifier nature label, or null when unscored/stale. */
-  nature: NatureLabel | null;
-  /** Canonical active same-scope links plus 0.5 per similar edge. */
-  links: number;
-  /** Latest absolute date in the body is past the expiry grace (PLAN/EVENT/TRANSIENT). */
-  expired: boolean;
-  /** An active cluster summary cites this record (record_links from). */
-  consolidated: boolean;
-  /** Latest metadata-only reactivation reason, or null. */
-  latestReactivationReason: string | null;
-  /** Feedback/usage count from note_heat (0 when no heat row). */
-  uses: number;
-  /** Additional event timestamps (usage/correction/reactivation/predecessor). */
-  eventTimes: ReadonlyArray<string>;
-  /** Latest metadata-only retirement reason, or null. */
-  retireReason: string | null;
-}
-
-function toMs(value: string | number | Date): number | null {
-  if (value instanceof Date) {
-    const t = value.getTime();
-    return Number.isFinite(t) ? t : null;
-  }
-  if (typeof value === "number") return Number.isFinite(value) ? value : null;
-  const t = Date.parse(value);
-  return Number.isFinite(t) ? t : null;
-}
-
-function clamp01(n: number): number {
-  if (!Number.isFinite(n)) return 0.5;
-  if (n < 0) return 0;
-  if (n > 1) return 1;
-  return n;
-}
-
-export interface RetentionFactors {
-  base: number;
-  kind: number;
-  importance: number;
-  nature: number;
-  links: number;
-  expired: number;
-  consolidated: number;
-  total: number;
-}
-
-type RetentionInput = Pick<
-  ActivationInput,
-  "kind" | "createdAt" | "importance" | "eventTimes"
-> &
-  Partial<Pick<ActivationInput, "nature" | "links" | "expired" | "consolidated">>;
-
-/**
- * Multi-factor retention factors. `base` is the ACT-R base-level activation
- * (createdAt + usage/feedback + predecessor usage + corrections +
- * reactivations, with decay d); the remaining factors are additive. Missing
- * optional signals contribute zero, except importance (neutral 0.5).
- * Invalid event timestamps are ignored; no usable event time yields -Infinity.
- */
-export function computeRetentionFactors(
-  input: RetentionInput,
-  params: ActivationParams,
-  now: string | number | Date,
-): RetentionFactors {
-  const nowMs = toMs(now);
-  if (nowMs === null) {
-    return {
-      base: Number.NaN,
-      kind: 0,
-      importance: 0,
-      nature: 0,
-      links: 0,
-      expired: 0,
-      consolidated: 0,
-      total: Number.NaN,
-    };
-  }
-  let sum = 0;
-  const times: Array<string | number> = [input.createdAt, ...input.eventTimes];
-  for (const t of times) {
-    const ms = toMs(t);
-    if (ms === null) continue;
-    const hours = Math.max((nowMs - ms) / 3_600_000, 1);
-    sum += Math.pow(hours, -params.decay);
-  }
-  const base = sum <= 0 ? Number.NEGATIVE_INFINITY : Math.log(sum);
-  const importanceValue = clamp01(input.importance ?? 0.5);
-  const kind = params.wKind[input.kind] ?? 0;
-  const importance = params.wImportance * importanceValue;
-  const nature = input.nature ? params.wNature[input.nature] ?? 0 : 0;
-  const linkCount = Math.max(0, input.links ?? 0);
-  const links = params.wLinks * Math.log(1 + linkCount);
-  const expired = input.expired === true ? -params.wExpired : 0;
-  const consolidated =
-    input.consolidated === true && importanceValue < 2 / 3 ? -params.wConsolidated : 0;
-  return {
-    base,
-    kind,
-    importance,
-    nature,
-    links,
-    expired,
-    consolidated,
-    total: base + kind + importance + nature + links + expired + consolidated,
-  };
-}
-
-/** Total retention score R (sum of computeRetentionFactors). */
-export function computeActivation(
-  input: RetentionInput,
-  params: ActivationParams,
-  now: string | number | Date,
-): number {
-  return computeRetentionFactors(input, params, now).total;
-}
 
 /** Auto-retirement reason codes that may be reconsidered by activation. */
 export const AUTO_RETIRE_REASONS = ["LOW_ACTIVATION", "LOW_SIGNAL", "OUTDATED", "CONSOLIDATED"] as const;
@@ -509,42 +357,6 @@ export function activationAgeHours(
   return Math.max((nowMs - createdMs) / 3_600_000, 0);
 }
 
-/** Latest absolute date in the body (UTC midnight), or null if none. */
-export function latestAbsoluteDateMs(body: string): number | null {
-  let latest: number | null = null;
-  const consider = (y: number, m: number, d: number): void => {
-    if (m < 1 || m > 12 || d < 1 || d > 31) return;
-    const ms = Date.UTC(y, m - 1, d);
-    const dt = new Date(ms);
-    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return;
-    if (latest === null || ms > latest) latest = ms;
-  };
-  for (const m of body.matchAll(/(\d{4})-(\d{2})-(\d{2})/g)) {
-    consider(Number(m[1]), Number(m[2]), Number(m[3]));
-  }
-  for (const m of body.matchAll(/(\d{4})年(\d{1,2})月(\d{1,2})日/g)) {
-    consider(Number(m[1]), Number(m[2]), Number(m[3]));
-  }
-  return latest;
-}
-
-/**
- * Deterministic date expiry signal: only PLAN/EVENT/TRANSIENT bodies are
- * considered. True when the latest absolute date (YYYY-MM-DD or
- * YYYY年M月D日) is strictly more than `graceDays` before now.
- */
-export function isExpiredDated(
-  body: string,
-  nature: NatureLabel | null,
-  now: string | number | Date,
-  graceDays: number,
-): boolean {
-  if (nature !== "PLAN" && nature !== "EVENT" && nature !== "TRANSIENT") return false;
-  const nowMs = toMs(now);
-  const latest = latestAbsoluteDateMs(body);
-  if (nowMs === null || latest === null) return false;
-  return nowMs - latest > graceDays * 86_400_000;
-}
 
 const CLUSTER_SUMMARY_SOURCE = "cultivation:llm-derived-cluster";
 
@@ -599,442 +411,6 @@ export function retireDecision(
   return "keep";
 }
 
-function isRecordKind(v: string): v is ActivationKind {
-  return (
-    v === "user_fact" ||
-    v === "model_inference" ||
-    v === "summary" ||
-    v === "correction"
-  );
-}
-
-function isRecordStatus(v: string): v is ActivationStatus {
-  return (
-    v === "active" ||
-    v === "retired" ||
-    v === "superseded" ||
-    v === "archived"
-  );
-}
-
-function chunk<T>(items: T[], size = SQL_CHUNK): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
-  return out;
-}
-
-function placeholders(n: number): string {
-  return new Array(n).fill("?").join(",");
-}
-
-/**
- * Every audit op that can move a record between active and retired. User
- * transitions are staged by Companion as record.retire/record.reactivate
- * (NO_LONGER_USEFUL / USER_REQUESTED), but cultivation batches audit the same
- * transitions as maintain.cultivate; older databases may also carry
- * maintain.cultivation/maintain.distill/maintain.activation target rows.
- */
-const TRANSITION_AUDIT_OPS = [
-  "record.retire",
-  "record.reactivate",
-  "maintain.cultivate",
-  "maintain.cultivation",
-  "maintain.distill",
-  "maintain.activation",
-] as const;
-
-const TRANSITION_REASON_CODES = [...RETIRE_REASONS, ...REACTIVATE_REASONS] as const;
-
-interface TransitionHistory {
-  /** Timestamps of reactivation audit rows (event-frequency input). */
-  reactivationTimes: Map<string, string[]>;
-  /** Reason of the latest reactivation row, whichever op wrote it. */
-  latestReactivationReasons: Map<string, string | null>;
-  /** Reason of the latest retirement row, whichever op wrote it. */
-  retireReasons: Map<string, string | null>;
-}
-
-/**
- * Single ordered scan over active<->retired transitions. Retire and
- * reactivate reason-code sets are disjoint (fixed codes), so one query can
- * classify each row and keep only the latest per target: `ORDER BY ts, rowid`
- * makes later rows overwrite earlier ones (latest event wins).
- */
-function loadTransitionHistory(
-  db: DatabaseSync,
-  ids: string[],
-): TransitionHistory {
-  const reactivationTimes = new Map<string, string[]>();
-  const latestReactivationReasons = new Map<string, string | null>();
-  const retireReasons = new Map<string, string | null>();
-  const retireCodes = new Set<string>(RETIRE_REASONS);
-  for (const chunkIds of chunk(ids)) {
-    const found = db
-      .prepare(
-        `SELECT targetId, ts, reasonCode FROM audit
-          WHERE op IN (${placeholders(TRANSITION_AUDIT_OPS.length)})
-            AND targetId IN (${placeholders(chunkIds.length)})
-            AND reasonCode IN (${placeholders(TRANSITION_REASON_CODES.length)})
-          ORDER BY ts ASC, rowid ASC`,
-      )
-      .all(
-        ...TRANSITION_AUDIT_OPS,
-        ...chunkIds,
-        ...TRANSITION_REASON_CODES,
-      ) as unknown as Array<{ targetId: string; ts: string; reasonCode: string | null }>;
-    for (const row of found) {
-      if (row.reasonCode === null) continue;
-      if (retireCodes.has(row.reasonCode)) {
-        retireReasons.set(row.targetId, row.reasonCode);
-        continue;
-      }
-      const list = reactivationTimes.get(row.targetId);
-      if (list) list.push(row.ts);
-      else reactivationTimes.set(row.targetId, [row.ts]);
-      latestReactivationReasons.set(row.targetId, row.reasonCode);
-    }
-  }
-  return { reactivationTimes, latestReactivationReasons, retireReasons };
-}
-
-interface RecordRow {
-  id: string;
-  body: string;
-  bodyHash: string;
-  kind: string;
-  status: string;
-  createdAt: string;
-  supersedes: string | null;
-}
-
-export interface ActivationAfter {
-  createdAt: string;
-  id: string;
-}
-
-export interface LoadActivationOptions {
-  /** Include retired rows (default true). Active-only scans pass false. */
-  includeRetired?: boolean;
-  /** Hard candidate cap (default ACTIVATION_MAX_RECORDS). */
-  maxRecords?: number;
-  /**
-   * Keyset continuation: return records strictly after (createdAt, id) in
-   * scan order. Used by maintain.activation to advance past the oldest
-   * bounded window across passes.
-   */
-  after?: ActivationAfter;
-  /** Evaluation clock for the deterministic date-expiry signal. */
-  now?: string;
-  /** Date-expiry grace in days (default 3). */
-  expiryGraceDays?: number;
-}
-
-/**
- * Bounded activation inputs for one scope. See the header for the event
- * sources and the aggregate-heat approximation. Returns candidates only
- * (active, plus retired when requested); ancestor/correction/usage data is
- * folded into each candidate's eventTimes.
- */
-export function loadActivationInputs(
-  db: DatabaseSync,
-  scope: string,
-  options: LoadActivationOptions = {},
-): ActivationInput[] {
-  const includeRetired = options.includeRetired ?? true;
-  const maxRecords = Math.max(1, Math.floor(options.maxRecords ?? ACTIVATION_MAX_RECORDS));
-  const statuses = includeRetired ? "('active','retired')" : "('active')";
-  const after =
-    options.after &&
-    typeof options.after.createdAt === "string" &&
-    Number.isFinite(Date.parse(options.after.createdAt)) &&
-    typeof options.after.id === "string" &&
-    options.after.id.length > 0
-      ? options.after
-      : null;
-  const keyset = after ? "AND (createdAt > ? OR (createdAt = ? AND id > ?))" : "";
-  const rows = db
-    .prepare(
-      `SELECT id, body, bodyHash, kind, status, createdAt, supersedes
-         FROM records
-        WHERE scope = ? AND status IN ${statuses} ${keyset}
-        ORDER BY createdAt ASC, id ASC
-        LIMIT ?`,
-    )
-    .all(
-      ...(after
-        ? [scope, after.createdAt, after.createdAt, after.id, maxRecords]
-        : [scope, maxRecords]),
-    ) as unknown as RecordRow[];
-  const candidates = rows.filter(
-    (r) => isRecordKind(r.kind) && isRecordStatus(r.status),
-  );
-  if (candidates.length === 0) return [];
-  const candidateIds = candidates.map((r) => r.id);
-  const candidateSet = new Set(candidateIds);
-
-  // Follow supersedes links (bounded) to collect predecessor ids per candidate.
-  const ancestors = new Map<string, string[]>();
-  for (const ids of chunk(candidateIds)) {
-    const sql = `WITH RECURSIVE chain(rootId, id, supersedes, depth) AS (
-        SELECT r.id, r.id, r.supersedes, 0 FROM records r WHERE r.id IN (${placeholders(ids.length)})
-        UNION ALL
-        SELECT c.rootId, p.id, p.supersedes, c.depth + 1
-          FROM chain c JOIN records p ON p.id = c.supersedes
-         WHERE c.depth < ${ACTIVATION_CHAIN_MAX}
-      )
-      SELECT rootId, id FROM chain WHERE depth > 0`;
-    const found = db.prepare(sql).all(...ids) as unknown as Array<{
-      rootId: string;
-      id: string;
-    }>;
-    for (const row of found) {
-      const list = ancestors.get(row.rootId);
-      if (!list) ancestors.set(row.rootId, [row.id]);
-      else if (!list.includes(row.id)) list.push(row.id);
-    }
-  }
-
-  const allIds = [...candidateIds];
-  for (const list of ancestors.values()) {
-    for (const id of list) if (!candidateSet.has(id)) allIds.push(id);
-  }
-
-  // Heat aggregates (uses output + aggregate-only usage approximation).
-  const heat = new Map<string, { usedCount: number; lastUsedAt: string }>();
-  for (const ids of chunk(allIds)) {
-    const found = db
-      .prepare(
-        `SELECT recordId, usedCount, lastUsedAt FROM note_heat WHERE recordId IN (${placeholders(ids.length)})`,
-      )
-      .all(...ids) as unknown as Array<{
-      recordId: string;
-      usedCount: number;
-      lastUsedAt: string;
-    }>;
-    for (const row of found) heat.set(row.recordId, row);
-  }
-
-  // Per-usage timestamps (canonical feedback ledger).
-  const usageTimes = new Map<string, string[]>();
-  for (const ids of chunk(allIds)) {
-    const found = db
-      .prepare(
-        `SELECT recordId, ts FROM usage WHERE recordId IN (${placeholders(ids.length)}) ORDER BY ts ASC`,
-      )
-      .all(...ids) as unknown as Array<{ recordId: string; ts: string }>;
-    for (const row of found) {
-      const list = usageTimes.get(row.recordId);
-      if (list) list.push(row.ts);
-      else usageTimes.set(row.recordId, [row.ts]);
-    }
-  }
-
-  // Corrections that supersede a candidate.
-  const correctionTimes = new Map<string, string[]>();
-  for (const ids of chunk(candidateIds)) {
-    const found = db
-      .prepare(
-        `SELECT supersedes, createdAt FROM records
-          WHERE kind = 'correction' AND supersedes IN (${placeholders(ids.length)})`,
-      )
-      .all(...ids) as unknown as Array<{ supersedes: string; createdAt: string }>;
-    for (const row of found) {
-      const list = correctionTimes.get(row.supersedes);
-      if (list) list.push(row.createdAt);
-      else correctionTimes.set(row.supersedes, [row.createdAt]);
-    }
-  }
-
-  // Active<->retired transition history from ANY op that can perform it.
-  // Retirements are mostly written by maintain.cultivate on behalf of
-  // maintain.distill (reasonCode LOW_SIGNAL); user actions are staged as
-  // record.retire/reactivate; maintain.activation reuses those ops with
-  // LOW_ACTIVATION/STILL_USEFUL. Filtering by the fixed retire+reactivate
-  // codes excludes cultivate keep rows (reasonCode null) and per-batch
-  // summary audit rows. The latest transition per kind wins.
-  const { reactivationTimes, latestReactivationReasons, retireReasons } =
-    loadTransitionHistory(db, candidateIds);
-
-  // Derived importance/nature, only while they still match the current bodyHash.
-  const importance = new Map<string, { value: number; bodyHash: string; nature: string | null }>();
-  for (const ids of chunk(candidateIds)) {
-    const found = db
-      .prepare(
-        `SELECT recordId, importance, bodyHash, nature FROM record_importance WHERE recordId IN (${placeholders(ids.length)})`,
-      )
-      .all(...ids) as unknown as Array<{
-      recordId: string;
-      importance: number;
-      bodyHash: string;
-      nature: string | null;
-    }>;
-    for (const row of found) {
-      importance.set(row.recordId, {
-        value: row.importance,
-        bodyHash: row.bodyHash,
-        nature: row.nature,
-      });
-    }
-  }
-  const hashOf = new Map(candidates.map((r) => [r.id, r.bodyHash]));
-
-  // Canonical links: count edges whose OTHER endpoint is active in this scope.
-  const linkCounts = new Map<string, number>();
-  // Chunk queries can return the same edge once per endpoint chunk (the row
-  // matches fromId IN this chunk OR toRef IN this chunk). Dedupe by edge key
-  // so a cross-chunk edge contributes exactly once per endpoint.
-  const seenLinks = new Set<string>();
-  for (const ids of chunk(candidateIds)) {
-    const rows = db
-      .prepare(
-        `SELECT fromId, toRef FROM record_links
-          WHERE fromId IN (${placeholders(ids.length)}) OR toRef IN (${placeholders(ids.length)})`,
-      )
-      .all(...ids, ...ids) as unknown as Array<{ fromId: string; toRef: string }>;
-    const otherIds = new Set<string>();
-    for (const row of rows) {
-      if (row.fromId !== row.toRef) {
-        otherIds.add(row.toRef);
-        otherIds.add(row.fromId);
-      }
-    }
-    const activePeers = new Set<string>();
-    for (const others of chunk([...otherIds])) {
-      const found = db
-        .prepare(
-          `SELECT id FROM records WHERE scope = ? AND status = 'active' AND id IN (${placeholders(others.length)})`,
-        )
-        .all(scope, ...others) as unknown as Array<{ id: string }>;
-      for (const row of found) activePeers.add(row.id);
-    }
-    for (const row of rows) {
-      if (row.fromId === row.toRef) continue;
-      const edgeKey = `${row.fromId}\u0000${row.toRef}`;
-      if (seenLinks.has(edgeKey)) continue;
-      seenLinks.add(edgeKey);
-      if (candidateSet.has(row.fromId) && activePeers.has(row.toRef)) {
-        linkCounts.set(row.fromId, (linkCounts.get(row.fromId) ?? 0) + 1);
-      }
-      if (candidateSet.has(row.toRef) && activePeers.has(row.fromId)) {
-        linkCounts.set(row.toRef, (linkCounts.get(row.toRef) ?? 0) + 1);
-      }
-    }
-  }
-
-  // Derived similar_edges count at 0.5 weight each. Same rule as canonical
-  // links: an edge is evidence only while the OTHER endpoint is active in this
-  // scope. maintain.associate prunes rows for inactive records lazily, so
-  // without this filter retirement decisions would depend on whether that
-  // maintenance has run since a neighbour was retired/archived/superseded.
-  const similarCounts = new Map<string, number>();
-  // Same chunking overlap for similar_edges: count each stored row once.
-  const seenSimilar = new Set<string>();
-  for (const ids of chunk(candidateIds)) {
-    const rows = db
-      .prepare(
-        `SELECT a, b FROM similar_edges
-          WHERE scope = ? AND (a IN (${placeholders(ids.length)}) OR b IN (${placeholders(ids.length)}))`,
-      )
-      .all(scope, ...ids, ...ids) as unknown as Array<{ a: string; b: string }>;
-    const otherIds = new Set<string>();
-    for (const row of rows) {
-      if (row.a !== row.b) {
-        otherIds.add(row.a);
-        otherIds.add(row.b);
-      }
-    }
-    const activePeers = new Set<string>();
-    for (const others of chunk([...otherIds])) {
-      const found = db
-        .prepare(
-          `SELECT id FROM records WHERE scope = ? AND status = 'active' AND id IN (${placeholders(others.length)})`,
-        )
-        .all(scope, ...others) as unknown as Array<{ id: string }>;
-      for (const row of found) activePeers.add(row.id);
-    }
-    for (const row of rows) {
-      if (row.a === row.b) continue;
-      const edgeKey = `${row.a}\u0000${row.b}`;
-      if (seenSimilar.has(edgeKey)) continue;
-      seenSimilar.add(edgeKey);
-      if (candidateSet.has(row.a) && activePeers.has(row.b)) {
-        similarCounts.set(row.a, (similarCounts.get(row.a) ?? 0) + 1);
-      }
-      if (candidateSet.has(row.b) && activePeers.has(row.a)) {
-        similarCounts.set(row.b, (similarCounts.get(row.b) ?? 0) + 1);
-      }
-    }
-  }
-
-  // Cited by an ACTIVE cluster summary whose revision is current (nothing
-  // supersedes it) — a stale citation from a replaced summary is not evidence.
-  const consolidated = new Set<string>();
-  for (const ids of chunk(candidateIds)) {
-    const found = db
-      .prepare(
-        `SELECT l.toRef AS target FROM record_links l
-           JOIN records s ON s.id = l.fromId
-          WHERE s.scope = ? AND s.status = 'active' AND s.source = ?
-            AND NOT EXISTS (
-              SELECT 1 FROM records n
-               WHERE n.supersedes = s.id AND n.scope = s.scope
-            )
-            AND l.toRef IN (${placeholders(ids.length)})
-          GROUP BY l.toRef`,
-      )
-      .all(scope, CLUSTER_SUMMARY_SOURCE, ...ids) as unknown as Array<{ target: string }>;
-    for (const row of found) consolidated.add(row.target);
-  }
-
-  const nowForExpiry =
-    options.now !== undefined && Number.isFinite(Date.parse(options.now)) ? options.now : nowIso();
-  const graceDays = Math.max(0, options.expiryGraceDays ?? 3);
-
-  const timesFor = (id: string): string[] => {
-    const out: string[] = [];
-    out.push(...(usageTimes.get(id) ?? []));
-    const h = heat.get(id);
-    if (h && Number.isFinite(h.usedCount) && h.usedCount > 0) {
-      const residual = h.usedCount - (usageTimes.get(id)?.length ?? 0);
-      // Aggregate-only legacy rows: repeat lastUsedAt for the residual count.
-      for (let i = 0; i < Math.min(residual, 1000); i++) out.push(h.lastUsedAt);
-    }
-    return out;
-  };
-
-  return candidates.map((r) => {
-    const eventTimes: string[] = [];
-    eventTimes.push(...timesFor(r.id));
-    for (const ancestorId of ancestors.get(r.id) ?? []) {
-      eventTimes.push(...timesFor(ancestorId));
-    }
-    eventTimes.push(...(correctionTimes.get(r.id) ?? []));
-    eventTimes.push(...(reactivationTimes.get(r.id) ?? []));
-    const imp = importance.get(r.id);
-    const fresh = imp !== undefined && imp.bodyHash === hashOf.get(r.id);
-    const freshImp = fresh && Number.isFinite(imp.value) ? imp.value : null;
-    const freshNature =
-      fresh && imp.nature !== null && (NATURE_LABELS as readonly string[]).includes(imp.nature)
-        ? (imp.nature as NatureLabel)
-        : null;
-    return {
-      recordId: r.id,
-      kind: r.kind as ActivationKind,
-      status: r.status as ActivationStatus,
-      createdAt: r.createdAt,
-      body: r.body,
-      importance: freshImp,
-      nature: freshNature,
-      links: (linkCounts.get(r.id) ?? 0) + 0.5 * (similarCounts.get(r.id) ?? 0),
-      expired: isExpiredDated(r.body, freshNature, nowForExpiry, graceDays),
-      consolidated: consolidated.has(r.id),
-      latestReactivationReason: latestReactivationReasons.get(r.id) ?? null,
-      uses: heat.get(r.id)?.usedCount ?? 0,
-      eventTimes,
-      retireReason: retireReasons.get(r.id) ?? null,
-    };
-  });
-}
 
 /* ------------------------------------------------------------------ */
 /* activation.preview (read-only)                                      */
@@ -1173,7 +549,16 @@ export function activationPreview(
     return applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
   }
   const bounds: ActivationConfig = activationBounds(config);
-  const paramsForModel: ActivationParams = bounds;
+  let active: ActiveRetentionWeights;
+  try {
+    active = loadActiveRetentionWeights(db, config);
+  } catch {
+    return applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
+  }
+  const paramsForModel: ActivationParams = paramsWithWeights(
+    bounds,
+    active.weights,
+  );
 
   let inputs: ActivationInput[];
   try {
@@ -1250,6 +635,9 @@ export function activationPreview(
               now,
             })
           : null,
+      /** null = config/default prior weights (no accepted learner version). */
+      weightsVersion: active.version,
+      weights: active.weights,
     });
   let res = applyResponseBudget(build(page, remaining.length > page.length), config.limits.responseMaxBytes);
   while (!res.ok && page.length > 0) {
@@ -1595,6 +983,75 @@ export async function maintainActivation(
     let scoreFailed = 0;
     let degraded = false;
 
+    // Harvest retention labels at the start of every pass, under the lease.
+    // Harvest failures never fail maintenance; the ledgers are derived.
+    let learn: {
+      harvested: number;
+      examples: number;
+      positives: number;
+      attempted: boolean;
+      accepted: boolean;
+      version: number | null;
+      skipped: LearnSkipReason | null;
+      train: number;
+      holdout: number;
+      trainLoss: number | null;
+      holdoutLoss: number | null;
+      baselineHoldoutLoss: number | null;
+    } = {
+      harvested: 0,
+      examples: 0,
+      positives: 0,
+      attempted: false,
+      accepted: false,
+      version: null,
+      skipped: null,
+      train: 0,
+      holdout: 0,
+      trainLoss: null,
+      holdoutLoss: null,
+      baselineHoldoutLoss: null,
+    };
+    try {
+      learn = { ...learn, ...harvestRetentionExamples(db, config, p.scope, nowValid) };
+    } catch {
+      degraded = true;
+    }
+    // Optimize/accept under the same lease and maintenance deadline. The
+    // learner never throws into maintenance; a failure is reported as
+    // degraded with the "error" skip reason.
+    if (overDeadline()) {
+      learn.skipped = "deadline";
+    } else {
+      try {
+        const outcome = maybeLearn(db, config, p.scope, nowValid);
+        learn.attempted = outcome.attempted;
+        learn.accepted = outcome.accepted;
+        learn.version = outcome.version;
+        learn.skipped = outcome.skipped;
+        learn.train = outcome.train;
+        learn.holdout = outcome.holdout;
+        learn.trainLoss = outcome.trainLoss;
+        learn.holdoutLoss = outcome.holdoutLoss;
+        learn.baselineHoldoutLoss = outcome.baselineHoldoutLoss;
+      } catch {
+        degraded = true;
+        learn.skipped = "error";
+      }
+    }
+    // Scoring uses the accepted weights (or the config prior when learning is
+    // disabled / has not accepted anything yet).
+    let activeWeights: ActiveRetentionWeights;
+    try {
+      activeWeights = loadActiveRetentionWeights(db, config);
+    } catch {
+      return budgeted(fail("STORE_UNAVAILABLE"), config);
+    }
+    const paramsForModel: ActivationParams = paramsWithWeights(
+      bounds,
+      activeWeights.weights,
+    );
+
     // Bounded scan continuation: each pass examines at most the same
     // ACTIVATION_MAX_RECORDS window, advancing (createdAt, id) and wrapping
     // to the start once the end is reached, so newer records are eventually
@@ -1709,14 +1166,14 @@ export async function maintainActivation(
     }
 
     const decisions: ActivationDecisionItem[] = inputs.map((input) => {
-      const factors = computeRetentionFactors(input, bounds, nowValid);
+      const factors = computeRetentionFactors(input, paramsForModel, nowValid);
       const ageHours = activationAgeHours(input.createdAt, nowValid);
       const decision = retireDecision(
         factors.total,
         input.status,
         input.retireReason,
         ageHours,
-        bounds,
+        paramsForModel,
         input.importance,
         bounds.protectImportance,
         {
@@ -1785,6 +1242,7 @@ export async function maintainActivation(
         wouldRetire,
         wouldReactivate,
         degraded,
+        learn,
       }),
       config,
     );
