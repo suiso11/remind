@@ -1239,6 +1239,13 @@ function linkRecord(db: DatabaseSync, from: string, to: string): void {
   db.prepare(`INSERT OR IGNORE INTO record_links(fromId, toRef) VALUES (?, ?)`).run(from, to);
 }
 
+function similarEdge(db: DatabaseSync, x: string, y: string): void {
+  const [a, b] = x < y ? [x, y] : [y, x];
+  db.prepare(
+    `INSERT OR REPLACE INTO similar_edges(scope, a, b, score, computedAt) VALUES (?, ?, ?, 0.9, ?)`,
+  ).run(SCOPE, a, b, NOW);
+}
+
 function previewItems(ctx: { db: DatabaseSync; config: AppConfig }, now = NOW) {
   const res = activationPreview(ctx.db, ctx.config, { scope: SCOPE }, now);
   assert.equal(res.ok, true, JSON.stringify(res));
@@ -1323,6 +1330,60 @@ describe("activation: multi-factor retention score", () => {
       const last = inputs.find((i) => i.recordId === ids[300]);
       assert.equal(first?.links, 1, "edge counted once for from endpoint");
       assert.equal(last?.links, 1, "edge counted once for to endpoint");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("ignores similar edges whose neighbour is no longer active", () => {
+    const ctx = setup();
+    try {
+      const stale = remember(ctx.db, ctx.config, "古い隣人と似ている", "r-sim-stale", "2026-01-01T00:00:00.000Z");
+      const fresh = remember(ctx.db, ctx.config, "今も使う隣人と似ている", "r-sim-fresh", "2026-01-01T00:00:00.000Z");
+      const retiredPeer = remember(ctx.db, ctx.config, "もう使わない記憶", "r-sim-peer-r", "2026-01-01T00:00:00.000Z");
+      const activePeer = remember(ctx.db, ctx.config, "現役の記憶", "r-sim-peer-a", "2026-01-01T00:00:00.000Z");
+      similarEdge(ctx.db, stale, retiredPeer);
+      similarEdge(ctx.db, fresh, activePeer);
+      const ret = retireRecord(
+        ctx.db,
+        ctx.config,
+        { id: retiredPeer, scope: SCOPE, reasonCode: "LOW_SIGNAL" },
+        "r-sim-retire",
+        NOW,
+      );
+      assert.equal(ret.ok, true, JSON.stringify(ret));
+      // The derived row survives until maintain.associate prunes it.
+      const rows = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM similar_edges WHERE scope = ?`)
+        .get(SCOPE) as { n: number };
+      assert.equal(rows.n, 2);
+
+      const inputs = loadActivationInputs(ctx.db, SCOPE, { includeRetired: false });
+      const staleInput = inputs.find((i) => i.recordId === stale);
+      const freshInput = inputs.find((i) => i.recordId === fresh);
+      assert.equal(staleInput?.links, 0, "edge to a retired neighbour contributes 0");
+      assert.equal(freshInput?.links, 0.5, "edge to an active neighbour still counts");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("counts a cross-chunk similar edge once per endpoint (301 candidates)", () => {
+    const ctx = setup();
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 301; i++) {
+        ids.push(
+          remember(ctx.db, ctx.config, `similar chunk memory ${i}`, `r-simchunk-${i}`, "2026-01-01T00:00:00.000Z"),
+        );
+      }
+      // ids[0] and ids[300] land in different SQL chunks (SQL_CHUNK = 300).
+      similarEdge(ctx.db, ids[0]!, ids[300]!);
+      const inputs = loadActivationInputs(ctx.db, SCOPE, { includeRetired: false });
+      const first = inputs.find((i) => i.recordId === ids[0]);
+      const last = inputs.find((i) => i.recordId === ids[300]);
+      assert.equal(first?.links, 0.5, "edge counted once for endpoint a");
+      assert.equal(last?.links, 0.5, "edge counted once for endpoint b");
     } finally {
       ctx.cleanup();
     }

@@ -890,7 +890,11 @@ export function loadActivationInputs(
     }
   }
 
-  // Derived similar_edges count at 0.5 weight each.
+  // Derived similar_edges count at 0.5 weight each. Same rule as canonical
+  // links: an edge is evidence only while the OTHER endpoint is active in this
+  // scope. maintain.associate prunes rows for inactive records lazily, so
+  // without this filter retirement decisions would depend on whether that
+  // maintenance has run since a neighbour was retired/archived/superseded.
   const similarCounts = new Map<string, number>();
   // Same chunking overlap for similar_edges: count each stored row once.
   const seenSimilar = new Set<string>();
@@ -901,16 +905,38 @@ export function loadActivationInputs(
           WHERE scope = ? AND (a IN (${placeholders(ids.length)}) OR b IN (${placeholders(ids.length)}))`,
       )
       .all(scope, ...ids, ...ids) as unknown as Array<{ a: string; b: string }>;
+    const otherIds = new Set<string>();
     for (const row of rows) {
+      if (row.a !== row.b) {
+        otherIds.add(row.a);
+        otherIds.add(row.b);
+      }
+    }
+    const activePeers = new Set<string>();
+    for (const others of chunk([...otherIds])) {
+      const found = db
+        .prepare(
+          `SELECT id FROM records WHERE scope = ? AND status = 'active' AND id IN (${placeholders(others.length)})`,
+        )
+        .all(scope, ...others) as unknown as Array<{ id: string }>;
+      for (const row of found) activePeers.add(row.id);
+    }
+    for (const row of rows) {
+      if (row.a === row.b) continue;
       const edgeKey = `${row.a}\u0000${row.b}`;
       if (seenSimilar.has(edgeKey)) continue;
       seenSimilar.add(edgeKey);
-      if (candidateSet.has(row.a)) similarCounts.set(row.a, (similarCounts.get(row.a) ?? 0) + 1);
-      if (candidateSet.has(row.b)) similarCounts.set(row.b, (similarCounts.get(row.b) ?? 0) + 1);
+      if (candidateSet.has(row.a) && activePeers.has(row.b)) {
+        similarCounts.set(row.a, (similarCounts.get(row.a) ?? 0) + 1);
+      }
+      if (candidateSet.has(row.b) && activePeers.has(row.a)) {
+        similarCounts.set(row.b, (similarCounts.get(row.b) ?? 0) + 1);
+      }
     }
   }
 
-  // Cited by an ACTIVE cluster summary (record_links from -> toRef = record).
+  // Cited by an ACTIVE cluster summary whose revision is current (nothing
+  // supersedes it) — a stale citation from a replaced summary is not evidence.
   const consolidated = new Set<string>();
   for (const ids of chunk(candidateIds)) {
     const found = db
@@ -918,6 +944,10 @@ export function loadActivationInputs(
         `SELECT l.toRef AS target FROM record_links l
            JOIN records s ON s.id = l.fromId
           WHERE s.scope = ? AND s.status = 'active' AND s.source = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM records n
+               WHERE n.supersedes = s.id AND n.scope = s.scope
+            )
             AND l.toRef IN (${placeholders(ids.length)})
           GROUP BY l.toRef`,
       )
