@@ -42,6 +42,7 @@ import {
   ACTIVATION_BATCH_MAX_CAP,
   activationBounds,
   cultivationBounds,
+  isLoopbackHttpUrl,
   maintenanceTimeoutMs,
   type ActivationConfig,
 } from "./config.js";
@@ -163,6 +164,21 @@ const CLASSIFIER_TOKEN_BUDGET = 64;
 export const CLASSIFIER_VERSION = "v2";
 /** Value written to record_importance.source for the current classifier. */
 export const CLASSIFIER_SOURCE = `llm:${CLASSIFIER_VERSION}`;
+
+/**
+ * Exact source stamp for this config. It encodes both the classifier version
+ * and the model id, so switching `activation.llm.model` (or the global openai
+ * model) makes every previously scored row stale and rescored once. Rows with
+ * the older model-less `llm:v2` stamp count as stale too.
+ */
+export function classifierSourceFor(config: AppConfig): string {
+  const model =
+    config.activation?.llm?.model ??
+    (config.llm?.backend === "openai" ? config.llm.model : undefined);
+  return model !== undefined && model.length > 0
+    ? `${CLASSIFIER_SOURCE}:${model}`
+    : CLASSIFIER_SOURCE;
+}
 
 /** Minimum body room the classifier keeps even when llm.maxPromptChars is
  *  below the fixed instruction size (500..8000 documented range). */
@@ -884,6 +900,7 @@ function writeImportance(
   writes: ImportanceWrite[],
   now: string,
   fenceOwner: string,
+  classifierSource: string = CLASSIFIER_SOURCE,
 ): void {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -899,7 +916,7 @@ function writeImportance(
          scoredAt = excluded.scoredAt`,
     );
     for (const w of writes)
-      stmt.run(w.recordId, w.importance, w.nature, w.bodyHash, CLASSIFIER_SOURCE, now);
+      stmt.run(w.recordId, w.importance, w.nature, w.bodyHash, classifierSource, now);
     assertDbUnderCap(db, config);
     db.exec("COMMIT");
   } catch (e) {
@@ -1091,16 +1108,25 @@ export async function maintainActivation(
     }
 
     const llmModelDir = resolveLlmDir(config, configPath);
-    const modelUsable = llmUsable(config, llmModelDir);
+    const activationLlm = config.activation?.llm;
+    // The classifier override is self-contained (validated loopback + model),
+    // so it is usable even when the global llm section is disabled/absent.
+    const modelUsable =
+      activationLlm !== undefined
+        ? isLoopbackHttpUrl(activationLlm.baseUrl) &&
+          typeof activationLlm.model === "string" &&
+          activationLlm.model.length > 0
+        : llmUsable(config, llmModelDir);
     // An injected generator against a config without an llm section is the
     // test model itself (same convention as episodes/associate).
     const usable = modelUsable || (generateOverride !== undefined && config.llm === undefined);
     if (!usable) degraded = true;
 
     if (usable) {
+      const classifierSource = classifierSourceFor(config);
       let candidates: UnscoredRow[];
       try {
-        candidates = selectUnscored(db, p.scope, p.limit);
+        candidates = selectUnscored(db, p.scope, p.limit, classifierSource);
       } catch {
         return budgeted(fail("STORE_UNAVAILABLE"), config);
       }
@@ -1108,10 +1134,13 @@ export async function maintainActivation(
         generateOverride ??
         ((prompt, tokens, signal) =>
           generateCompletion(prompt, llmModelDir, {
-            timeoutMs: llmTimeoutMs(config),
+            timeoutMs: activationLlm?.timeoutMs ?? llmTimeoutMs(config),
             maxNewTokens: tokens,
             config,
             signal,
+            ...(activationLlm !== undefined
+              ? { llmOverride: activationLlm, forceDisableThinking: true }
+              : {}),
           }));
       const maxPromptChars = llmMaxPromptChars(config);
       const leaseTtlMs = cultivationBounds(config).leaseTtlMs;
@@ -1165,7 +1194,7 @@ export async function maintainActivation(
         try {
           // Fence with the execution clock *now*, not the pre-inference
           // timestamp: a long generation must not commit after lease expiry.
-          writeImportance(db, config, writes, renewNow(), execOwner);
+          writeImportance(db, config, writes, renewNow(), execOwner, classifierSource);
           scored = writes.length;
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);

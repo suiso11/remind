@@ -114,9 +114,11 @@ import {
  * Version 11 adds the retention learning ledgers: harvested
  * retention_examples and accepted retention_weights snapshots. Both are
  * derived/rebuildable and created with IF NOT EXISTS, so migration is
- * idempotent.
+ * idempotent. Version 12 widens the record_importance source CHECK so a
+ * model-qualified classifier stamp (`llm:v2:<model>`) fits; v9-v11 files are
+ * rebuilt in place with every row preserved.
  */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -135,6 +137,8 @@ export const LEGACY_SCHEMA_VERSION_8 = 8;
 export const LEGACY_SCHEMA_VERSION_9 = 9;
 /** Pre-retention-learning schema stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_10 = 10;
+/** Pre-model-qualified-importance-source stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_11 = 11;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -482,11 +486,12 @@ export function ensureAssociateSchema(db: DatabaseSync): void {
 
 /**
  * v10 migration for the derived importance ledger: nullable `nature` plus the
- * versioned classifier source (`llm:v2`). Existing rows written before the
- * nature column stay NULL and activation reclassifies them. A pre-v10 source
- * CHECK that only allows ('llm','external') is rebuilt once so the versioned
- * source can be written; every row is copied, no canonical data is touched.
- * Idempotent via PRAGMA table_info and sqlite_master SQL inspection.
+ * versioned classifier source (`llm:v2`, and `llm:v2:<model>` since v12).
+ * Existing rows written before the nature column stay NULL and activation
+ * reclassifies them. A pre-v12 source CHECK that only allows a fixed source
+ * list is rebuilt once so model-qualified stamps can be written; every row is
+ * copied, no canonical data is touched. Idempotent via PRAGMA table_info and
+ * sqlite_master SQL inspection.
  */
 function ensureImportanceNatureColumn(db: DatabaseSync): void {
   let hasNature = true;
@@ -510,7 +515,11 @@ function ensureImportanceNatureColumn(db: DatabaseSync): void {
   const sqlRow = db
     .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='record_importance'`)
     .get() as { sql: string | null } | undefined;
-  if (sqlRow?.sql && !sqlRow.sql.includes("llm:v2")) {
+  const sourceAllowsModelStamp =
+    sqlRow?.sql !== null &&
+    sqlRow?.sql !== undefined &&
+    (/source\s+LIKE\s+'llm%'/i.test(sqlRow.sql) || sqlRow.sql.includes("llm:v2:"));
+  if (sqlRow?.sql && !sourceAllowsModelStamp) {
     db.exec("SAVEPOINT ensure_importance_source");
     try {
       db.exec(`ALTER TABLE record_importance RENAME TO record_importance_v9`);
@@ -519,7 +528,7 @@ function ensureImportanceNatureColumn(db: DatabaseSync): void {
         importance REAL NOT NULL,
         bodyHash TEXT NOT NULL,
         nature TEXT NULL,
-        source TEXT NOT NULL CHECK(source IN ('llm','llm:v2','external')),
+        source TEXT NOT NULL CHECK(source = 'external' OR source LIKE 'llm%'),
         scoredAt TEXT NOT NULL)`);
       db.exec(`INSERT INTO record_importance(recordId, importance, bodyHash, nature, source, scoredAt)
                SELECT recordId, importance, bodyHash, nature, source, scoredAt FROM record_importance_v9`);
@@ -596,7 +605,7 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
     importance REAL NOT NULL,
     bodyHash TEXT NOT NULL,
     nature TEXT NULL,
-    source TEXT NOT NULL CHECK(source IN ('llm','llm:v2','external')),
+    source TEXT NOT NULL CHECK(source = 'external' OR source LIKE 'llm%'),
     scoredAt TEXT NOT NULL)`);
   // v10 additive migration: nullable nature label for pre-v10 ledgers.
   // ALTER TABLE ADD COLUMN only; idempotent and savepoint-scoped.
