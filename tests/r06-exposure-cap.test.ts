@@ -47,7 +47,11 @@ function makeConfig(dir: string): { config: AppConfig; configPath: string } {
     },
     timeouts: { cliMs: 5000, busyMs: 2000 },
     dbMaxBytes: 104857600,
-  };
+    // The strict global 1000-row ledger is the learning-disabled behavior;
+    // with learning enabled pending exposures are preserved beyond the cap
+    // (covered by retention-learn.test.ts). Pin this suite to the legacy cap.
+    activation: { learn: { enabled: false } },
+  } as AppConfig;
   return { config, configPath: path.join(dir, "memory.config.json") };
 }
 

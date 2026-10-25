@@ -12,6 +12,7 @@ import {
   LEGACY_SCHEMA_VERSION_7,
   LEGACY_SCHEMA_VERSION_8,
   LEGACY_SCHEMA_VERSION_9,
+  LEGACY_SCHEMA_VERSION_10,
   SCHEMA_VERSION,
   ensureM1Schema,
   hasLegacyApprovalSchema,
@@ -103,7 +104,8 @@ export function initDb(
     // association tables; 5 = pre-whole-scope edge fingerprint; 6 = pre-record-
     // importance; 7 = pre-consolidation-cluster-ledger (record_importance,
     // i.e. PR #32's activation v7, already present); 8 = pre-consolidate-
-    // rotation-cursor, 9 = pre-nature-ledger (6-9 are upgraded in place); SCHEMA_VERSION =
+    // rotation-cursor, 9 = pre-nature-ledger, 10 = pre-retention-learning (6-10 are
+    // upgraded in place); SCHEMA_VERSION =
     // already current. Anything else is an unrelated/legacy file.
     if (
       uv !== 0 &&
@@ -115,6 +117,7 @@ export function initDb(
       uv !== LEGACY_SCHEMA_VERSION_7 &&
       uv !== LEGACY_SCHEMA_VERSION_8 &&
       uv !== LEGACY_SCHEMA_VERSION_9 &&
+      uv !== LEGACY_SCHEMA_VERSION_10 &&
       uv !== SCHEMA_VERSION
     ) {
       throw new Error(LEGACY_DB_MESSAGE);

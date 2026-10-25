@@ -169,6 +169,31 @@ export interface ActivationConfig {
   apply: boolean;
   /** Importance at/above which retirement needs the protective margin (default 0.66). */
   protectImportance: number;
+  /** Retention weight learner bounds (optional; absent uses defaults). */
+  learn?: RetentionLearnConfig;
+}
+
+/**
+ * Retention weight learner bounds (startup-only, optional). The learner
+ * harvests labeled recall outcomes during maintain.activation; the optimizer
+ * lands in a later slice. `maxDrift` bounds |new - baseline| per weight when
+ * a candidate is considered for acceptance.
+ */
+export interface RetentionLearnConfig {
+  /** Harvest labels and allow learned weights (default true). */
+  enabled: boolean;
+  /** Base-level decay used for feature snapshots (default 2.0). */
+  lambda: number;
+  /** Maximum absolute drift from the baseline per learned weight (default 1.5). */
+  maxDrift: number;
+  /** Minimum examples required before fitting (default 300). */
+  minExamples: number;
+  /** Minimum positive examples required before fitting (default 30). */
+  minPositives: number;
+  /** Minimum interval between learner runs (default 86400000 = 1 day). */
+  learnIntervalMs: number;
+  /** Exposure label horizon: only older exposures are labeled (default 21600000 = 6h). */
+  labelHorizonMs: number;
 }
 
 /**
@@ -314,6 +339,24 @@ function checkRange(
 ): string | null {
   if (!isInt(v)) return `${name} must be an integer`;
   if (v < min || v > max) return `${name} must be in ${min}..${max}`;
+  return null;
+}
+
+/**
+ * Continuous numeric bound check for fractional parameters (learner
+ * coefficients, activation weights/thresholds). Counts and caps must keep
+ * using the integer-only `checkRange`.
+ */
+function checkFiniteRange(
+  name: string,
+  v: unknown,
+  min: number,
+  max: number,
+): string | null {
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    return `${name} must be a number in ${min}..${max}`;
+  }
+  if (v < min || v > max) return `${name} must be a number in ${min}..${max}`;
   return null;
 }
 
@@ -673,27 +716,14 @@ export function loadConfig(configPath: string): AppConfig {
     const eK = checkRange("associate.topK", topK, 1, 50);
     if (eK) throw new Error(eK);
     const minScore = a["minScore"] ?? ASSOCIATE_DEFAULT_MIN_SCORE;
-    if (typeof minScore !== "number" || !Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
-      throw new Error("associate.minScore must be a number in 0..1");
-    }
+    const eMinScore = checkFiniteRange("associate.minScore", minScore, 0, 1);
+    if (eMinScore) throw new Error(eMinScore);
     const topicMergeMin = a["topicMergeMin"] ?? ASSOCIATE_DEFAULT_TOPIC_MERGE_MIN;
-    if (
-      typeof topicMergeMin !== "number" ||
-      !Number.isFinite(topicMergeMin) ||
-      topicMergeMin < 0 ||
-      topicMergeMin > 1
-    ) {
-      throw new Error("associate.topicMergeMin must be a number in 0..1");
-    }
+    const eTopicMerge = checkFiniteRange("associate.topicMergeMin", topicMergeMin, 0, 1);
+    if (eTopicMerge) throw new Error(eTopicMerge);
     const topicBonus = a["topicBonus"] ?? ASSOCIATE_DEFAULT_TOPIC_BONUS;
-    if (
-      typeof topicBonus !== "number" ||
-      !Number.isFinite(topicBonus) ||
-      topicBonus < 0 ||
-      topicBonus > 1
-    ) {
-      throw new Error("associate.topicBonus must be a number in 0..1");
-    }
+    const eTopicBonus = checkFiniteRange("associate.topicBonus", topicBonus, 0, 1);
+    if (eTopicBonus) throw new Error(eTopicBonus);
     const llmTopics = a["llmTopics"] ?? ASSOCIATE_DEFAULT_LLM_TOPICS;
     if (typeof llmTopics !== "boolean") {
       throw new Error("associate.llmTopics must be a boolean");
@@ -751,6 +781,7 @@ export function loadConfig(configPath: string): AppConfig {
           "batchMax",
           "apply",
           "protectImportance",
+          "learn",
         ].includes(k)
       ) {
         throw new Error(`unknown activation field: ${k}`);
@@ -772,7 +803,7 @@ export function loadConfig(configPath: string): AppConfig {
       throw new Error("activation.tauRetire must be < activation.tauReactivate");
     }
     const minAgeHours = a["minAgeHours"] ?? ACTIVATION_DEFAULT_MIN_AGE_HOURS;
-    const eAge = checkRange("activation.minAgeHours", minAgeHours, 0, 87600);
+    const eAge = checkFiniteRange("activation.minAgeHours", minAgeHours, 0, 87600);
     if (eAge) throw new Error(eAge);
     const wImportance = a["wImportance"] ?? ACTIVATION_DEFAULT_W_IMPORTANCE;
     if (typeof wImportance !== "number" || !Number.isFinite(wImportance) || wImportance < 0 || wImportance > 10) {
@@ -817,7 +848,7 @@ export function loadConfig(configPath: string): AppConfig {
       throw new Error("activation.wLinks must be a number in 0..10");
     }
     const expiryGraceDays = a["expiryGraceDays"] ?? ACTIVATION_DEFAULT_EXPIRY_GRACE_DAYS;
-    const eGrace = checkRange("activation.expiryGraceDays", expiryGraceDays, 0, 87600);
+    const eGrace = checkFiniteRange("activation.expiryGraceDays", expiryGraceDays, 0, 87600);
     if (eGrace) throw new Error(eGrace);
     const wExpired = a["wExpired"] ?? ACTIVATION_DEFAULT_W_EXPIRED;
     if (typeof wExpired !== "number" || !Number.isFinite(wExpired) || wExpired < 0 || wExpired > 10) {
@@ -834,7 +865,7 @@ export function loadConfig(configPath: string): AppConfig {
         throw new Error(`unknown activation.minAgeHoursByNature field: ${k}`);
       }
       const h = minAgeRaw[k];
-      const e = checkRange(`activation.minAgeHoursByNature.${k}`, h, 0, 87600);
+      const e = checkFiniteRange(`activation.minAgeHoursByNature.${k}`, h, 0, 87600);
       if (e) throw new Error(e);
     }
     const minAgeHoursByNature = { ...ACTIVATION_DEFAULT_MIN_AGE_HOURS_BY_NATURE };
@@ -858,6 +889,52 @@ export function loadConfig(configPath: string): AppConfig {
     ) {
       throw new Error("activation.protectImportance must be a number in 0..1");
     }
+    let learn: RetentionLearnConfig | undefined;
+    if ("learn" in a && a["learn"] !== undefined) {
+      const l = a["learn"];
+      if (!isPlainObject(l)) throw new Error("activation.learn must be an object");
+      const allowed = [
+        "enabled",
+        "lambda",
+        "maxDrift",
+        "minExamples",
+        "minPositives",
+        "learnIntervalMs",
+        "labelHorizonMs",
+      ];
+      for (const k of Object.keys(l)) {
+        if (!allowed.includes(k)) throw new Error(`unknown activation.learn field: ${k}`);
+      }
+      const enabled = l["enabled"] ?? RETENTION_LEARN_DEFAULTS.enabled;
+      if (typeof enabled !== "boolean") throw new Error("activation.learn.enabled must be a boolean");
+      const lambda = l["lambda"] ?? RETENTION_LEARN_DEFAULTS.lambda;
+      const eLambda = checkFiniteRange("activation.learn.lambda", lambda, 0, 10);
+      if (eLambda) throw new Error(eLambda);
+      const maxDrift = l["maxDrift"] ?? RETENTION_LEARN_DEFAULTS.maxDrift;
+      const eDrift = checkFiniteRange("activation.learn.maxDrift", maxDrift, 0, 100);
+      if (eDrift) throw new Error(eDrift);
+      const minExamples = l["minExamples"] ?? RETENTION_LEARN_DEFAULTS.minExamples;
+      const eMinEx = checkRange("activation.learn.minExamples", minExamples, 0, 1_000_000);
+      if (eMinEx) throw new Error(eMinEx);
+      const minPositives = l["minPositives"] ?? RETENTION_LEARN_DEFAULTS.minPositives;
+      const eMinPos = checkRange("activation.learn.minPositives", minPositives, 0, 1_000_000);
+      if (eMinPos) throw new Error(eMinPos);
+      const learnIntervalMs = l["learnIntervalMs"] ?? RETENTION_LEARN_DEFAULTS.learnIntervalMs;
+      const eInterval = checkRange("activation.learn.learnIntervalMs", learnIntervalMs, 0, 31_536_000_000);
+      if (eInterval) throw new Error(eInterval);
+      const labelHorizonMs = l["labelHorizonMs"] ?? RETENTION_LEARN_DEFAULTS.labelHorizonMs;
+      const eHorizon = checkRange("activation.learn.labelHorizonMs", labelHorizonMs, 0, 31_536_000_000);
+      if (eHorizon) throw new Error(eHorizon);
+      learn = {
+        enabled: enabled,
+        lambda: lambda as number,
+        maxDrift: maxDrift as number,
+        minExamples: minExamples as number,
+        minPositives: minPositives as number,
+        learnIntervalMs: learnIntervalMs as number,
+        labelHorizonMs: labelHorizonMs as number,
+      };
+    }
     activation = {
       decay,
       tauRetire,
@@ -874,6 +951,7 @@ export function loadConfig(configPath: string): AppConfig {
       batchMax: batchMax as number,
       apply,
       protectImportance,
+      ...(learn !== undefined ? { learn } : {}),
     };
   }
 
@@ -1046,6 +1124,22 @@ export const ACTIVATION_DEFAULT_APPLY = false;
 /** protectImportance default (2/3 rounded down); see retireDecision. */
 export const ACTIVATION_DEFAULT_PROTECT_IMPORTANCE = 0.66;
 
+/** Retention learner defaults (see RetentionLearnConfig). */
+export const RETENTION_LEARN_DEFAULTS: RetentionLearnConfig = {
+  enabled: true,
+  lambda: 2.0,
+  maxDrift: 1.5,
+  minExamples: 300,
+  minPositives: 30,
+  learnIntervalMs: 86_400_000,
+  labelHorizonMs: 21_600_000,
+};
+
+/** Resolved learner bounds, filling documented defaults per field. */
+export function retentionLearnBounds(config: AppConfig): RetentionLearnConfig {
+  return { ...RETENTION_LEARN_DEFAULTS, ...(config.activation?.learn ?? {}) };
+}
+
 export function activationBounds(config: AppConfig): ActivationConfig {
   const a = config.activation;
   const kind = a?.wKind;
@@ -1073,6 +1167,7 @@ export function activationBounds(config: AppConfig): ActivationConfig {
     batchMax: a?.batchMax ?? ACTIVATION_DEFAULT_BATCH_MAX,
     apply: a?.apply ?? ACTIVATION_DEFAULT_APPLY,
     protectImportance: a?.protectImportance ?? ACTIVATION_DEFAULT_PROTECT_IMPORTANCE,
+    learn: retentionLearnBounds(config),
   };
 }
 

@@ -36,6 +36,7 @@ import {
   rawBodyMaxCp,
   rawPageMaxCp,
   requirePrivacyEnabled,
+  retentionLearnBounds,
 } from "./config.js";
 import {
   bodyHashFor,
@@ -110,10 +111,12 @@ import {
  * hold cluster ledgers. Version 10 adds the nullable nature label to the
  * record_importance ledger (combined nature+importance classifier); v9 files
  * keep their scores and gain the column with NULL nature (rescore-on-null).
- * Every CREATE in the sequence is IF NOT EXISTS, so a re-run of 7 -> 10 is
+ * Version 11 adds the retention learning ledgers: harvested
+ * retention_examples and accepted retention_weights snapshots. Both are
+ * derived/rebuildable and created with IF NOT EXISTS, so migration is
  * idempotent.
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -130,6 +133,8 @@ export const LEGACY_SCHEMA_VERSION_7 = 7;
 export const LEGACY_SCHEMA_VERSION_8 = 8;
 /** Pre-nature-ledger stamp (v9 carries record_importance without nature); accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_9 = 9;
+/** Pre-retention-learning schema stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_10 = 10;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -167,6 +172,15 @@ export const VECTOR_CANDIDATE_MAX = 20;
 export const VECTOR_FUSION_WEIGHT = 4;
 /** Exposures ledger cap: oldest rows pruned beyond this (feedback stays verifiable while fresh). */
 export const EXPOSURES_CAP = 1000;
+/**
+ * Hard safety cap when learning is enabled. Exposures newer than the
+ * per-scope exposure harvest cursor are pending labels and are normally
+ * retained regardless of EXPOSURES_CAP; only above this bound does the prune
+ * drop the oldest rows (pending or not). Loss is bounded to the rows beyond
+ * the cap, so a scope can lose pending labels only if it accumulates more
+ * than this many unharvested exposures within one label horizon.
+ */
+export const EXPOSURES_PENDING_HARD_CAP = 20000;
 
 const ID_RE = /^[A-Za-z0-9_-]+$/;
 
@@ -587,6 +601,43 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   // v10 additive migration: nullable nature label for pre-v10 ledgers.
   // ALTER TABLE ADD COLUMN only; idempotent and savepoint-scoped.
   ensureImportanceNatureColumn(db);
+  // v11 retention learning ledgers (derived/rebuildable, never canonical).
+  // retention_examples is keyed by the exposure identity; audit transitions
+  // use 'audit:'+rowid as recallId. retention_weights keeps every accepted
+  // learner snapshot so a regression can roll back to the previous version.
+  db.exec(`CREATE TABLE IF NOT EXISTS retention_examples(
+    recallId TEXT NOT NULL,
+    recordId TEXT NOT NULL,
+    source TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    label REAL NOT NULL,
+    weight REAL NOT NULL,
+    features TEXT NOT NULL,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY(recallId, recordId, source))`);
+  db.exec(`CREATE TABLE IF NOT EXISTS retention_weights(
+    version INTEGER PRIMARY KEY AUTOINCREMENT,
+    weights TEXT NOT NULL,
+    scale REAL NOT NULL,
+    intercept REAL NOT NULL,
+    nTrain INTEGER NOT NULL,
+    nPos INTEGER NOT NULL,
+    trainLoss REAL NOT NULL,
+    holdoutLoss REAL NOT NULL,
+    baselineHoldoutLoss REAL NOT NULL,
+    accepted INTEGER NOT NULL,
+    createdAt TEXT NOT NULL)`);
+  // Durable per-scope harvest cursors. retention_examples is bounded and
+  // pruned, so the cursor (not the example table) must remember how far each
+  // source was consumed; otherwise pruning makes the oldest transitions
+  // eligible again forever and starves newer ones.
+  db.exec(`CREATE TABLE IF NOT EXISTS retention_harvest_state(
+    scope TEXT NOT NULL,
+    source TEXT NOT NULL,
+    lastTs TEXT NOT NULL,
+    lastKey TEXT NOT NULL,
+    lastKey2 TEXT NULL,
+    PRIMARY KEY(scope, source))`);
   db.exec(`CREATE TABLE IF NOT EXISTS projection_queue(recordId TEXT PRIMARY KEY, attempts INTEGER NOT NULL, nextAt TEXT NOT NULL)`);
   // Derived lexical indexes (rebuildable; never canonical).
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);
@@ -3790,6 +3841,68 @@ export interface RecallVectorInput {
   topK?: number;
 }
 
+/**
+ * Prune the exposures ledger after a recall.
+ *
+ * With learning disabled this keeps the original bounded 1000-row ledger.
+ * With learning enabled, exposures newer than the scope's durable exposure
+ * harvest cursor are pending labels: the harvester has not consumed them yet,
+ * and the label horizon may still be hours away. They are retained even beyond
+ * EXPOSURES_CAP so recall traffic can never delete labels before they mature.
+ * Already-harvested rows keep the 1000-row feedback-verification bound.
+ * EXPOSURES_PENDING_HARD_CAP is the safety valve: only when the table exceeds
+ * it are the oldest rows dropped regardless, so the loss is bounded to the
+ * rows beyond that cap (oldest pending labels first).
+ */
+function pruneExposures(db: DatabaseSync, config: AppConfig, scope: string): void {
+  if (!retentionLearnBounds(config).enabled) {
+    db.prepare(
+      `DELETE FROM exposures WHERE rowid NOT IN (SELECT rowid FROM exposures ORDER BY ts DESC, rowid DESC LIMIT ?)`,
+    ).run(EXPOSURES_CAP);
+    return;
+  }
+  const cursor = db
+    .prepare(
+      `SELECT lastTs, lastKey, lastKey2 FROM retention_harvest_state
+        WHERE scope = ? AND source = 'exposure'`,
+    )
+    .get(scope) as { lastTs: string; lastKey: string; lastKey2: string | null } | undefined;
+  if (
+    cursor !== undefined &&
+    Number.isFinite(Date.parse(cursor.lastTs)) &&
+    typeof cursor.lastKey === "string" &&
+    cursor.lastKey.length > 0 &&
+    typeof cursor.lastKey2 === "string"
+  ) {
+    // Same (ts, recallId, recordId) ordering as the harvest cursor. Rows that
+    // compare newer than the cursor have not been consumed by any harvest.
+    const pending = `(ts > ? OR (ts = ? AND (recallId > ? OR (recallId = ? AND recordId > ?))))`;
+    const params = [cursor.lastTs, cursor.lastTs, cursor.lastKey, cursor.lastKey, cursor.lastKey2];
+    // Scope the feedback-verification bound per scope so another scope's
+    // cursor can never make this scope's pending rows look harvested.
+    db.prepare(
+      `DELETE FROM exposures
+        WHERE scope = ?
+          AND NOT ${pending}
+          AND rowid NOT IN (
+            SELECT rowid FROM exposures
+             WHERE scope = ?
+               AND NOT ${pending}
+             ORDER BY ts DESC, rowid DESC
+             LIMIT ?)`,
+    ).run(scope, ...params, scope, ...params, EXPOSURES_CAP);
+  }
+  // No cursor means nothing in this scope has been harvested yet: every row
+  // is a pending label. The hard cap below still bounds the ledger.
+  const total = (db.prepare(`SELECT COUNT(*) AS n FROM exposures`).get() as { n: number }).n;
+  if (total > EXPOSURES_PENDING_HARD_CAP) {
+    db.prepare(
+      `DELETE FROM exposures WHERE rowid NOT IN (
+         SELECT rowid FROM exposures ORDER BY ts DESC, rowid DESC LIMIT ?)`,
+    ).run(EXPOSURES_PENDING_HARD_CAP);
+  }
+}
+
 export function recallRecords(
   db: DatabaseSync,
   config: AppConfig,
@@ -4115,13 +4228,12 @@ export function recallRecords(
       for (const it of items) {
         exp.run(now, recallId, p.runId, p.scope, it.id, Buffer.byteLength(it.snippet, "utf8"), it.truncated ? 1 : 0, p.limit);
       }
-      // Bounded exposures ledger (prune oldest beyond cap). Prune failure
-      // must fail the recall closed so the strict global 1000-row cap is
-      // never exceeded: the surrounding transaction rolls back the new
+      // Bounded exposures ledger. With learning enabled, rows newer than the
+      // harvest cursor are pending labels and survive the 1000-row prune
+      // (bounded by EXPOSURES_PENDING_HARD_CAP). Prune failure must fail the
+      // recall closed: the surrounding transaction rolls back the new
       // exposures + audit together.
-      db.prepare(
-        `DELETE FROM exposures WHERE rowid NOT IN (SELECT rowid FROM exposures ORDER BY ts DESC, rowid DESC LIMIT ?)`,
-      ).run(EXPOSURES_CAP);
+      pruneExposures(db, config, p.scope);
       // Recall metadata (audit + exposures) may exceed configured cap;
       // only real SQLite failures fail closed via the catch below.
       return stored;

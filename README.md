@@ -181,6 +181,18 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 - `activation.protectImportance` (既定 0.66 ≒ 2/3) 以上の重要度は通常の `tauRetire` では引退せず `R < tauRetire - 1` を要求する。
 - `activation.apply` は既定 **false**。false の間は状態を変えず `wouldRetire / wouldReactivate` を返す。応答 data は `{scored, scoreFailed, retired, reactivated, wouldRetire, wouldReactivate, degraded}`。全 `activation.*` キーは起動時に厳格検証し、未知キー・範囲外は起動エラーにする。
 
+### Learned retention weights
+
+- **ラベル**: `retention_examples` に 2 系統を蓄積する。(a) `exposures` の horizon (`activation.learn.labelHorizonMs`, 既定 6h) 経過後の露出で、同一 `(recallId,recordId)` の `usage` があれば正例、なければ負例 (weight 1)。(b) 監査台帳の明示遷移: `USER_REQUESTED` 再活性化は正例、`NO_LONGER_USEFUL` 引退は負例 (weight 5)。`recallId` は露出 ID または `audit:<rowid>` で、再実行しても再ラベルしない。
+- **リーク規則**: 特徴量はラベル時刻 `ts` でスナップショットする。`base` は `ts` より厳密に前の事象だけを使うため、ラベル対象の `usage` は混入しない。kind/nature/importance/links/expired/consolidated は現在状態の近似で、その旨を snapshot に記録する。
+- **モデル**: `R_w(x) = base + Σ_k w_k·φ_k(x)` は `computeRetentionFactors` と同じ因子構造 (kind, `wImportance·importance`, `wNature[label]`, `wLinks·ln(1+L)`, `−wExpired·expired`, `−wConsolidated·consolidated`)。`P(useful) = sigmoid(a·R_w + b)`、`a > 0`、`b` は学習。θ は平坦化した w (kind 4 + nature 11 + 4 スカラー) と `a,b`。
+- **MAP 事前分布**: 事前重み = 現在の config/default (`activation.*`)。目的関数は重み付き log-loss + `lambda·Σ(w−prior)²`。`a,b` は正則化しないが `a ≥ 0.05` に clamp。最適化は決定的な full-batch Adam (lr 0.05, 600 反復、初期値 w=prior, a=1, b=0)。
+- **ガードレール**: 各 step 後に射影する。`wImportance, wLinks, wExpired, wConsolidated ≥ 0`、`GREETING/CHATOPS/TRANSIENT/EMOTION` の nature 重み `≤ 0`、全重み `|w−prior| ≤ activation.learn.maxDrift` (既定 1.5)。
+- **受理ゲート**: `activation.learn.enabled`、前回試行から `learnIntervalMs` (既定 1 日) 経過、前回試行以降の新規例 ≥ 50、全体 `n ≥ minExamples` (既定 300)、正例 ≥ `minPositives` (既定 30) を満たすときだけ試行する。ゲート skip は行を残さない。試行時は時刻順の末尾 20% を holdout とし、train で新重みを fit、baseline (最新 accepted、無ければ prior) は重み固定で `a,b` のみ train fit して比較を公平にする。holdout log-loss が baseline を `1e-4` 超で改善した場合だけ採用し、採用時は全例で再 fit して `accepted=1` を保存する。試行行 (`accepted=0` を含む) は常に損失付きで残す。
+- **スコアリング**: `activation.preview` と `maintain.activation` の判定は最新 accepted 重みを使い、無ければ config 重みにフォールバックする。preview は `weightsVersion` (null = prior) と `weights` を返し、`maintain.activation` の `learn` は `{harvested, examples, positives, attempted, accepted, version, skipped, train, holdout, trainLoss, holdoutLoss, baselineHoldoutLoss}` を返す (`version` は試行行の `retention_weights.version`、skip 時は null)。
+- **ロールバック**: `activation.learn.enabled=false` で採点は即座に config 重みへ戻る (最新 accepted は無視。行は保持)。learner を再有効化すれば次の accepted まで prior で採点する。
+- **現状のデータ量に関する注意**: 学習は十分な露出・利用履歴が溜まってから意味を持つ。既定の `minExamples=300` / `minPositives=30` / 新規 50 件ゲートにより、小規模データでは試行自体が skip され、重みは prior のままになる。受理は holdout 改善のみを条件とするため、データが少ない間は保守的に無変更となる。
+
 ## 冪等・エラー
 
 - 全書き込みは `idempotencyKey` 必須。欠落は `BAD_REQUEST`。同一キー + 同一 params の再送は保存済み応答を `deduplicated:true` で返す。params 改変は `CONFLICT`。
