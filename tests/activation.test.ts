@@ -13,6 +13,7 @@ import type { AppConfig } from "../src/config.js";
 import { loadConfig, type ActivationConfig } from "../src/config.js";
 import { eventAppend, correctRecord, rememberRecord, retireRecord } from "../src/store.js";
 import { acquireCultivationLease, releaseCultivationLease } from "../src/cultivation.js";
+import { chatMlToMessages } from "../src/llm.js";
 import { maintainDistill } from "../src/distill.js";
 import {
   ACTIVATION_DEFAULTS,
@@ -606,9 +607,23 @@ describe("activation: combined classifier prompt and strict parsing", () => {
     for (const label of NATURE_LABELS) assert.ok(prompt.includes(label), label);
     assert.ok(prompt.includes("\"nature\""));
     for (const max of [500, 1200]) {
+      // Below the fixed instruction size the contract wins over the cap: the
+      // prompt keeps all instructions plus at least 200 body code points.
       const clipped = buildClassifierPrompt("あ".repeat(5000), max);
-      assert.ok([...clipped].length <= max, `fits ${max}`);
+      assert.ok(clipped.startsWith("<|im_start|>system\n"), `keeps system at ${max}`);
+      assert.ok(clipped.includes("分類器"), `keeps instructions at ${max}`);
+      assert.ok(clipped.includes("あ".repeat(200)), `keeps 200cp body at ${max}`);
+      assert.ok(!clipped.includes("あ".repeat(201)), `clips body at ${max}`);
       assert.ok(clipped.endsWith("<|im_start|>assistant\n"), "keeps assistant cue");
+      // The ChatML must always split into real roles (never cue-only).
+      const conv = chatMlToMessages(clipped);
+      assert.ok(conv, `converts at ${max}`);
+      // The trailing assistant cue is an empty prefill: the conversion must
+      // still yield real system+user messages (never null / cue-only).
+      assert.deepEqual(conv.messages.map((m) => m.role), ["system", "user"]);
+      assert.equal(conv.prefill, "");
+      assert.ok(conv.messages[0]!.content.includes("分類器"));
+      assert.ok(conv.messages[1]!.content.includes("あ".repeat(200)));
     }
   });
 
@@ -1287,6 +1302,27 @@ describe("activation: multi-factor retention score", () => {
       assert.equal(l?.decision, "keep");
       assert.ok((l?.factors.links ?? 0) > 0);
       assert.ok((l?.A ?? 0) > (u?.A ?? 0));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("counts a cross-chunk canonical edge once per endpoint (301 candidates)", () => {
+    const ctx = setup();
+    try {
+      const ids: string[] = [];
+      for (let i = 0; i < 301; i++) {
+        ids.push(
+          remember(ctx.db, ctx.config, `chunk memory ${i}`, `r-chunk-${i}`, "2026-01-01T00:00:00.000Z"),
+        );
+      }
+      // ids[0] and ids[300] land in different SQL chunks (SQL_CHUNK = 300).
+      linkRecord(ctx.db, ids[0]!, ids[300]!);
+      const inputs = loadActivationInputs(ctx.db, SCOPE, { includeRetired: false });
+      const first = inputs.find((i) => i.recordId === ids[0]);
+      const last = inputs.find((i) => i.recordId === ids[300]);
+      assert.equal(first?.links, 1, "edge counted once for from endpoint");
+      assert.equal(last?.links, 1, "edge counted once for to endpoint");
     } finally {
       ctx.cleanup();
     }

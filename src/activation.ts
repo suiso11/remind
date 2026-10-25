@@ -182,6 +182,10 @@ export const CLASSIFIER_VERSION = "v2";
 /** Value written to record_importance.source for the current classifier. */
 export const CLASSIFIER_SOURCE = `llm:${CLASSIFIER_VERSION}`;
 
+/** Minimum body room the classifier keeps even when llm.maxPromptChars is
+ *  below the fixed instruction size (500..8000 documented range). */
+const MIN_CLASSIFIER_BODY_CP = 200;
+
 /**
  * Japanese ChatML prompt for the ONE combined retention classifier.
  *
@@ -239,16 +243,21 @@ export function buildClassifierPrompt(body: string, maxPromptChars = 2000): stri
     "<|im_end|>\n" +
     "<|im_start|>user\n";
   const tail = "<|im_end|>\n<|im_start|>assistant\n";
-  const room = Math.max(1, maxPromptChars - countCp(head) - countCp(tail));
+  // The fixed instructions ARE the classifier contract: unlike distill's
+  // tailClip, they must never be truncated, and the assistant cue must always
+  // survive so chatMlToMessages() yields a valid system+user+assistant array.
+  // Below `fixed + MIN_CLASSIFIER_BODY_CP` the configured cap cannot hold both
+  // the contract and a classifiable body. Like episodes' verificationFits
+  // (which refuses a prompt it cannot ask honestly), we keep the contract and
+  // give it the minimum body budget: the effective budget is therefore
+  // max(cap, fixed + minimum), and the prompt may exceed a too-small cap.
+  // The alternative (returning only the cue) silently sent an empty request.
+  const fixed = countCp(head) + countCp(tail);
+  const budget = Math.max(maxPromptChars, fixed + MIN_CLASSIFIER_BODY_CP);
+  const room = Math.max(MIN_CLASSIFIER_BODY_CP, budget - fixed);
   const cps = [...body];
   const shown = cps.length > room ? cps.slice(0, room).join("") : body;
-  const full = head + shown + tail;
-  // Guard: if the caller's cap is smaller than head+tail, keep the assistant
-  // cue so the ChatML split still yields a valid messages array.
-  if (countCp(full) <= maxPromptChars) return full;
-  const headTailOnly = head + tail;
-  if (countCp(headTailOnly) <= maxPromptChars) return headTailOnly;
-  return tail;
+  return head + shown + tail;
 }
 
 /** Remove complete or unterminated think blocks before JSON extraction. */
@@ -840,6 +849,10 @@ export function loadActivationInputs(
 
   // Canonical links: count edges whose OTHER endpoint is active in this scope.
   const linkCounts = new Map<string, number>();
+  // Chunk queries can return the same edge once per endpoint chunk (the row
+  // matches fromId IN this chunk OR toRef IN this chunk). Dedupe by edge key
+  // so a cross-chunk edge contributes exactly once per endpoint.
+  const seenLinks = new Set<string>();
   for (const ids of chunk(candidateIds)) {
     const rows = db
       .prepare(
@@ -864,10 +877,14 @@ export function loadActivationInputs(
       for (const row of found) activePeers.add(row.id);
     }
     for (const row of rows) {
-      if (row.fromId !== row.toRef && candidateSet.has(row.fromId) && activePeers.has(row.toRef)) {
+      if (row.fromId === row.toRef) continue;
+      const edgeKey = `${row.fromId}\u0000${row.toRef}`;
+      if (seenLinks.has(edgeKey)) continue;
+      seenLinks.add(edgeKey);
+      if (candidateSet.has(row.fromId) && activePeers.has(row.toRef)) {
         linkCounts.set(row.fromId, (linkCounts.get(row.fromId) ?? 0) + 1);
       }
-      if (row.fromId !== row.toRef && candidateSet.has(row.toRef) && activePeers.has(row.fromId)) {
+      if (candidateSet.has(row.toRef) && activePeers.has(row.fromId)) {
         linkCounts.set(row.toRef, (linkCounts.get(row.toRef) ?? 0) + 1);
       }
     }
@@ -875,6 +892,8 @@ export function loadActivationInputs(
 
   // Derived similar_edges count at 0.5 weight each.
   const similarCounts = new Map<string, number>();
+  // Same chunking overlap for similar_edges: count each stored row once.
+  const seenSimilar = new Set<string>();
   for (const ids of chunk(candidateIds)) {
     const rows = db
       .prepare(
@@ -883,6 +902,9 @@ export function loadActivationInputs(
       )
       .all(scope, ...ids, ...ids) as unknown as Array<{ a: string; b: string }>;
     for (const row of rows) {
+      const edgeKey = `${row.a}\u0000${row.b}`;
+      if (seenSimilar.has(edgeKey)) continue;
+      seenSimilar.add(edgeKey);
       if (candidateSet.has(row.a)) similarCounts.set(row.a, (similarCounts.get(row.a) ?? 0) + 1);
       if (candidateSet.has(row.b)) similarCounts.set(row.b, (similarCounts.get(row.b) ?? 0) + 1);
     }
