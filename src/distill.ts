@@ -14,20 +14,11 @@
  * - Model context is same-scope, bounded, and untrusted: at most 6 active
  *   same-scope peer snippets, clipped to fit llm.maxPromptChars. Bodies are
  *   never executed, never echoed into audit/errors.
- * - Two-stage model judgment (probe-grounded, see src/llm.ts). Stage 1 is a
- *   single-label retire classification (KEEP-type: FACT, PREFERENCE,
- *   OPINION, PLAN, EVENT, RELATIONSHIP, PROJECT; DROP-type: GREETING,
- *   TRANSIENT, CHATOPS; exact label, uncertain keeps). It runs ONLY when
- *   llm.backend === "openai": the pinned ONNX Qwen2.5-1.5B gate demonstrably
- *   mis-retired lasting facts (live audit: 108/158 retired, every one
- *   LOW_SIGNAL from the old gate, median ~5 min after creation), so the ONNX
- *   backend skips stage 1 and goes straight to merge/keep. DROP candidates
- *   pass deterministic guards (any record_links in/out, or note_heat
- *   usedCount > 0 => keep) and a grace period: while the record is younger
- *   than cultivation.retireMinAgeMs the review is deferred to
- *   createdAt + retireMinAgeMs WITHOUT counting a failure (attempts
- *   unchanged, no apply); a later drain re-runs the gate and guards. Then
- *   (2) a positional merge/keep choice (peers shown as numbers 1..N, model
+ * - Distill never retires. Retirement is decided ONLY by the combined
+ *   retention score in maintain.activation (nature + importance); the old
+ *   stage-1 retire gate, ONNX-skip rule, deterministic retire guards, and
+ *   minimum-age grace period are gone. Distill keeps the merge/
+ *   consolidation stages: (2) a positional merge/keep choice (peers shown as numbers 1..N, model
  *   replies MERGE <n> or KEEP; code maps the position to the actual
  *   same-scope bounded peer shown there — the model never names ids), then
  *   (3) a shared-fact confirmation for any proposed merge (model states the
@@ -51,8 +42,8 @@
  *   audited keep (no-change); inference failures mark the review failed for
  *   bounded retry (no apply at all); stale apply results are per-action
  *   no-change via applyCultivationBatch.
- * - No deletes, no TTL, no age-only retirement anywhere (the grace period
- *   only delays a model DROP; age alone never retires). Consolidation only
+ * - No deletes, no TTL, no retirement in distill at all (retirement lives in
+ *   maintain.activation's combined retention score). Consolidation only
  *   INSERTs summary rows; sources are never auto-retired.
  * - No model (disabled section or missing files) => degraded OK with zero
  *   applies and zero review changes (no fake decisions, no heuristics).
@@ -71,11 +62,9 @@ import {
   type SourceRef,
 } from "./sourceref.js";
 import {
-  RETIRE_REASONS,
   acquireCultivationLease,
   applyCultivationBatch,
   completeCultivationReview,
-  deferCultivationReview,
   dequeueCultivationBatch,
   encodeCultivationCursor,
   releaseCultivationLease,
@@ -86,16 +75,13 @@ import {
   activeModelLabel,
   buildConfirmPrompt,
   buildMergePrompt,
-  buildRetireGatePrompt,
   buildSummaryPrompt,
   generateCompletion,
-  llmBackend,
   llmUsable,
   llmMaxNewTokens,
   llmMaxPromptChars,
   llmTimeoutMs,
   parseMergeChoice,
-  parseRetireGate,
   parseSharedFact,
   parseSummaryBody,
   resolveLlmDir,
@@ -105,8 +91,6 @@ import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol
 import { isScopeAuthorized } from "./store.js";
 
 export const DISTILL_OP = "maintain.distill";
-/** Model-driven retire always files this fixed reason (transient/low-signal). */
-export const DISTILL_RETIRE_REASON = "LOW_SIGNAL" as (typeof RETIRE_REASONS)[number];
 /** Provenance source stamped on model-drafted summaries (contains "derived" for empty-ref rules). */
 export const DISTILL_SUMMARY_SOURCE = "cultivation:llm-derived";
 /** Bounded peer context per review (same-scope active snippets, untrusted). */
@@ -255,27 +239,6 @@ function loadRecord(db: DatabaseSync, id: string): RecordRow | null {
   }
 }
 
-/**
- * Deterministic retire guards (checked before any auto-retire): a record that
- * is referenced by any canonical link (outbound or backlink), or whose note
- * heat has been used at least once, is kept regardless of the model label.
- * A failed guard query conservatively keeps as well.
- */
-function retireBlockedByGuards(db: DatabaseSync, recordId: string): boolean {
-  try {
-    const link = db
-      .prepare(`SELECT 1 AS one FROM record_links WHERE fromId = ? OR toRef = ? LIMIT 1`)
-      .get(recordId, recordId) as { one: number } | undefined;
-    if (link) return true;
-    const heat = db
-      .prepare(`SELECT usedCount FROM note_heat WHERE recordId = ?`)
-      .get(recordId) as { usedCount: number } | undefined;
-    return !!heat && typeof heat.usedCount === "number" && heat.usedCount > 0;
-  } catch {
-    return true;
-  }
-}
-
 function loadPeers(db: DatabaseSync, scope: string, selfId: string): Array<{ id: string; body: string }> {
   try {
     return db
@@ -341,8 +304,6 @@ interface PlannedItem {
    */
   action: CultivationAction | null;
   retry: boolean;
-  /** Grace-period deferral: return the row to pending at nextAt, no attempt. */
-  defer?: { nextAt: string };
 }
 
 /**
@@ -460,13 +421,6 @@ export async function maintainDistill(
     const maxNewTokens = llmMaxNewTokens(config);
     const maxPromptChars = llmMaxPromptChars(config);
     const maintenanceMs = maintenanceTimeoutMs(config);
-    // Auto-retirement is enabled ONLY on the OpenAI-compatible backend. The
-    // pinned ONNX Qwen2.5-1.5B gate demonstrably mis-retired lasting content
-    // (live audit: 108/158 retired, all LOW_SIGNAL, median ~5 min after
-    // creation), so with ONNX the gate is skipped and the review continues to
-    // the merge/keep stage (consolidation behavior is unchanged).
-    const autoRetire = llmBackend(config) === "openai";
-    const bounds = cultivationBounds(config);
     const startedMs = Date.now();
     const overDeadline = (): boolean => Date.now() - startedMs > maintenanceMs;
     // Renewal clock: production heartbeats use a fresh wall-clock timestamp
@@ -542,65 +496,6 @@ export async function maintainDistill(
         continue;
       }
       const peers = loadPeers(db, p.scope, target.id);
-      // Stage 1 (retention gate, OpenAI backend only): exact label
-      // classification. DROP labels are retire candidates; KEEP labels
-      // continue to merge/keep; uncertain/invalid => audited keep, never a
-      // mutation. With ONNX the gate is skipped entirely (see autoRetire).
-      if (autoRetire) {
-        let gateRaw: string | null = null;
-        try {
-          gateRaw = await decide(buildRetireGatePrompt(target.body, maxPromptChars), Math.min(maxNewTokens, 32));
-        } catch {
-          gateRaw = null;
-        }
-        if (gateRaw === null) {
-          inferencePoisoned = true; // uncancelled inference: stop issuing model calls
-          planned.push({ review, action: null, retry: true }); // inference failure => retry, no apply
-          if (!renewOrAbort()) {
-            settleOwned(items.map((it) => it.queueId));
-            return budgeted(overDeadline() ? fail("TIMEOUT") : conflict(), config);
-          }
-          continue;
-        }
-        const gate = parseRetireGate(gateRaw);
-        if (gate.kind === "uncertain") {
-          planned.push({ review, action: keepOf(target.id, target.revision), retry: false });
-          continue;
-        }
-        if (gate.kind === "retire") {
-          // Deterministic guards: linked records and records that were
-          // actually used are kept regardless of the model label.
-          if (retireBlockedByGuards(db, target.id)) {
-            planned.push({ review, action: keepOf(target.id, target.revision), retry: false });
-            continue;
-          }
-          // Grace period keyed on the RECORD's createdAt: a young DROP
-          // candidate is deferred to createdAt + retireMinAgeMs without
-          // counting a failure (attempts unchanged, no apply). The later
-          // drain re-runs the gate and guards.
-          const createdMs = Date.parse(target.createdAt);
-          if (!Number.isFinite(createdMs)) {
-            planned.push({ review, action: keepOf(target.id, target.revision), retry: false });
-            continue;
-          }
-          const nowMs = Date.parse(nowValid);
-          if (!Number.isFinite(nowMs) || nowMs - createdMs < bounds.retireMinAgeMs) {
-            planned.push({
-              review,
-              action: null,
-              retry: false,
-              defer: { nextAt: new Date(createdMs + bounds.retireMinAgeMs).toISOString() },
-            });
-            continue;
-          }
-          planned.push({
-            review,
-            action: { recordId: target.id, action: "retire", reasonCode: DISTILL_RETIRE_REASON, expectedRevision: target.revision, expectedStatus: "active" },
-            retry: false,
-          });
-          continue;
-        }
-      }
       // Stage 2a (positional merge/keep): at least 2 peers must be shown for
       // a real choice; a single peer cannot demonstrate one. The model names
       // a position, code resolves it to the peer actually shown there.
@@ -813,7 +708,7 @@ export async function maintainDistill(
         const byId = new Map(results.map((r) => [r.recordId, r]));
         for (const pl of planned) {
           if (pl.action === null) {
-            if (!pl.defer) failedIds.push(pl.review.queueId);
+            failedIds.push(pl.review.queueId);
             continue;
           }
           const r = byId.get(pl.action.recordId);
@@ -827,30 +722,20 @@ export async function maintainDistill(
         // under this batch go back for bounded retry; the rest stay with the
         // owner/reclaim path. On STORE_UNAVAILABLE with the lease still held
         // the guard matches every owned row (same outcome as before).
-        for (const pl of planned) if (!pl.defer) failedIds.push(pl.review.queueId);
+        for (const pl of planned) failedIds.push(pl.review.queueId);
         settleOwned(failedIds);
-        // Grace-period deferrals are independent of the failed apply batch:
-        // settle them without counting a failure (ownership-guarded).
-        for (const pl of planned) {
-          if (pl.defer) deferCultivationReview(db, config, pl.review.queueId, { nextAt: pl.defer.nextAt, guard: batchId ? { batchId } : undefined });
-        }
         // res is a failure envelope here (never OK): propagate its fixed code.
         const code = (res.code === "OK" ? "STORE_UNAVAILABLE" : res.code) as Exclude<ResponseEnvelope["code"], "OK">;
         return budgeted(fail(code), config);
       }
     } else {
-      for (const pl of planned) if (!pl.defer) failedIds.push(pl.review.queueId);
+      for (const pl of planned) failedIds.push(pl.review.queueId);
     }
 
-    // --- Settle phase: deferred rows go back to pending (no attempt);
-    // decided reviews done; inference failures failed (bounded retry).
+    // --- Settle phase: decided reviews done; inference failures failed
+    // (bounded retry). Distill has no deferral path.
     let failed = 0;
-    let deferred = 0;
     for (const pl of planned) {
-      if (pl.defer) {
-        if (deferCultivationReview(db, config, pl.review.queueId, { nextAt: pl.defer.nextAt, guard: batchId ? { batchId } : undefined })) deferred++;
-        continue;
-      }
       if (pl.action === null && pl.retry) {
         if (completeCultivationReview(db, config, pl.review.queueId, "failed", nowValid)) failed++;
       } else {
@@ -864,7 +749,7 @@ export async function maintainDistill(
     const last = items.length > 0 ? items[items.length - 1]! : null;
     const nextCursor = last ? encodeCultivationCursor(last.nextAt, last.queueId) : p.cursor;
     const stored = budgeted(
-      ok({ distill: { applied, reviewed: items.length, failed, deferred, batchId, nextCursor, degraded: false, ...modelLabel } }),
+      ok({ distill: { applied, reviewed: items.length, failed, deferred: 0, batchId, nextCursor, degraded: false, ...modelLabel } }),
       config,
     );
     try {

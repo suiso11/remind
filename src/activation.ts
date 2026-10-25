@@ -53,10 +53,9 @@ import {
 } from "./cultivation.js";
 import {
   generateCompletion,
-  llmEnabled,
   llmMaxPromptChars,
   llmTimeoutMs,
-  modelFilesPresent as llmModelFilesPresent,
+  llmUsable,
   resolveLlmDir,
 } from "./llm.js";
 import {
@@ -99,7 +98,12 @@ export interface ActivationParams {
   minAgeHours: number;
   wImportance: number;
   wKind: Record<ActivationKind, number>;
-  reconsiderLegacy: boolean;
+  wNature: Record<NatureLabel, number>;
+  wLinks: number;
+  expiryGraceDays: number;
+  wExpired: number;
+  wConsolidated: number;
+  minAgeHoursByNature: Partial<Record<NatureLabel, number>>;
 }
 
 export const ACTIVATION_DEFAULTS: ActivationParams = {
@@ -114,51 +118,204 @@ export const ACTIVATION_DEFAULTS: ActivationParams = {
     summary: 0.3,
     correction: 1.0,
   },
-  reconsiderLegacy: true,
+  wNature: {
+    FACT: 1.0,
+    PREFERENCE: 1.0,
+    RELATIONSHIP: 1.2,
+    PROJECT: 1.0,
+    OPINION: 0.6,
+    PLAN: 0.6,
+    EVENT: 0.4,
+    EMOTION: -0.8,
+    TRANSIENT: -1.5,
+    GREETING: -2.5,
+    CHATOPS: -2.0,
+  },
+  wLinks: 0.8,
+  expiryGraceDays: 3,
+  wExpired: 2.0,
+  wConsolidated: 0.5,
+  minAgeHoursByNature: {
+    GREETING: 24,
+    CHATOPS: 24,
+    EMOTION: 72,
+    TRANSIENT: 72,
+  },
 };
 
-/** Token budget for the one-digit importance answer. */
-const IMPORTANCE_TOKEN_BUDGET = 8;
+/** Nature labels produced by the combined retention classifier. */
+export const NATURE_LABELS = [
+  "FACT",
+  "PREFERENCE",
+  "OPINION",
+  "PLAN",
+  "EVENT",
+  "RELATIONSHIP",
+  "PROJECT",
+  "EMOTION",
+  "TRANSIENT",
+  "GREETING",
+  "CHATOPS",
+] as const;
+export type NatureLabel = (typeof NATURE_LABELS)[number];
+
+export interface NatureClassification {
+  nature: NatureLabel;
+  importance: number;
+}
 
 /**
- * Japanese ChatML prompt for importance scoring. The few-shot examples are
- * deliberately generic (no domain vocabulary), so the model learns the
- * retention semantics rather than copying corpus nouns. A missing score
- * (model disabled/missing/failed) is neutral, never an implicit zero.
+ * Token budget for the combined nature+importance JSON answer. The old
+ * one-digit budget (8) was too tight for a JSON object once the model emitted
+ * any prefix/thinking token; the strict parser below still accepts surrounding
+ * prose, but the budget must leave room for the object itself.
  */
-export function buildImportancePrompt(body: string, maxPromptChars = 2000): string {
+const CLASSIFIER_TOKEN_BUDGET = 64;
+
+/**
+ * Classifier prompt/semantics version. Bump this whenever the definitions or
+ * few-shot examples change: the value is persisted in record_importance.source
+ * ("llm:v2"), and selectUnscored treats rows stamped with an older version as
+ * unscored so a prompt change rescans the corpus once.
+ */
+export const CLASSIFIER_VERSION = "v2";
+/** Value written to record_importance.source for the current classifier. */
+export const CLASSIFIER_SOURCE = `llm:${CLASSIFIER_VERSION}`;
+
+/**
+ * Japanese ChatML prompt for the ONE combined retention classifier.
+ *
+ * The single call returns the nature label plus the 0-3 importance in strict
+ * JSON, so maintain.activation has one consistent retention signal instead of
+ * two independent gates. Definitions are generic and never keyword-scanned
+ * from the body. The body is clipped to the remaining character budget and the
+ * assistant cue is preserved (tailClip-equivalent guard below) so the ChatML
+ * conversion to the OpenAI backend always sees a complete prefill.
+ *
+ * Boundary rules (v2): CHATOPS is ONLY operating this assistant/conversation
+ * itself (search requests, remarks about tone/persona/mistakes, "can you do
+ * X", "anything else to talk about") with no lasting content. A question or
+ * request ABOUT a topic in the world reveals the user's interest and is
+ * PREFERENCE (or OPINION when it states a stance). Things the user builds,
+ * changes, or names (models, projects, tools, features to add) are PROJECT.
+ * Feelings about a person are RELATIONSHIP (or EMOTION when momentary).
+ * GREETING is only greetings/goodnight/thanks/compliments with no other
+ * content.
+ */
+export function buildClassifierPrompt(body: string, maxPromptChars = 2000): string {
   const head =
     "<|im_start|>system\n" +
-    "あなたは記憶の重要度評価器です。記憶が長期的にユーザーを理解するのにどれほど役立つかを0〜3で評価してください。\n" +
-    "3: 長く続く好み・所有物・人間関係・予定・アイデンティティに関する事実\n" +
+    "あなたは記憶の保持価値を判定する分類器です。記憶を読み、nature ラベルと重要度 importance を1つのJSONで返してください。\n" +
+    "基本方針: 世界の話題についての質問・依頼は、その話題へのユーザーの関心を示す。\n" +
+    "nature は次のいずれか1つだけ:\n" +
+    "FACT: ユーザー本人・持ち物・環境（使用中のモデル・ツールを含む）について長く続く事実\n" +
+    "PREFERENCE: 好き嫌い・好み・こだわり・関心・習慣・傾向（話題についての質問や依頼も、その話題への興味として PREFERENCE）\n" +
+    "OPINION: 意見・信念・判断・立場（話題について自分の考えを述べた場合）\n" +
+    "PLAN: 今後やろうとしていること・目標\n" +
+    "EVENT: その日を超えて意味のある出来事\n" +
+    "RELATIONSHIP: 人物・集団・関係性、特定の人物への好意・可愛い/好きという感情（対象が人なら PREFERENCE ではなく RELATIONSHIP）\n" +
+    "PROJECT: ユーザーが作る・変える・名付けるもの（モデル・プロジェクト・ツール・追加したい機能・使用モデルの差し替えや設定変更）\n" +
+    "EMOTION: その時点の気持ち・感情（持続する性質ではない）\n" +
+    "TRANSIENT: 天気・体調・当日の予定など一日限りの状態\n" +
+    "GREETING: 挨拶・おやすみ・感謝・褒め言葉のみ（他に内容がない場合だけ）\n" +
+    "CHATOPS: このアシスタントや会話そのものへの操作・会話運用だけ（検索依頼、口調・人格・誤りへの言及、できるか尋ねる、「他に話すことある？」など）。世界の話題についての質問、利用モデルやツールの構成変更、ユーザーの傾向・習慣の記述は含めない\n" +
+    "importance は 0〜3 の整数:\n" +
+    "3: 長期的にユーザー理解へ役立つ（持続する事実・好み・人間関係・計画・プロジェクト）\n" +
     "2: 後で役立つ文脈\n" +
-    "1: 些細な情報\n" +
-    "0: 一時的な気分や一度きりの雑談\n" +
-    "出力は数字1文字だけ。説明や文は書かないでください。\n" +
-    "例：\n" +
-    "「コーヒーはブラックが好き」→ 3\n" +
-    "「週末は図書館へ行く予定」→ 3\n" +
-    "「会議は3階で行われる」→ 2\n" +
-    "「今日は少し疲れた」→ 0\n" +
+    "1: 些細だが記録する価値がある\n" +
+    "0: 一時的・社交的なだけ\n" +
+    "例:\n" +
+    "「その小説の主人公について教えて」→ {\"nature\":\"PREFERENCE\",\"importance\":2}\n" +
+    "「最近の為替についてどう思う？」→ {\"nature\":\"OPINION\",\"importance\":2}\n" +
+    "「自作アプリに通知機能を追加したい」→ {\"nature\":\"PROJECT\",\"importance\":3}\n" +
+    "「利用モデルを別のものに差し替えた」→ {\"nature\":\"PROJECT\",\"importance\":3}\n" +
+    "「同僚の佐藤さんは頼りになる」→ {\"nature\":\"RELATIONSHIP\",\"importance\":3}\n" +
+    "「今日は少し疲れた」→ {\"nature\":\"EMOTION\",\"importance\":1}\n" +
+    "「明日は雨らしい」→ {\"nature\":\"TRANSIENT\",\"importance\":0}\n" +
+    "「君は音声で話せる？」→ {\"nature\":\"CHATOPS\",\"importance\":0}\n" +
+    "「さっきの返答は間違っていた。もっと砕けて話して」→ {\"nature\":\"CHATOPS\",\"importance\":0}\n" +
+    "「おやすみ、ありがとう」→ {\"nature\":\"GREETING\",\"importance\":0}\n" +
+    "出力はJSONオブジェクト1つだけ。前後に説明を書かない。例: {\"nature\":\"PREFERENCE\",\"importance\":3}\n" +
     "<|im_end|>\n" +
     "<|im_start|>user\n";
   const tail = "<|im_end|>\n<|im_start|>assistant\n";
   const room = Math.max(1, maxPromptChars - countCp(head) - countCp(tail));
   const cps = [...body];
   const shown = cps.length > room ? cps.slice(0, room).join("") : body;
-  return head + shown + tail;
+  const full = head + shown + tail;
+  // Guard: if the caller's cap is smaller than head+tail, keep the assistant
+  // cue so the ChatML split still yields a valid messages array.
+  if (countCp(full) <= maxPromptChars) return full;
+  const headTailOnly = head + tail;
+  if (countCp(headTailOnly) <= maxPromptChars) return headTailOnly;
+  return tail;
+}
+
+/** Remove complete or unterminated think blocks before JSON extraction. */
+function stripClassifierThinking(raw: string): string {
+  return raw
+    .replace(/<think(?:ing)?\b[^>]*>[\s\S]*?<\/think(?:ing)?>/gi, " ")
+    .replace(/<think(?:ing)?\b[^>]*>[\s\S]*$/i, " ");
 }
 
 /**
- * Strict importance parser: trim surrounding whitespace and accept exactly one
- * digit in 0..3. Anything else (words, punctuation, multi-digit, multi-line
- * answers) is null so the caller can leave the record unscored.
+ * Extract the first balanced JSON object from model output, ignoring braces
+ * inside strings. Returns null when no complete object exists. Prose before or
+ * after the object is tolerated (models often prefix an explanation).
  */
-export function parseImportance(raw: string | null | undefined): number | null {
-  if (typeof raw !== "string") return null;
-  const trimmed = raw.trim();
-  if (!/^[0-3]$/.test(trimmed)) return null;
-  return Number(trimmed);
+function firstJsonObject(raw: string): string | null {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return raw.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Strict combined-classifier parser. Accepts surrounding prose/thinking, then
+ * requires exactly one JSON object with exactly the keys `nature` and
+ * `importance`, an exact label from NATURE_LABELS, and an integer 0..3.
+ * Anything else (wrong/missing label, float/string/out-of-range importance,
+ * extra keys, arrays, non-string input) is null so the caller leaves the
+ * record unscored and counts a scoring failure.
+ */
+export function parseNatureClassification(raw: string | null | undefined): NatureClassification | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 8000) return null;
+  if (hasControl(raw.replace(/\n/g, ""))) return null;
+  const cleaned = stripClassifierThinking(raw);
+  const jsonText = firstJsonObject(cleaned);
+  if (jsonText === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const rec = parsed as Record<string, unknown>;
+  const keys = Object.keys(rec);
+  if (keys.length !== 2 || !keys.includes("nature") || !keys.includes("importance")) return null;
+  const nature = rec["nature"];
+  const importance = rec["importance"];
+  if (typeof nature !== "string" || !(NATURE_LABELS as readonly string[]).includes(nature)) return null;
+  if (typeof importance !== "number" || !Number.isInteger(importance) || importance < 0 || importance > 3) return null;
+  return { nature: nature as NatureLabel, importance };
 }
 
 /** Maximum candidate records considered by one preview scan. */
@@ -180,6 +337,16 @@ export interface ActivationInput {
   body: string;
   /** Derived importance, or null when absent/stale. */
   importance: number | null;
+  /** Combined-classifier nature label, or null when unscored/stale. */
+  nature: NatureLabel | null;
+  /** Canonical active same-scope links plus 0.5 per similar edge. */
+  links: number;
+  /** Latest absolute date in the body is past the expiry grace (PLAN/EVENT/TRANSIENT). */
+  expired: boolean;
+  /** An active cluster summary cites this record (record_links from). */
+  consolidated: boolean;
+  /** Latest metadata-only reactivation reason, or null. */
+  latestReactivationReason: string | null;
   /** Feedback/usage count from note_heat (0 when no heat row). */
   uses: number;
   /** Additional event timestamps (usage/correction/reactivation/predecessor). */
@@ -205,17 +372,48 @@ function clamp01(n: number): number {
   return n;
 }
 
+export interface RetentionFactors {
+  base: number;
+  kind: number;
+  importance: number;
+  nature: number;
+  links: number;
+  expired: number;
+  consolidated: number;
+  total: number;
+}
+
+type RetentionInput = Pick<
+  ActivationInput,
+  "kind" | "createdAt" | "importance" | "eventTimes"
+> &
+  Partial<Pick<ActivationInput, "nature" | "links" | "expired" | "consolidated">>;
+
 /**
- * Pure ACT-R activation score. Deterministic for a given input/params/now.
+ * Multi-factor retention factors. `base` is the ACT-R base-level activation
+ * (createdAt + usage/feedback + predecessor usage + corrections +
+ * reactivations, with decay d); the remaining factors are additive. Missing
+ * optional signals contribute zero, except importance (neutral 0.5).
  * Invalid event timestamps are ignored; no usable event time yields -Infinity.
  */
-export function computeActivation(
-  input: Pick<ActivationInput, "kind" | "createdAt" | "importance" | "eventTimes">,
+export function computeRetentionFactors(
+  input: RetentionInput,
   params: ActivationParams,
   now: string | number | Date,
-): number {
+): RetentionFactors {
   const nowMs = toMs(now);
-  if (nowMs === null) return Number.NaN;
+  if (nowMs === null) {
+    return {
+      base: Number.NaN,
+      kind: 0,
+      importance: 0,
+      nature: 0,
+      links: 0,
+      expired: 0,
+      consolidated: 0,
+      total: Number.NaN,
+    };
+  }
   let sum = 0;
   const times: Array<string | number> = [input.createdAt, ...input.eventTimes];
   for (const t of times) {
@@ -224,10 +422,69 @@ export function computeActivation(
     const hours = Math.max((nowMs - ms) / 3_600_000, 1);
     sum += Math.pow(hours, -params.decay);
   }
-  if (sum <= 0) return Number.NEGATIVE_INFINITY;
-  const importance = clamp01(input.importance ?? 0.5);
-  const kindWeight = params.wKind[input.kind] ?? 0;
-  return Math.log(sum) + kindWeight + params.wImportance * importance;
+  const base = sum <= 0 ? Number.NEGATIVE_INFINITY : Math.log(sum);
+  const importanceValue = clamp01(input.importance ?? 0.5);
+  const kind = params.wKind[input.kind] ?? 0;
+  const importance = params.wImportance * importanceValue;
+  const nature = input.nature ? params.wNature[input.nature] ?? 0 : 0;
+  const linkCount = Math.max(0, input.links ?? 0);
+  const links = params.wLinks * Math.log(1 + linkCount);
+  const expired = input.expired === true ? -params.wExpired : 0;
+  const consolidated =
+    input.consolidated === true && importanceValue < 2 / 3 ? -params.wConsolidated : 0;
+  return {
+    base,
+    kind,
+    importance,
+    nature,
+    links,
+    expired,
+    consolidated,
+    total: base + kind + importance + nature + links + expired + consolidated,
+  };
+}
+
+/** Total retention score R (sum of computeRetentionFactors). */
+export function computeActivation(
+  input: RetentionInput,
+  params: ActivationParams,
+  now: string | number | Date,
+): number {
+  return computeRetentionFactors(input, params, now).total;
+}
+
+/** Auto-retirement reason codes that may be reconsidered by activation. */
+export const AUTO_RETIRE_REASONS = ["LOW_ACTIVATION", "LOW_SIGNAL", "OUTDATED", "CONSOLIDATED"] as const;
+
+/** Per-nature retirement age, falling back to the global minAgeHours. */
+export function minAgeHoursFor(nature: NatureLabel | null | undefined, params: ActivationParams): number {
+  if (nature) {
+    const override = params.minAgeHoursByNature[nature];
+    if (typeof override === "number" && Number.isFinite(override)) return override;
+  }
+  return params.minAgeHours;
+}
+
+export interface RetirementReasonFactors {
+  expired: number;
+  consolidated: number;
+  total: number;
+}
+
+/**
+ * Dominant retirement cause for the audit reasonCode: an applied expiry
+ * penalty is OUTDATED; otherwise a consolidated penalty that alone pushed the
+ * score below tauRetire is CONSOLIDATED; everything else is LOW_ACTIVATION.
+ */
+export function retirementReason(
+  factors: RetirementReasonFactors,
+  params: ActivationParams,
+): "OUTDATED" | "CONSOLIDATED" | "LOW_ACTIVATION" {
+  if (factors.expired < 0) return "OUTDATED";
+  if (factors.consolidated < 0 && factors.total < params.tauRetire && factors.total - factors.consolidated >= params.tauRetire) {
+    return "CONSOLIDATED";
+  }
+  return "LOW_ACTIVATION";
 }
 
 /** Age in hours, clamped at 0 for clock skew/future creation times. */
@@ -241,41 +498,92 @@ export function activationAgeHours(
   return Math.max((nowMs - createdMs) / 3_600_000, 0);
 }
 
+/** Latest absolute date in the body (UTC midnight), or null if none. */
+export function latestAbsoluteDateMs(body: string): number | null {
+  let latest: number | null = null;
+  const consider = (y: number, m: number, d: number): void => {
+    if (m < 1 || m > 12 || d < 1 || d > 31) return;
+    const ms = Date.UTC(y, m - 1, d);
+    const dt = new Date(ms);
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return;
+    if (latest === null || ms > latest) latest = ms;
+  };
+  for (const m of body.matchAll(/(\d{4})-(\d{2})-(\d{2})/g)) {
+    consider(Number(m[1]), Number(m[2]), Number(m[3]));
+  }
+  for (const m of body.matchAll(/(\d{4})年(\d{1,2})月(\d{1,2})日/g)) {
+    consider(Number(m[1]), Number(m[2]), Number(m[3]));
+  }
+  return latest;
+}
+
 /**
- * Hysteresis gate. Active rows retire only below tauRetire and only after
- * minAgeHours. Retired rows reactivate only below the (higher) tauReactivate
- * threshold and only when the latest retirement was activation-driven
- * (LOW_ACTIVATION, or legacy LOW_SIGNAL when reconsiderLegacy is enabled).
+ * Deterministic date expiry signal: only PLAN/EVENT/TRANSIENT bodies are
+ * considered. True when the latest absolute date (YYYY-MM-DD or
+ * YYYY年M月D日) is strictly more than `graceDays` before now.
+ */
+export function isExpiredDated(
+  body: string,
+  nature: NatureLabel | null,
+  now: string | number | Date,
+  graceDays: number,
+): boolean {
+  if (nature !== "PLAN" && nature !== "EVENT" && nature !== "TRANSIENT") return false;
+  const nowMs = toMs(now);
+  const latest = latestAbsoluteDateMs(body);
+  if (nowMs === null || latest === null) return false;
+  return nowMs - latest > graceDays * 86_400_000;
+}
+
+const CLUSTER_SUMMARY_SOURCE = "cultivation:llm-derived-cluster";
+
+export interface RetirementDecisionContext {
+  nature?: NatureLabel | null;
+  latestReactivationReason?: string | null;
+  factors?: RetirementReasonFactors;
+}
+
+/**
+ * Hysteresis gate over the multi-factor retention score R.
+ *
+ * Active rows retire when R < tauRetire and age >= the nature-aware minimum
+ * age (minAgeHoursByNature, else minAgeHours). A record whose latest
+ * reactivation was USER_REQUESTED is never auto-retired. Retired rows
+ * reactivate when R >= tauReactivate and the latest retirement was one of the
+ * auto-retirement causes (LOW_ACTIVATION, legacy LOW_SIGNAL, OUTDATED,
+ * CONSOLIDATED); user-driven NO_LONGER_USEFUL retirements stay retired.
  *
  * Protective margin: a record whose importance is at/above
  * `protectImportance` (default 0.66 ≈ 2/3) is never retired at the normal
- * threshold; it retires only if A falls below `tauRetire - 1`. This keeps a
+ * threshold; it retires only if R falls below `tauRetire - 1`. This keeps a
  * model-scored lasting fact from being dropped by recency/frequency alone.
  */
 export function retireDecision(
-  A: number,
+  R: number,
   status: ActivationStatus,
   retireReason: string | null,
   ageHours: number,
   params: ActivationParams,
   importance: number | null = null,
   protectImportance = 0.66,
+  ctx: RetirementDecisionContext = {},
 ): ActivationDecision {
   if (status === "active") {
-    const belowRetire = A < params.tauRetire;
-    if (!belowRetire || ageHours < params.minAgeHours) return "keep";
+    if (ctx.latestReactivationReason === "USER_REQUESTED") return "keep";
+    const belowRetire = R < params.tauRetire;
+    if (!belowRetire || ageHours < minAgeHoursFor(ctx.nature, params)) return "keep";
     const protectedImportance =
       importance !== null &&
       Number.isFinite(importance) &&
       importance >= protectImportance;
-    if (protectedImportance && A >= params.tauRetire - 1) return "keep";
+    if (protectedImportance && R >= params.tauRetire - 1) return "keep";
     return "retire";
   }
   if (status === "retired") {
     const activationDriven =
-      retireReason === "LOW_ACTIVATION" ||
-      (params.reconsiderLegacy && retireReason === "LOW_SIGNAL");
-    return activationDriven && A >= params.tauReactivate ? "reactivate" : "keep";
+      retireReason !== null &&
+      (AUTO_RETIRE_REASONS as readonly string[]).includes(retireReason);
+    return activationDriven && R >= params.tauReactivate ? "reactivate" : "keep";
   }
   return "keep";
 }
@@ -334,6 +642,10 @@ export interface LoadActivationOptions {
    * bounded window across passes.
    */
   after?: ActivationAfter;
+  /** Evaluation clock for the deterministic date-expiry signal. */
+  now?: string;
+  /** Date-expiry grace in days (default 3). */
+  expiryGraceDays?: number;
 }
 
 /**
@@ -454,18 +766,20 @@ export function loadActivationInputs(
 
   // Reactivation events (metadata-only audit).
   const reactivationTimes = new Map<string, string[]>();
+  const latestReactivationReasons = new Map<string, string | null>();
   for (const ids of chunk(candidateIds)) {
     const found = db
       .prepare(
-        `SELECT targetId, ts FROM audit
+        `SELECT targetId, ts, reasonCode FROM audit
           WHERE op = 'record.reactivate' AND targetId IN (${placeholders(ids.length)})
           ORDER BY ts ASC, rowid ASC`,
       )
-      .all(...ids) as unknown as Array<{ targetId: string; ts: string }>;
+      .all(...ids) as unknown as Array<{ targetId: string; ts: string; reasonCode: string | null }>;
     for (const row of found) {
       const list = reactivationTimes.get(row.targetId);
       if (list) list.push(row.ts);
       else reactivationTimes.set(row.targetId, [row.ts]);
+      latestReactivationReasons.set(row.targetId, row.reasonCode);
     }
   }
 
@@ -501,23 +815,97 @@ export function loadActivationInputs(
     for (const row of found) retireReasons.set(row.targetId, row.reasonCode);
   }
 
-  // Derived importance, only when it still matches the current bodyHash.
-  const importance = new Map<string, { value: number; bodyHash: string }>();
+  // Derived importance/nature, only while they still match the current bodyHash.
+  const importance = new Map<string, { value: number; bodyHash: string; nature: string | null }>();
   for (const ids of chunk(candidateIds)) {
     const found = db
       .prepare(
-        `SELECT recordId, importance, bodyHash FROM record_importance WHERE recordId IN (${placeholders(ids.length)})`,
+        `SELECT recordId, importance, bodyHash, nature FROM record_importance WHERE recordId IN (${placeholders(ids.length)})`,
       )
       .all(...ids) as unknown as Array<{
       recordId: string;
       importance: number;
       bodyHash: string;
+      nature: string | null;
     }>;
     for (const row of found) {
-      importance.set(row.recordId, { value: row.importance, bodyHash: row.bodyHash });
+      importance.set(row.recordId, {
+        value: row.importance,
+        bodyHash: row.bodyHash,
+        nature: row.nature,
+      });
     }
   }
   const hashOf = new Map(candidates.map((r) => [r.id, r.bodyHash]));
+
+  // Canonical links: count edges whose OTHER endpoint is active in this scope.
+  const linkCounts = new Map<string, number>();
+  for (const ids of chunk(candidateIds)) {
+    const rows = db
+      .prepare(
+        `SELECT fromId, toRef FROM record_links
+          WHERE fromId IN (${placeholders(ids.length)}) OR toRef IN (${placeholders(ids.length)})`,
+      )
+      .all(...ids, ...ids) as unknown as Array<{ fromId: string; toRef: string }>;
+    const otherIds = new Set<string>();
+    for (const row of rows) {
+      if (row.fromId !== row.toRef) {
+        otherIds.add(row.toRef);
+        otherIds.add(row.fromId);
+      }
+    }
+    const activePeers = new Set<string>();
+    for (const others of chunk([...otherIds])) {
+      const found = db
+        .prepare(
+          `SELECT id FROM records WHERE scope = ? AND status = 'active' AND id IN (${placeholders(others.length)})`,
+        )
+        .all(scope, ...others) as unknown as Array<{ id: string }>;
+      for (const row of found) activePeers.add(row.id);
+    }
+    for (const row of rows) {
+      if (row.fromId !== row.toRef && candidateSet.has(row.fromId) && activePeers.has(row.toRef)) {
+        linkCounts.set(row.fromId, (linkCounts.get(row.fromId) ?? 0) + 1);
+      }
+      if (row.fromId !== row.toRef && candidateSet.has(row.toRef) && activePeers.has(row.fromId)) {
+        linkCounts.set(row.toRef, (linkCounts.get(row.toRef) ?? 0) + 1);
+      }
+    }
+  }
+
+  // Derived similar_edges count at 0.5 weight each.
+  const similarCounts = new Map<string, number>();
+  for (const ids of chunk(candidateIds)) {
+    const rows = db
+      .prepare(
+        `SELECT a, b FROM similar_edges
+          WHERE scope = ? AND (a IN (${placeholders(ids.length)}) OR b IN (${placeholders(ids.length)}))`,
+      )
+      .all(scope, ...ids, ...ids) as unknown as Array<{ a: string; b: string }>;
+    for (const row of rows) {
+      if (candidateSet.has(row.a)) similarCounts.set(row.a, (similarCounts.get(row.a) ?? 0) + 1);
+      if (candidateSet.has(row.b)) similarCounts.set(row.b, (similarCounts.get(row.b) ?? 0) + 1);
+    }
+  }
+
+  // Cited by an ACTIVE cluster summary (record_links from -> toRef = record).
+  const consolidated = new Set<string>();
+  for (const ids of chunk(candidateIds)) {
+    const found = db
+      .prepare(
+        `SELECT l.toRef AS target FROM record_links l
+           JOIN records s ON s.id = l.fromId
+          WHERE s.scope = ? AND s.status = 'active' AND s.source = ?
+            AND l.toRef IN (${placeholders(ids.length)})
+          GROUP BY l.toRef`,
+      )
+      .all(scope, CLUSTER_SUMMARY_SOURCE, ...ids) as unknown as Array<{ target: string }>;
+    for (const row of found) consolidated.add(row.target);
+  }
+
+  const nowForExpiry =
+    options.now !== undefined && Number.isFinite(Date.parse(options.now)) ? options.now : nowIso();
+  const graceDays = Math.max(0, options.expiryGraceDays ?? 3);
 
   const timesFor = (id: string): string[] => {
     const out: string[] = [];
@@ -540,9 +928,11 @@ export function loadActivationInputs(
     eventTimes.push(...(correctionTimes.get(r.id) ?? []));
     eventTimes.push(...(reactivationTimes.get(r.id) ?? []));
     const imp = importance.get(r.id);
-    const freshImp =
-      imp !== undefined && Number.isFinite(imp.value) && imp.bodyHash === hashOf.get(r.id)
-        ? imp.value
+    const fresh = imp !== undefined && imp.bodyHash === hashOf.get(r.id);
+    const freshImp = fresh && Number.isFinite(imp.value) ? imp.value : null;
+    const freshNature =
+      fresh && imp.nature !== null && (NATURE_LABELS as readonly string[]).includes(imp.nature)
+        ? (imp.nature as NatureLabel)
         : null;
     return {
       recordId: r.id,
@@ -551,6 +941,11 @@ export function loadActivationInputs(
       createdAt: r.createdAt,
       body: r.body,
       importance: freshImp,
+      nature: freshNature,
+      links: (linkCounts.get(r.id) ?? 0) + 0.5 * (similarCounts.get(r.id) ?? 0),
+      expired: isExpiredDated(r.body, freshNature, nowForExpiry, graceDays),
+      consolidated: consolidated.has(r.id),
+      latestReactivationReason: latestReactivationReasons.get(r.id) ?? null,
       uses: heat.get(r.id)?.usedCount ?? 0,
       eventTimes,
       retireReason: retireReasons.get(r.id) ?? null,
@@ -626,8 +1021,12 @@ export interface PreviewItem {
   status: string;
   kind: string;
   label: string;
+  nature: NatureLabel | null;
   A: number;
   importance: number | null;
+  factors: RetentionFactors;
+  /** Dominant retire reason, or null when the decision is not retire. */
+  reason: "OUTDATED" | "CONSOLIDATED" | "LOW_ACTIVATION" | null;
   uses: number;
   ageHours: number;
   decision: ActivationDecision;
@@ -695,32 +1094,45 @@ export function activationPreview(
 
   let inputs: ActivationInput[];
   try {
-    inputs = loadActivationInputs(db, scope, { includeRetired });
+    inputs = loadActivationInputs(db, scope, {
+      includeRetired,
+      now,
+      expiryGraceDays: bounds.expiryGraceDays,
+    });
   } catch {
     return applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
   }
 
   const scored: PreviewItem[] = inputs.map((input) => {
-    const A = computeActivation(input, paramsForModel, now);
+    const factors = computeRetentionFactors(input, paramsForModel, now);
     const ageHours = activationAgeHours(input.createdAt, now);
+    const decision = retireDecision(
+      factors.total,
+      input.status,
+      input.retireReason,
+      ageHours,
+      paramsForModel,
+      input.importance,
+      bounds.protectImportance,
+      {
+        nature: input.nature,
+        latestReactivationReason: input.latestReactivationReason,
+        factors,
+      },
+    );
     return {
       id: input.recordId,
       status: input.status,
       kind: input.kind,
       label: labelOf(input.body, config.limits.snippetMaxCp),
-      A,
+      nature: input.nature,
+      A: factors.total,
       importance: input.importance,
+      factors,
+      reason: decision === "retire" ? retirementReason(factors, paramsForModel) : null,
       uses: input.uses,
       ageHours,
-      decision: retireDecision(
-        A,
-        input.status,
-        input.retireReason,
-        ageHours,
-        paramsForModel,
-        input.importance,
-        bounds.protectImportance,
-      ),
+      decision,
     };
   });
 
@@ -942,24 +1354,36 @@ interface UnscoredRow {
   bodyHash: string;
 }
 
-/** Active+retired records with no importance row for the current bodyHash. */
-function selectUnscored(db: DatabaseSync, scope: string, limit: number): UnscoredRow[] {
+/**
+ * Active+retired records whose ledger row is missing, stale for the current
+ * bodyHash, lacks a nature label, or was written by an older classifier
+ * version. The version check makes a prompt/definition change rescore the
+ * corpus exactly once (`source='llm:<CLASSIFIER_VERSION>'`).
+ */
+function selectUnscored(
+  db: DatabaseSync,
+  scope: string,
+  limit: number,
+  classifierSource = CLASSIFIER_SOURCE,
+): UnscoredRow[] {
   return db
     .prepare(
       `SELECT r.id AS id, r.bodyNorm AS bodyNorm, r.bodyHash AS bodyHash
          FROM records r
          LEFT JOIN record_importance i ON i.recordId = r.id
         WHERE r.scope = ? AND r.status IN ('active','retired')
-          AND (i.recordId IS NULL OR i.bodyHash <> r.bodyHash)
+          AND (i.recordId IS NULL OR i.bodyHash <> r.bodyHash OR i.nature IS NULL
+               OR i.source <> ?)
         ORDER BY r.createdAt ASC, r.id ASC
         LIMIT ?`,
     )
-    .all(scope, limit) as unknown as UnscoredRow[];
+    .all(scope, classifierSource, limit) as unknown as UnscoredRow[];
 }
 
 interface ImportanceWrite {
   recordId: string;
   importance: number;
+  nature: NatureLabel;
   bodyHash: string;
 }
 
@@ -974,15 +1398,17 @@ function writeImportance(
   try {
     if (!isCultivationLeaseHeldBy(db, fenceOwner, now)) throw new Error("lease lost");
     const stmt = db.prepare(
-      `INSERT INTO record_importance(recordId, importance, bodyHash, source, scoredAt)
-       VALUES (?, ?, ?, 'llm', ?)
+      `INSERT INTO record_importance(recordId, importance, nature, bodyHash, source, scoredAt)
+       VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(recordId) DO UPDATE SET
          importance = excluded.importance,
+         nature = excluded.nature,
          bodyHash = excluded.bodyHash,
          source = excluded.source,
          scoredAt = excluded.scoredAt`,
     );
-    for (const w of writes) stmt.run(w.recordId, w.importance, w.bodyHash, now);
+    for (const w of writes)
+      stmt.run(w.recordId, w.importance, w.nature, w.bodyHash, CLASSIFIER_SOURCE, now);
     assertDbUnderCap(db, config);
     db.exec("COMMIT");
   } catch (e) {
@@ -998,16 +1424,18 @@ function writeImportance(
 interface ActivationDecisionItem {
   id: string;
   decision: ActivationDecision;
+  reason: "OUTDATED" | "CONSOLIDATED" | "LOW_ACTIVATION" | null;
 }
 
 /**
  * Run one bounded maintain.activation pass.
  *
- * Step (a): score importance for up to `limit` active+retired records whose
- * record_importance row is missing or stale for the current bodyHash. The
- * score is stored as `digit / 3` with source='llm'. When the configured LLM is
- * disabled/missing (and no injected generator applies), scoring is skipped and
- * `degraded` is true.
+ * Step (a): classify nature + importance for up to `limit` active+retired
+ * records whose record_importance row is missing, stale for the current
+ * bodyHash, or still lacks a nature label. One strict-JSON model call per
+ * record stores nature and `importance / 3` with source='llm:<version>'. When the
+ * configured LLM is disabled/missing (and no injected generator applies),
+ * scoring is skipped and `degraded` is true.
  *
  * Step (b): compute ACT-R activation over the scope. Decisions are applied
  * only when `activation.apply` is true (default false); otherwise the response
@@ -1096,7 +1524,7 @@ export async function maintainActivation(
     }
 
     const llmModelDir = resolveLlmDir(config, configPath);
-    const modelUsable = llmEnabled(config) && llmModelFilesPresent(llmModelDir);
+    const modelUsable = llmUsable(config, llmModelDir);
     // An injected generator against a config without an llm section is the
     // test model itself (same convention as episodes/associate).
     const usable = modelUsable || (generateOverride !== undefined && config.llm === undefined);
@@ -1115,6 +1543,7 @@ export async function maintainActivation(
           generateCompletion(prompt, llmModelDir, {
             timeoutMs: llmTimeoutMs(config),
             maxNewTokens: tokens,
+            config,
             signal,
           }));
       const maxPromptChars = llmMaxPromptChars(config);
@@ -1128,7 +1557,7 @@ export async function maintainActivation(
           const run = await withLeaseHeartbeat(
             renew,
             leaseTtlMs,
-            (signal) => generate(prompt, IMPORTANCE_TOKEN_BUDGET, signal),
+            (signal) => generate(prompt, CLASSIFIER_TOKEN_BUDGET, signal),
           );
           return run.ok ? { lost: false, raw: run.value } : { lost: true, raw: null };
         } catch {
@@ -1147,18 +1576,23 @@ export async function maintainActivation(
         if (!renew()) return budgeted(conflict(), config);
         // Keep the lease alive while this inference runs; a slow scoring call
         // must not expire the lease before writeImportance's fence.
-        const run = await heartbeatGenerate(buildImportancePrompt(row.bodyNorm, maxPromptChars));
+        const run = await heartbeatGenerate(buildClassifierPrompt(row.bodyNorm, maxPromptChars));
         if (run.lost) {
           // Lease stolen/expired mid-inference: drop every pending write.
           return budgeted(conflict(), config);
         }
         const raw: string | null = run.raw;
-        const digit = parseImportance(raw);
-        if (digit === null) {
+        const classification = parseNatureClassification(raw);
+        if (classification === null) {
           scoreFailed++;
           continue;
         }
-        writes.push({ recordId: row.id, importance: digit / 3, bodyHash: row.bodyHash });
+        writes.push({
+          recordId: row.id,
+          importance: classification.importance / 3,
+          nature: classification.nature,
+          bodyHash: row.bodyHash,
+        });
       }
       if (writes.length > 0) {
         try {
@@ -1179,6 +1613,8 @@ export async function maintainActivation(
     try {
       inputs = loadActivationInputs(db, p.scope, {
         includeRetired: true,
+        now: nowValid,
+        expiryGraceDays: bounds.expiryGraceDays,
         ...(scanAfter ? { after: scanAfter } : {}),
       });
     } catch {
@@ -1190,18 +1626,27 @@ export async function maintainActivation(
     }
 
     const decisions: ActivationDecisionItem[] = inputs.map((input) => {
-      const A = computeActivation(input, bounds, nowValid);
+      const factors = computeRetentionFactors(input, bounds, nowValid);
       const ageHours = activationAgeHours(input.createdAt, nowValid);
       const decision = retireDecision(
-        A,
+        factors.total,
         input.status,
         input.retireReason,
         ageHours,
         bounds,
         input.importance,
         bounds.protectImportance,
+        {
+          nature: input.nature,
+          latestReactivationReason: input.latestReactivationReason,
+          factors,
+        },
       );
-      return { id: input.recordId, decision };
+      return {
+        id: input.recordId,
+        decision,
+        reason: decision === "retire" ? retirementReason(factors, bounds) : null,
+      };
     });
 
     const wouldRetire = decisions.filter((d) => d.decision === "retire").length;
@@ -1223,7 +1668,7 @@ export async function maintainActivation(
         const transitionParams = {
           id: item.id,
           scope: p.scope,
-          reasonCode: item.decision === "retire" ? "LOW_ACTIVATION" : "STILL_USEFUL",
+          reasonCode: item.decision === "retire" ? item.reason ?? "LOW_ACTIVATION" : "STILL_USEFUL",
         };
         const res =
           item.decision === "retire"

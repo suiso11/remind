@@ -107,10 +107,13 @@ import {
  * rotation cursor. Older 2- through 8-stamped files are migrated in place
  * (never refused), including v7 files stamped by PR #32's activation slice
  * (record_importance already present and preserved) and v8 files that already
- * hold cluster ledgers. Every CREATE in the sequence is IF NOT EXISTS, so a
- * re-run of 7 -> 9 is idempotent.
+ * hold cluster ledgers. Version 10 adds the nullable nature label to the
+ * record_importance ledger (combined nature+importance classifier); v9 files
+ * keep their scores and gain the column with NULL nature (rescore-on-null).
+ * Every CREATE in the sequence is IF NOT EXISTS, so a re-run of 7 -> 10 is
+ * idempotent.
  */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -125,6 +128,8 @@ export const LEGACY_SCHEMA_VERSION_6 = 6;
 export const LEGACY_SCHEMA_VERSION_7 = 7;
 /** Pre-consolidate-rotation-cursor stamp (v8 carries cluster_summaries); accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_8 = 8;
+/** Pre-nature-ledger stamp (v9 carries record_importance without nature); accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_9 = 9;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -462,6 +467,59 @@ export function ensureAssociateSchema(db: DatabaseSync): void {
 }
 
 /**
+ * v10 migration for the derived importance ledger: nullable `nature` plus the
+ * versioned classifier source (`llm:v2`). Existing rows written before the
+ * nature column stay NULL and activation reclassifies them. A pre-v10 source
+ * CHECK that only allows ('llm','external') is rebuilt once so the versioned
+ * source can be written; every row is copied, no canonical data is touched.
+ * Idempotent via PRAGMA table_info and sqlite_master SQL inspection.
+ */
+function ensureImportanceNatureColumn(db: DatabaseSync): void {
+  let hasNature = true;
+  try {
+    const cols = db.prepare(`PRAGMA table_info(record_importance)`).all() as Array<{ name: string }>;
+    hasNature = cols.some((c) => c.name === "nature");
+  } catch {
+    hasNature = false;
+  }
+  if (!hasNature) {
+    db.exec("SAVEPOINT ensure_importance_nature");
+    try {
+      db.exec(`ALTER TABLE record_importance ADD COLUMN nature TEXT NULL`);
+      db.exec("RELEASE SAVEPOINT ensure_importance_nature");
+    } catch (e) {
+      try { db.exec("ROLLBACK TO SAVEPOINT ensure_importance_nature"); } catch { /* preserve error */ }
+      try { db.exec("RELEASE SAVEPOINT ensure_importance_nature"); } catch { /* preserve error */ }
+      throw e;
+    }
+  }
+  const sqlRow = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='record_importance'`)
+    .get() as { sql: string | null } | undefined;
+  if (sqlRow?.sql && !sqlRow.sql.includes("llm:v2")) {
+    db.exec("SAVEPOINT ensure_importance_source");
+    try {
+      db.exec(`ALTER TABLE record_importance RENAME TO record_importance_v9`);
+      db.exec(`CREATE TABLE record_importance(
+        recordId TEXT PRIMARY KEY,
+        importance REAL NOT NULL,
+        bodyHash TEXT NOT NULL,
+        nature TEXT NULL,
+        source TEXT NOT NULL CHECK(source IN ('llm','llm:v2','external')),
+        scoredAt TEXT NOT NULL)`);
+      db.exec(`INSERT INTO record_importance(recordId, importance, bodyHash, nature, source, scoredAt)
+               SELECT recordId, importance, bodyHash, nature, source, scoredAt FROM record_importance_v9`);
+      db.exec(`DROP TABLE record_importance_v9`);
+      db.exec("RELEASE SAVEPOINT ensure_importance_source");
+    } catch (e) {
+      try { db.exec("ROLLBACK TO SAVEPOINT ensure_importance_source"); } catch { /* preserve error */ }
+      try { db.exec("RELEASE SAVEPOINT ensure_importance_source"); } catch { /* preserve error */ }
+      throw e;
+    }
+  }
+}
+
+/**
  * Whole additive-migration sequence. Callers must already hold the single
  * write lock (ensureM1Schema acquires it, or an outer transaction owns it).
  * Nested helpers use savepoints so one failure rolls back only its own step.
@@ -523,8 +581,12 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
     recordId TEXT PRIMARY KEY,
     importance REAL NOT NULL,
     bodyHash TEXT NOT NULL,
-    source TEXT NOT NULL CHECK(source IN ('llm','external')),
+    nature TEXT NULL,
+    source TEXT NOT NULL CHECK(source IN ('llm','llm:v2','external')),
     scoredAt TEXT NOT NULL)`);
+  // v10 additive migration: nullable nature label for pre-v10 ledgers.
+  // ALTER TABLE ADD COLUMN only; idempotent and savepoint-scoped.
+  ensureImportanceNatureColumn(db);
   db.exec(`CREATE TABLE IF NOT EXISTS projection_queue(recordId TEXT PRIMARY KEY, attempts INTEGER NOT NULL, nextAt TEXT NOT NULL)`);
   // Derived lexical indexes (rebuildable; never canonical).
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);

@@ -44,10 +44,8 @@ import {
 import {
   buildConfirmPrompt,
   buildMergePrompt,
-  buildRetireGatePrompt,
   buildSummaryPrompt,
   parseMergeChoice,
-  parseRetireGate,
   parseSharedFact,
   parseSummaryBody,
 } from "../src/llm.js";
@@ -751,29 +749,6 @@ describe("m3 pre-M3 migration preserves rows", () => {
 });
 
 describe("m3 two-stage gate safeguards (deterministic, no model)", () => {
-  it("retire gate labels: DROP retires, KEEP continues, anything else is uncertain", () => {
-    // DROP-type labels => retire candidate.
-    for (const label of ["GREETING", "transient", "ChatOps."]) {
-      assert.deepEqual(parseRetireGate(label), { kind: "retire" }, label);
-    }
-    assert.deepEqual(parseRetireGate("  TRANSIENT!  "), { kind: "retire" });
-    assert.deepEqual(parseRetireGate("GREETING。"), { kind: "retire" });
-    // KEEP-type labels => continue to merge/keep (never retire).
-    for (const label of ["FACT", "preference", "Opinion", "plan", "event", "relationship", "project"]) {
-      assert.deepEqual(parseRetireGate(label), { kind: "continue" }, label);
-    }
-    assert.deepEqual(parseRetireGate("FACT."), { kind: "continue" });
-    // Narrative text, the old NONE contract, unknown labels and invalid
-    // input => uncertain (caller keeps, no mutation).
-    assert.deepEqual(parseRetireGate("The cabin key is on the blue hook."), { kind: "uncertain" });
-    assert.deepEqual(parseRetireGate("NONE"), { kind: "uncertain" });
-    assert.deepEqual(parseRetireGate("TRANSIENT mood"), { kind: "uncertain" });
-    assert.deepEqual(parseRetireGate(""), { kind: "uncertain" });
-    assert.deepEqual(parseRetireGate(null), { kind: "uncertain" });
-    assert.deepEqual(parseRetireGate(42), { kind: "uncertain" });
-    assert.deepEqual(parseRetireGate("FACT\nEXTRA LINE"), { kind: "uncertain" });
-  });
-
   it("shared-fact confirmation keeps generation semantics: NONE rejects, content confirms", () => {
     assert.deepEqual(parseSharedFact("NONE"), { kind: "none" });
     assert.deepEqual(parseSharedFact("  none.  "), { kind: "none" });
@@ -808,12 +783,6 @@ describe("m3 two-stage gate safeguards (deterministic, no model)", () => {
     assert.ok(prompt.includes("1.") && prompt.includes("2."), "peers shown as numbers");
     assert.ok(!prompt.includes("rec_alpha_1") && !prompt.includes("rec_beta_2"), "no raw ids shown");
     assert.ok(prompt.length <= 2000, "bounded prompt");
-    const gate = buildRetireGatePrompt("I feel sad and low tonight", 2000);
-    for (const label of ["FACT", "PREFERENCE", "OPINION", "PLAN", "EVENT", "RELATIONSHIP", "PROJECT", "GREETING", "TRANSIENT", "CHATOPS"]) {
-      assert.ok(gate.includes(label), `gate defines ${label}`);
-    }
-    assert.ok(gate.includes("Reply with the label only"), "gate asks for one label");
-    assert.ok(gate.length <= 2000, "bounded gate prompt");
     const confirm = buildConfirmPrompt("fact a", "fact b", 2000);
     assert.ok(confirm.includes("NONE"), "confirmation explains the NONE contract");
     // Summary validation stays strict: empty/oversize/control rejected.
@@ -951,10 +920,7 @@ describe("m3 review fixes (orphan/degraded/singleflight/cursor/cancel/dup/search
     };
   }
 
-  const keepDecide = async (prompt: string): Promise<string | null> => {
-    if (prompt.includes("You classify one memory")) return "FACT";
-    return "KEEP";
-  };
+  const keepDecide = async (_prompt: string): Promise<string | null> => "KEEP";
 
   it("stealing an expired lease reclaims crashed orphans to pending (not stranded leased)", () => {
     const ctx = setup();
@@ -1007,6 +973,8 @@ describe("m3 review fixes (orphan/degraded/singleflight/cursor/cancel/dup/search
     const ctx = setup();
     try {
       remember(ctx.db, ctx.config, "singleflight probe note", "m3-rf-3");
+      remember(ctx.db, ctx.config, "singleflight peer one", "m3-rf-3b");
+      remember(ctx.db, ctx.config, "singleflight peer two", "m3-rf-3c");
       const modelDir = fakeLlmDir(ctx.dir);
       enableOpenAiGate(ctx, modelDir);
       const configPath = path.join(ctx.dir, "memory.config.json");
@@ -1072,146 +1040,41 @@ describe("m3 review fixes (orphan/degraded/singleflight/cursor/cancel/dup/search
     }
   });
 
-  it("a review cancelled after dequeue becomes an audited no-change, never a mutation", async () => {
+  it("distill never retires: no model output changes record status", async () => {
     const ctx = setup();
     try {
-      const id = remember(ctx.db, ctx.config, "cancel race probe note", "m3-rf-5");
+      const ids = [
+        remember(ctx.db, ctx.config, "a same-day weather remark", "m3-rf-nr-1"),
+        remember(ctx.db, ctx.config, "a passing greeting only", "m3-rf-nr-2"),
+        remember(ctx.db, ctx.config, "a transient mood note", "m3-rf-nr-3"),
+      ];
       const modelDir = fakeLlmDir(ctx.dir);
       enableOpenAiGate(ctx, modelDir);
-      const decide = async (prompt: string): Promise<string | null> => {
-        if (prompt.includes("You classify one memory")) {
-          // Race: an external cancel lands after dequeue but before the apply commit.
-          try {
-            const rows = ctx.db.prepare(`SELECT queueId FROM cultivation_queue WHERE recordId=?`).all(id) as Array<{ queueId: string }>;
-            for (const r of rows) cancelCultivationReview(ctx.db, r.queueId);
-          } catch {
-            /* ignore */
-          }
-          return "TRANSIENT"; // would retire the record without the fence
-        }
-        return "KEEP";
-      };
-      const res = await maintainDistill(ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"), { scope: "personal/default", limit: 5 }, "m3-rf-cancel", decide, T4);
-      assert.equal(res.ok, true);
-      assert.equal((res.data as { distill: { applied: number } }).distill.applied, 0);
-      assert.equal(
-        (getRecord(ctx.db, ctx.config, { id, scope: "personal/default" }).data as { record: { status: string } }).record.status,
-        "active",
-        "cancelled-before-commit must not mutate the record",
-      );
-    } finally {
-      ctx.cleanup();
-    }
-  });
-
-  it("onnx backend never runs the retire gate (no auto-retire, no defer)", async () => {
-    const ctx = setup();
-    try {
-      const id = remember(ctx.db, ctx.config, "a same-day weather remark", "m3-rf-onnx");
-      const modelDir = fakeLlmDir(ctx.dir);
-      enableFakeLlm(ctx, modelDir);
-      let gateCalls = 0;
-      const decide = async (prompt: string): Promise<string | null> => {
-        if (prompt.includes("You classify one memory")) {
-          gateCalls++;
-          return "TRANSIENT";
-        }
-        return "KEEP";
+      let calls = 0;
+      const decide = async (_prompt: string): Promise<string | null> => {
+        calls++;
+        return "TRANSIENT"; // a DROP-looking label under the removed gate
       };
       const res = await maintainDistill(
         ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"),
-        { scope: "personal/default", limit: 5 }, "m3-rf-onnx-drain", decide, T4,
+        { scope: "personal/default", limit: 5 }, "m3-rf-no-retire", decide, T4,
       );
       assert.equal(res.ok, true, JSON.stringify(res));
-      assert.equal(gateCalls, 0, "onnx must skip stage-1 classification");
-      const d = (res.data as { distill: { applied: number; deferred: number; reviewed: number } }).distill;
-      assert.equal(d.reviewed, 1);
-      assert.equal(d.deferred, 0);
-      assert.equal(d.applied, 0);
-      assert.equal(
-        (getRecord(ctx.db, ctx.config, { id, scope: "personal/default" }).data as { record: { status: string } }).record.status,
-        "active",
-        "onnx gate is disabled: DROP-looking content must not retire",
-      );
-    } finally {
-      ctx.cleanup();
-    }
-  });
-
-  it("deterministic guards keep linked and used records even when the gate says DROP", async () => {
-    const ctx = setup();
-    try {
-      const linked = remember(ctx.db, ctx.config, "a linked remark", "m3-rf-guard-l");
-      const used = remember(ctx.db, ctx.config, "a used remark", "m3-rf-guard-u");
-      ctx.db.prepare(`INSERT INTO record_links(fromId, toRef) VALUES (?, ?)`).run("rec_other", linked);
-      ctx.db.prepare(`UPDATE note_heat SET usedCount = 1, lastUsedAt = ? WHERE recordId = ?`).run(T3, used);
-      const modelDir = fakeLlmDir(ctx.dir);
-      enableOpenAiGate(ctx, modelDir);
-      const decide = async (prompt: string): Promise<string | null> =>
-        prompt.includes("You classify one memory") ? "TRANSIENT" : "KEEP";
-      const res = await maintainDistill(
-        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"),
-        { scope: "personal/default", limit: 5 }, "m3-rf-guards", decide, T4,
-      );
-      assert.equal(res.ok, true, JSON.stringify(res));
-      const d = (res.data as { distill: { applied: number; deferred: number; failed: number } }).distill;
+      const d = (res.data as { distill: { applied: number; deferred: number; reviewed: number; failed: number } }).distill;
+      assert.equal(d.reviewed, 3);
       assert.equal(d.applied, 0);
       assert.equal(d.deferred, 0);
       assert.equal(d.failed, 0);
-      for (const id of [linked, used]) {
+      assert.ok(calls > 0, "merge stage still runs the model");
+      for (const id of ids) {
         assert.equal(
           (getRecord(ctx.db, ctx.config, { id, scope: "personal/default" }).data as { record: { status: string } }).record.status,
           "active",
-          `${id} must be kept by the deterministic guards`,
+          "distill must never retire",
         );
       }
-    } finally {
-      ctx.cleanup();
-    }
-  });
-
-  it("young DROP candidate defers without an attempt, then retires on a later drain", async () => {
-    const ctx = setup();
-    try {
-      const id = remember(ctx.db, ctx.config, "a passing mood only", "m3-rf-defer");
-      const modelDir = fakeLlmDir(ctx.dir);
-      enableOpenAiGate(ctx, modelDir);
-      const decide = async (prompt: string): Promise<string | null> =>
-        prompt.includes("You classify one memory") ? "TRANSIENT" : "KEEP";
-      const r1 = await maintainDistill(
-        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"),
-        { scope: "personal/default", limit: 5 }, "m3-rf-defer-1", decide, T3,
-      );
-      assert.equal(r1.ok, true, JSON.stringify(r1));
-      const d1 = (r1.data as { distill: { reviewed: number; applied: number; deferred: number; failed: number } }).distill;
-      assert.equal(d1.reviewed, 1);
-      assert.equal(d1.deferred, 1);
-      assert.equal(d1.failed, 0, "deferral must not count as a failure");
-      assert.equal(d1.applied, 0);
-      const row = ctx.db.prepare(
-        `SELECT status, attempts, nextAt, batchId FROM cultivation_queue WHERE recordId = ?`,
-      ).get(id) as { status: string; attempts: number; nextAt: string; batchId: string | null };
-      assert.equal(row.status, "pending");
-      assert.equal(row.attempts, 0, "deferral must not increment attempts");
-      assert.equal(row.nextAt, "2026-09-02T00:00:01.000Z", "nextAt = record.createdAt + retireMinAgeMs");
-      assert.equal(row.batchId, null);
-      assert.equal(
-        (getRecord(ctx.db, ctx.config, { id, scope: "personal/default" }).data as { record: { status: string } }).record.status,
-        "active",
-      );
-      // Later drain (past the grace period) re-runs the gate and retires.
-      const r2 = await maintainDistill(
-        ctx.db, ctx.config, path.join(ctx.dir, "memory.config.json"),
-        { scope: "personal/default", limit: 5 }, "m3-rf-defer-2", decide, T4,
-      );
-      assert.equal(r2.ok, true, JSON.stringify(r2));
-      const d2 = (r2.data as { distill: { applied: number; deferred: number } }).distill;
-      assert.equal(d2.deferred, 0);
-      assert.equal(d2.applied, 1);
-      assert.equal(
-        (getRecord(ctx.db, ctx.config, { id, scope: "personal/default" }).data as { record: { status: string } }).record.status,
-        "retired",
-      );
+      const retired = ctx.db.prepare(`SELECT COUNT(*) AS n FROM audit WHERE op = 'maintain.cultivate' AND reasonCode = 'LOW_SIGNAL'`).get() as { n: number };
+      assert.equal(retired.n, 0, "no model-driven retire audit");
     } finally {
       ctx.cleanup();
     }
@@ -1310,10 +1173,6 @@ describe("m3 review fixes (orphan/degraded/singleflight/cursor/cancel/dup/search
 
   it("prompts preserve structure within the documented 500..8000 code-point bound", () => {
     for (const max of [500, 2000]) {
-      const gate = buildRetireGatePrompt("x".repeat(2000), max);
-      assert.ok([...gate].length <= max, `gate fits ${max}`);
-      assert.ok(gate.endsWith("<|im_start|>assistant\n"), "gate keeps the assistant cue");
-      assert.ok(gate.includes("TRANSIENT"), "gate keeps the label contract");
       const merge = buildMergePrompt("x".repeat(2000), [{ id: "rec_y", body: "y".repeat(2000) }, { id: "rec_z", body: "z".repeat(2000) }], max);
       assert.ok([...merge].length <= max, `merge fits ${max}`);
       assert.ok(merge.endsWith("<|im_start|>assistant\n"), "merge keeps the assistant cue");
