@@ -159,19 +159,6 @@ interface HarvestCursor {
   lastKey2: string | null;
 }
 
-/** Additive schema; the init migration also creates it for fresh databases. */
-function ensureHarvestStateSchema(db: DatabaseSync): void {
-  db.exec(
-    `CREATE TABLE IF NOT EXISTS retention_harvest_state(
-       scope TEXT NOT NULL,
-       source TEXT NOT NULL,
-       lastTs TEXT NOT NULL,
-       lastKey TEXT NOT NULL,
-       lastKey2 TEXT NULL,
-       PRIMARY KEY(scope, source))`,
-  );
-}
-
 function readHarvestCursor(
   db: DatabaseSync,
   scope: string,
@@ -223,7 +210,9 @@ function writeHarvestCursor(
  * at (ts, rowid). All writes (inserts, pruning, cursor advance) commit in one
  * BEGIN IMMEDIATE transaction only while the database is under dbMaxBytes;
  * a cap breach rolls the whole harvest back so no derived row leaks past the
- * limit that a later canonical write would reject.
+ * limit that a later canonical write would reject. When
+ * activation.learn.enabled is false the function returns the current totals
+ * without opening a transaction or writing anything.
  */
 export function harvestRetentionExamples(
   db: DatabaseSync,
@@ -244,11 +233,14 @@ export function harvestRetentionExamples(
   };
   if (!Number.isFinite(nowMs)) return empty();
   const learn = retentionLearnBounds(config);
+  // Disabled learning means no label harvesting at all: no transaction, no
+  // cursor advance, no example pruning, and no writes that could trip the
+  // database cap. Return the current read-only totals for observability.
+  if (!learn.enabled) return empty();
   const cutoff = new Date(nowMs - Math.max(0, learn.labelHorizonMs)).toISOString();
 
   db.exec("BEGIN IMMEDIATE");
   try {
-    ensureHarvestStateSchema(db);
     const exposureCursor = readHarvestCursor(db, scope, HARVEST_SOURCE_EXPOSURE);
     const auditCursor = readHarvestCursor(db, scope, HARVEST_SOURCE_AUDIT);
 

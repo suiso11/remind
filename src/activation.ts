@@ -1042,8 +1042,11 @@ export async function maintainActivation(
     }
     // Optimize/accept under the same lease and maintenance deadline. The
     // learner never throws into maintenance; a failure is reported as
-    // degraded with the "error" skip reason.
-    if (overDeadline()) {
+    // degraded with the "error" skip reason. Disabled learning skips both
+    // harvest (inside harvestRetentionExamples) and the fit entirely.
+    if (bounds.learn?.enabled === false) {
+      learn.skipped = "disabled";
+    } else if (overDeadline()) {
       learn.skipped = "deadline";
     } else {
       try {

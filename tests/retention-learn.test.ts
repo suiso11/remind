@@ -16,7 +16,7 @@ import {
   type ActivationConfig,
   type RetentionLearnConfig,
 } from "../src/config.js";
-import { eventAppend, rememberRecord } from "../src/store.js";
+import { eventAppend, recallRecords, rememberRecord } from "../src/store.js";
 import {
   HARVEST_MAX_NEW,
   RETENTION_EXAMPLES_MAX,
@@ -219,6 +219,43 @@ describe("retention learner: harvest", () => {
     }
   });
 
+  it("keeps pending exposures past the 1000-row cap until they are labeled", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "pending-labels", "2026-01-01T00:00:00.000Z");
+      const t0 = "2026-01-01T00:30:00.000Z";
+      const recalls = 1100;
+      for (let i = 0; i < recalls; i++) {
+        const res = recallRecords(
+          ctx.db,
+          ctx.config,
+          { query: "record", link: id, scope: SCOPE, limit: 10 },
+          t0,
+        );
+        assert.equal(res.ok, true, JSON.stringify(res));
+      }
+      const pending = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM exposures WHERE scope = ?`)
+        .get(SCOPE) as { n: number };
+      assert.equal(pending.n, recalls, "recall pruning must not delete unlabeled exposures");
+
+      // The exposures are 6.5h old: all are past the 6h label horizon.
+      let harvested = 0;
+      for (let pass = 0; pass < 3; pass++) {
+        const res = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-01T07:00:00.000Z");
+        harvested += res.harvested;
+        if (res.harvested === 0) break;
+      }
+      assert.equal(harvested, recalls, "every pending exposure becomes an example");
+      const examples = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_examples WHERE source = 'exposure'`)
+        .get() as { n: number };
+      assert.equal(examples.n, recalls);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
   it("labels user retire/reactivate transitions with weight 5", () => {
     const ctx = setup();
     try {
@@ -406,6 +443,74 @@ describe("retention learner: harvest", () => {
         .prepare(`SELECT COUNT(*) AS n FROM retention_harvest_state WHERE scope = ?`)
         .get(SCOPE) as { n: number };
       assert.equal(state.n, 0);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("does no harvest writes when learning is disabled, even near the db cap", async () => {
+    const ctx = setupLearn({ enabled: false });
+    try {
+      const recordId = remember(ctx.db, ctx.config, "disabled", "2026-01-01T00:00:00.000Z");
+      const configPath = path.join(ctx.dir, "memory.config.json");
+      // Warm up the maintenance ledgers while the cap is not binding.
+      const warm = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        configPath,
+        { scope: SCOPE },
+        "disabled-warm",
+        async () => null,
+        "2026-01-01T00:30:00.000Z",
+      );
+      assert.equal(warm.ok, true, JSON.stringify(warm));
+
+      // Thousands of eligible exposures exist now. A harvest would insert
+      // examples and trip the cap below; disabled learning must not try.
+      for (let i = 0; i < 3000; i++) {
+        exposure(ctx.db, `recall-disabled-${i}`, recordId, "2026-01-01T01:00:00.000Z");
+      }
+      const physical = ["", "-wal", "-shm"].reduce((n, suffix) => {
+        const p = ctx.config.dbPath + suffix;
+        return n + (fs.existsSync(p) ? fs.statSync(p).size : 0);
+      }, 0);
+      ctx.config.dbMaxBytes = physical + 65536;
+
+      const beforeExamples = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_examples`)
+        .get() as { n: number };
+      const beforeCursors = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_harvest_state`)
+        .get() as { n: number };
+      const res = await maintainActivation(
+        ctx.db,
+        ctx.config,
+        configPath,
+        { scope: SCOPE },
+        "disabled-cap",
+        async () => null,
+        "2026-01-01T08:00:00.000Z",
+      );
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const data = res.data as {
+        learn: { harvested: number; skipped: string | null };
+      };
+      assert.equal(data.learn.harvested, 0);
+      assert.equal(data.learn.skipped, "disabled");
+      const afterExamples = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_examples`)
+        .get() as { n: number };
+      const afterCursors = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_harvest_state`)
+        .get() as { n: number };
+      assert.equal(afterExamples.n, beforeExamples.n);
+      assert.equal(afterCursors.n, beforeCursors.n);
+
+      // Direct harvest must also be a no-op under a cap that would reject
+      // any transaction write.
+      ctx.config.dbMaxBytes = 1;
+      const direct = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-01T08:00:00.000Z");
+      assert.equal(direct.harvested, 0);
     } finally {
       ctx.cleanup();
     }
