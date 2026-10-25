@@ -18,7 +18,8 @@
  *   - every usage timestamp of superseded predecessors, followed through the
  *     records.supersedes chain (a correction inherits the history it replaces)
  *   - every correction event (a correction record that supersedes this row)
- *   - every record.reactivate audit event
+ *   - every reactivation transition audit event (record.reactivate, or the
+ *     equivalent maintain.cultivate/cultivation/distill/activation rows)
  *
  * importance ∈ [0,1]; missing importance uses the neutral 0.5. The derived
  * record_importance row is only trusted while its bodyHash matches the
@@ -49,6 +50,7 @@ import {
   isCultivationLeaseHeldBy,
   releaseCultivationLease,
   withLeaseHeartbeat,
+  REACTIVATE_REASONS,
   RETIRE_REASONS,
 } from "./cultivation.js";
 import {
@@ -625,6 +627,76 @@ function placeholders(n: number): string {
   return new Array(n).fill("?").join(",");
 }
 
+/**
+ * Every audit op that can move a record between active and retired. User
+ * transitions are staged by Companion as record.retire/record.reactivate
+ * (NO_LONGER_USEFUL / USER_REQUESTED), but cultivation batches audit the same
+ * transitions as maintain.cultivate; older databases may also carry
+ * maintain.cultivation/maintain.distill/maintain.activation target rows.
+ */
+const TRANSITION_AUDIT_OPS = [
+  "record.retire",
+  "record.reactivate",
+  "maintain.cultivate",
+  "maintain.cultivation",
+  "maintain.distill",
+  "maintain.activation",
+] as const;
+
+const TRANSITION_REASON_CODES = [...RETIRE_REASONS, ...REACTIVATE_REASONS] as const;
+
+interface TransitionHistory {
+  /** Timestamps of reactivation audit rows (event-frequency input). */
+  reactivationTimes: Map<string, string[]>;
+  /** Reason of the latest reactivation row, whichever op wrote it. */
+  latestReactivationReasons: Map<string, string | null>;
+  /** Reason of the latest retirement row, whichever op wrote it. */
+  retireReasons: Map<string, string | null>;
+}
+
+/**
+ * Single ordered scan over active<->retired transitions. Retire and
+ * reactivate reason-code sets are disjoint (fixed codes), so one query can
+ * classify each row and keep only the latest per target: `ORDER BY ts, rowid`
+ * makes later rows overwrite earlier ones (latest event wins).
+ */
+function loadTransitionHistory(
+  db: DatabaseSync,
+  ids: string[],
+): TransitionHistory {
+  const reactivationTimes = new Map<string, string[]>();
+  const latestReactivationReasons = new Map<string, string | null>();
+  const retireReasons = new Map<string, string | null>();
+  const retireCodes = new Set<string>(RETIRE_REASONS);
+  for (const chunkIds of chunk(ids)) {
+    const found = db
+      .prepare(
+        `SELECT targetId, ts, reasonCode FROM audit
+          WHERE op IN (${placeholders(TRANSITION_AUDIT_OPS.length)})
+            AND targetId IN (${placeholders(chunkIds.length)})
+            AND reasonCode IN (${placeholders(TRANSITION_REASON_CODES.length)})
+          ORDER BY ts ASC, rowid ASC`,
+      )
+      .all(
+        ...TRANSITION_AUDIT_OPS,
+        ...chunkIds,
+        ...TRANSITION_REASON_CODES,
+      ) as unknown as Array<{ targetId: string; ts: string; reasonCode: string | null }>;
+    for (const row of found) {
+      if (row.reasonCode === null) continue;
+      if (retireCodes.has(row.reasonCode)) {
+        retireReasons.set(row.targetId, row.reasonCode);
+        continue;
+      }
+      const list = reactivationTimes.get(row.targetId);
+      if (list) list.push(row.ts);
+      else reactivationTimes.set(row.targetId, [row.ts]);
+      latestReactivationReasons.set(row.targetId, row.reasonCode);
+    }
+  }
+  return { reactivationTimes, latestReactivationReasons, retireReasons };
+}
+
 interface RecordRow {
   id: string;
   body: string;
@@ -773,56 +845,15 @@ export function loadActivationInputs(
     }
   }
 
-  // Reactivation events (metadata-only audit).
-  const reactivationTimes = new Map<string, string[]>();
-  const latestReactivationReasons = new Map<string, string | null>();
-  for (const ids of chunk(candidateIds)) {
-    const found = db
-      .prepare(
-        `SELECT targetId, ts, reasonCode FROM audit
-          WHERE op = 'record.reactivate' AND targetId IN (${placeholders(ids.length)})
-          ORDER BY ts ASC, rowid ASC`,
-      )
-      .all(...ids) as unknown as Array<{ targetId: string; ts: string; reasonCode: string | null }>;
-    for (const row of found) {
-      const list = reactivationTimes.get(row.targetId);
-      if (list) list.push(row.ts);
-      else reactivationTimes.set(row.targetId, [row.ts]);
-      latestReactivationReasons.set(row.targetId, row.reasonCode);
-    }
-  }
-
-  // Latest retirement reason for retired candidates, from ANY op that can
-  // retire a record. Production retirements are mostly written by
-  // maintain.cultivate on behalf of maintain.distill (reasonCode LOW_SIGNAL);
-  // maintain.activation itself reuses record.retire (LOW_ACTIVATION). Older
-  // databases may also carry maintain.distill/maintain.activation target rows.
-  // Filtering by the fixed retire codes excludes cultivate keep/reactivate
-  // rows (STILL_USEFUL) and per-batch summary audit rows.
-  const retireReasons = new Map<string, string | null>();
-  const retiredIds = candidates.filter((r) => r.status === "retired").map((r) => r.id);
-  const retirementOps = [
-    "record.retire",
-    "maintain.cultivate",
-    "maintain.cultivation",
-    "maintain.distill",
-    "maintain.activation",
-  ];
-  for (const ids of chunk(retiredIds)) {
-    const found = db
-      .prepare(
-        `SELECT targetId, reasonCode FROM audit
-          WHERE op IN (${placeholders(retirementOps.length)})
-            AND targetId IN (${placeholders(ids.length)})
-            AND reasonCode IN (${placeholders(RETIRE_REASONS.length)})
-          ORDER BY ts ASC, rowid ASC`,
-      )
-      .all(...retirementOps, ...ids, ...RETIRE_REASONS) as unknown as Array<{
-      targetId: string;
-      reasonCode: string | null;
-    }>;
-    for (const row of found) retireReasons.set(row.targetId, row.reasonCode);
-  }
+  // Active<->retired transition history from ANY op that can perform it.
+  // Retirements are mostly written by maintain.cultivate on behalf of
+  // maintain.distill (reasonCode LOW_SIGNAL); user actions are staged as
+  // record.retire/reactivate; maintain.activation reuses those ops with
+  // LOW_ACTIVATION/STILL_USEFUL. Filtering by the fixed retire+reactivate
+  // codes excludes cultivate keep rows (reasonCode null) and per-batch
+  // summary audit rows. The latest transition per kind wins.
+  const { reactivationTimes, latestReactivationReasons, retireReasons } =
+    loadTransitionHistory(db, candidateIds);
 
   // Derived importance/nature, only while they still match the current bodyHash.
   const importance = new Map<string, { value: number; bodyHash: string; nature: string | null }>();

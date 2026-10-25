@@ -12,7 +12,7 @@ import { SCHEMA_VERSION, initDb } from "../src/db.js";
 import type { AppConfig } from "../src/config.js";
 import { loadConfig, type ActivationConfig } from "../src/config.js";
 import { eventAppend, correctRecord, rememberRecord, retireRecord } from "../src/store.js";
-import { acquireCultivationLease, releaseCultivationLease } from "../src/cultivation.js";
+import { acquireCultivationLease, applyCultivationBatch, releaseCultivationLease } from "../src/cultivation.js";
 import { chatMlToMessages } from "../src/llm.js";
 import { maintainDistill } from "../src/distill.js";
 import {
@@ -1266,6 +1266,28 @@ function decide(ctx: { db: DatabaseSync; config: AppConfig }, id: string, now = 
   return previewItems(ctx, now).find((i) => i.id === id);
 }
 
+/** Stage one transition through applyCultivationBatch (audited as maintain.cultivate). */
+function cultivate(
+  ctx: { db: DatabaseSync; config: AppConfig },
+  key: string,
+  recordId: string,
+  action: "retire" | "reactivate",
+  reasonCode: string,
+  now: string,
+): void {
+  const res = applyCultivationBatch(
+    ctx.db,
+    ctx.config,
+    {
+      scope: SCOPE,
+      idempotencyKey: key,
+      actions: [{ recordId, action, reasonCode }],
+    },
+    now,
+  );
+  assert.equal(res.ok, true, JSON.stringify(res));
+}
+
 describe("activation: multi-factor retention score", () => {
   it("retires an unlinked 30h-old greeting but keeps an old durable FACT", () => {
     const ctx = setup();
@@ -1458,6 +1480,53 @@ describe("activation: multi-factor retention score", () => {
       const item = decide(ctx, id);
       assert.ok((item?.A ?? 0) < -1.5, "score is below tauRetire");
       assert.equal(item?.decision, "keep");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("never auto-retires after a USER_REQUESTED reactivation applied by cultivate", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "また呼んで", "r-cult-req", "2026-01-09T18:00:00.000Z");
+      setScore(ctx.db, id, 0, "GREETING");
+      cultivate(ctx, "r-cult-req-ret", id, "retire", "NO_LONGER_USEFUL", "2026-01-10T00:00:00.000Z");
+      cultivate(ctx, "r-cult-req-rea", id, "reactivate", "USER_REQUESTED", "2026-01-10T01:00:00.000Z");
+      const item = decide(ctx, id);
+      assert.ok((item?.A ?? 0) < -1.5, "score is below tauRetire");
+      assert.equal(item?.decision, "keep");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("never reactivates a NO_LONGER_USEFUL retirement applied by cultivate", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "古い住所", "r-cult-ret", "2026-01-10T00:00:00.000Z");
+      setScore(ctx.db, id, 1, "FACT");
+      cultivate(ctx, "r-cult-ret-k", id, "retire", "NO_LONGER_USEFUL", "2026-01-10T01:00:00.000Z");
+      const item = decide(ctx, id);
+      assert.ok((item?.A ?? 0) >= -0.5, "score alone would reactivate");
+      assert.equal(item?.decision, "keep");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("latest transition wins: a later LOW_ACTIVATION retirement is reconsiderable", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "また使う事実", "r-cult-latest", "2026-01-01T00:00:00.000Z");
+      setScore(ctx.db, id, 1, "FACT");
+      cultivate(ctx, "r-cult-latest-ret0", id, "retire", "NO_LONGER_USEFUL", "2026-01-10T00:00:00.000Z");
+      cultivate(ctx, "r-cult-latest-rea", id, "reactivate", "USER_REQUESTED", "2026-01-10T01:00:00.000Z");
+      // While the user reactivation is the latest event it protects the row.
+      assert.equal(decide(ctx, id)?.decision, "keep");
+      cultivate(ctx, "r-cult-latest-ret1", id, "retire", "LOW_ACTIVATION", "2026-01-10T02:00:00.000Z");
+      const item = decide(ctx, id);
+      assert.ok((item?.A ?? 0) >= -0.5, "score alone would reactivate");
+      assert.equal(item?.decision, "reactivate");
     } finally {
       ctx.cleanup();
     }
