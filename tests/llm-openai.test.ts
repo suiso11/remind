@@ -13,12 +13,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
-import { isLoopbackHttpUrl, loadConfig, type AppConfig, type LlmConfig } from "../src/config.js";
+import { isLoopbackHttpUrl, loadConfig, type ActivationConfig, type AppConfig, type LlmConfig } from "../src/config.js";
 import { initDb } from "../src/db.js";
 import { eventAppend, getRecord, rememberRecord } from "../src/store.js";
 import { maintainDistill } from "../src/distill.js";
 import { maintainEpisodes } from "../src/episodes.js";
 import { maintainAssociate } from "../src/associate.js";
+import { maintainActivation } from "../src/activation.js";
 import {
   chatMlToMessages,
   generateCompletion,
@@ -254,6 +255,39 @@ describe("llm backend config validation", () => {
       assert.equal(cfg.llm?.backend, "openai");
       assert.equal(cfg.llm?.disableThinking, true);
       assert.equal(llmUsable(cfg, path.join(dir, "missing")), true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("validates the activation.llm classifier override with the global llm rules", () => {
+    const dir = cfgDir();
+    try {
+      const example = JSON.parse(
+        fs.readFileSync(path.join(process.cwd(), "memory.config.example.json"), "utf8"),
+      ) as Record<string, unknown>;
+      const p = path.join(dir, "c.json");
+      const baseActivation = example["activation"] as Record<string, unknown>;
+      const write = (llm: Record<string, unknown>): void =>
+        fs.writeFileSync(p, JSON.stringify({ ...example, activation: { ...baseActivation, llm } }));
+      write({ backend: "openai", baseUrl: "http://example.com:8080", model: "m" });
+      assert.throws(() => loadConfig(p), /activation\.llm\.baseUrl.*loopback/);
+      write({ backend: "onnx", baseUrl: "http://127.0.0.1:8080", model: "m" });
+      assert.throws(() => loadConfig(p), /activation\.llm\.backend/);
+      write({ backend: "openai", baseUrl: "http://127.0.0.1:8080" });
+      assert.throws(() => loadConfig(p), /activation\.llm\.model/);
+      write({ backend: "openai", baseUrl: "http://127.0.0.1:8080", model: "m", apiKeyEnv: "BAD-NAME" });
+      assert.throws(() => loadConfig(p), /activation\.llm\.apiKeyEnv/);
+      write({ backend: "openai", baseUrl: "http://127.0.0.1:8080", model: "m", timeoutMs: 10 });
+      assert.throws(() => loadConfig(p), /activation\.llm\.timeoutMs/);
+      write({ backend: "openai", baseUrl: "http://127.0.0.1:8080", model: "m", nope: 1 });
+      assert.throws(() => loadConfig(p), /unknown activation\.llm field: nope/);
+      write({ backend: "openai", baseUrl: "http://localhost:8080/v1", model: "huihui-ornith-35b", timeoutMs: 90000, apiKeyEnv: "LLAMA_API_KEY" });
+      const cfg = loadConfig(p);
+      assert.equal(cfg.activation?.llm?.backend, "openai");
+      assert.equal(cfg.activation?.llm?.model, "huihui-ornith-35b");
+      assert.equal(cfg.activation?.llm?.timeoutMs, 90000);
+      assert.equal(cfg.activation?.llm?.apiKeyEnv, "LLAMA_API_KEY");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -665,6 +699,131 @@ describe("openai backend maintenance flows", () => {
           assert.deepEqual(rows.map((r) => r.topic).sort(), ["乗り物", "整備"].sort());
           assert.equal(rows[0]?.origin, "llm");
           assert.ok(requests.some((r) => systemText(r.body).includes("記憶の話題分類器")));
+        } finally {
+          ctx.cleanup();
+        }
+      },
+    );
+    resetLlmRuntime();
+  });
+});
+
+describe("activation classifier model override", () => {
+  it("uses activation.llm for classification only, disables thinking, and rescoring follows the model id", async () => {
+    await withServer(
+      () => ({ content: '{"nature":"FACT","importance":3}' }),
+      async (url, requests) => {
+        const ctx = setup(openAiLlm(url, { model: "ornith-1.5-9b" }));
+        try {
+          ctx.config.activation = {
+            llm: {
+              backend: "openai",
+              baseUrl: url,
+              model: "huihui-ornith-35b",
+            },
+          } as ActivationConfig;
+          const id = remember(ctx.db, ctx.config, "classifier override probe", "clf-1");
+
+          const first = await maintainActivation(
+            ctx.db,
+            ctx.config,
+            ctx.configPath,
+            { scope: SCOPE },
+            "act-clf-1",
+            undefined,
+            DRAIN_NOW,
+          );
+          assert.equal(first.ok, true, JSON.stringify(first));
+          assert.equal((first.data as { scored: number }).scored, 1);
+          assert.equal(requests[0]!.body.model, "huihui-ornith-35b");
+          assert.deepEqual(requests[0]!.body.chat_template_kwargs, { enable_thinking: false });
+          let row = ctx.db
+            .prepare(`SELECT source, importance FROM record_importance WHERE recordId = ?`)
+            .get(id) as { source: string; importance: number };
+          assert.equal(row.source, "llm:v2:huihui-ornith-35b");
+          assert.equal(row.importance, 1);
+
+          // Global callers keep the global model (and default thinking policy).
+          await generateCompletion(
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+            "/nonexistent",
+            { timeoutMs: 2000, maxNewTokens: 8, config: ctx.config },
+          );
+          assert.equal(requests[1]!.body.model, "ornith-1.5-9b");
+          assert.deepEqual(requests[1]!.body.chat_template_kwargs, { enable_thinking: false });
+
+          // Switching the classifier model makes the previous row stale.
+          ctx.config.activation = {
+            llm: { backend: "openai", baseUrl: url, model: "huihui-ornith-35b-v2" },
+          } as ActivationConfig;
+          const second = await maintainActivation(
+            ctx.db,
+            ctx.config,
+            ctx.configPath,
+            { scope: SCOPE },
+            "act-clf-2",
+            undefined,
+            DRAIN_NOW,
+          );
+          assert.equal(second.ok, true, JSON.stringify(second));
+          assert.equal((second.data as { scored: number }).scored, 1);
+          assert.equal(requests[2]!.body.model, "huihui-ornith-35b-v2");
+          const changed = ctx.db
+            .prepare(`SELECT source FROM record_importance WHERE recordId = ?`)
+            .get(id) as { source: string };
+          assert.equal(changed.source, "llm:v2:huihui-ornith-35b-v2");
+
+          // A legacy model-less llm:v2 stamp is stale too.
+          ctx.db.prepare(`UPDATE record_importance SET source = 'llm:v2' WHERE recordId = ?`).run(id);
+          const third = await maintainActivation(
+            ctx.db,
+            ctx.config,
+            ctx.configPath,
+            { scope: SCOPE },
+            "act-clf-3",
+            undefined,
+            DRAIN_NOW,
+          );
+          assert.equal(third.ok, true, JSON.stringify(third));
+          assert.equal((third.data as { scored: number }).scored, 1);
+        } finally {
+          ctx.cleanup();
+        }
+      },
+    );
+    resetLlmRuntime();
+  });
+
+  it("classifies through activation.llm even when the global llm is disabled", async () => {
+    await withServer(
+      () => ({ content: '{"nature":"PREFERENCE","importance":2}' }),
+      async (url, requests) => {
+        const global = openAiLlm(url, { model: "ornith-1.5-9b", enabled: false });
+        const ctx = setup(global);
+        try {
+          ctx.config.activation = {
+            llm: { backend: "openai", baseUrl: url, model: "huihui-ornith-35b" },
+          } as ActivationConfig;
+          const id = remember(ctx.db, ctx.config, "disabled global probe", "clf-2");
+          const res = await maintainActivation(
+            ctx.db,
+            ctx.config,
+            ctx.configPath,
+            { scope: SCOPE },
+            "act-clf-disabled",
+            undefined,
+            DRAIN_NOW,
+          );
+          assert.equal(res.ok, true, JSON.stringify(res));
+          const d = res.data as { scored: number; degraded: boolean };
+          assert.equal(d.degraded, false);
+          assert.equal(d.scored, 1);
+          assert.equal(requests.length, 1);
+          assert.equal(requests[0]!.body.model, "huihui-ornith-35b");
+          const row = ctx.db
+            .prepare(`SELECT source FROM record_importance WHERE recordId = ?`)
+            .get(id) as { source: string };
+          assert.equal(row.source, "llm:v2:huihui-ornith-35b");
         } finally {
           ctx.cleanup();
         }

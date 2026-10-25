@@ -34,7 +34,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AppConfig, LlmBackend } from "./config.js";
+import type { ActivationLlmConfig, AppConfig, LlmBackend, LlmConfig } from "./config.js";
 import {
   LLM_DEFAULT_MAX_NEW_TOKENS,
   LLM_DEFAULT_MAX_PROMPT_CHARS,
@@ -319,11 +319,22 @@ async function generateOpenAiCompletion(
     maxNewTokens: number;
     config?: AppConfig;
     signal?: AbortSignal;
+    /**
+     * Per-call classifier endpoint. When set it replaces the global
+     * config.llm backend/model/baseUrl (loopback and model are re-checked
+     * here for programmatic configs). The global llm stays the runtime for
+     * every other caller.
+     */
+    llmOverride?: ActivationLlmConfig;
+    /** Classifier calls must never let the 35B model spend reasoning budget. */
+    forceDisableThinking?: boolean;
   },
 ): Promise<string | null> {
   const config = opts.config;
-  const l = config?.llm;
-  if (!config || !l || llmBackend(config) !== "openai") return null;
+  const override = opts.llmOverride;
+  const l = override ?? config?.llm;
+  if (!config || !l) return null;
+  if (override === undefined && llmBackend(config) !== "openai") return null;
   if (!isLoopbackHttpUrl(l.baseUrl) || typeof l.model !== "string" || l.model.length === 0) {
     return null;
   }
@@ -332,7 +343,9 @@ async function generateOpenAiCompletion(
   const poisonKey = `openai:${l.baseUrl}`;
   if (poisonedDir !== null && poisonedDir === poisonKey) return null;
 
-  const disableThinking = l.disableThinking !== false;
+  const disableThinking =
+    opts.forceDisableThinking === true ||
+    ((l as LlmConfig).disableThinking !== false);
   const request: Record<string, unknown> = {
     model: l.model,
     messages: conv.messages,
@@ -421,11 +434,15 @@ export async function generateCompletion(
     config?: AppConfig;
     /** Optional external cancellation (e.g. a lost maintenance lease). */
     signal?: AbortSignal;
+    /** Classifier-only endpoint override; leaves global callers untouched. */
+    llmOverride?: ActivationLlmConfig;
+    /** Classifier calls force `enable_thinking:false` even if llm disables it. */
+    forceDisableThinking?: boolean;
   },
 ): Promise<string | null> {
   try {
     if (typeof prompt !== "string" || prompt.length === 0 || prompt.length > 8000) return null;
-    if (opts.config && llmBackend(opts.config) === "openai") {
+    if (opts.llmOverride !== undefined || (opts.config && llmBackend(opts.config) === "openai")) {
       return await generateOpenAiCompletion(prompt, opts);
     }
     if (!modelFilesPresent(modelDir)) return null;

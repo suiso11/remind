@@ -133,6 +133,23 @@ export interface ConsolidateConfig {
  * documented defaults. The model/preview are read-only; maintain.activation
  * writes only when `apply` is true.
  */
+/**
+ * Optional classifier-specific OpenAI-compatible endpoint. Retention
+ * classification (nature + importance) runs on this model when present;
+ * distill/consolidate/associate keep the global `llm` runtime. Validation
+ * mirrors `llm` for openai keys: loopback-only baseUrl, model name required,
+ * and apiKeyEnv carries only the environment variable NAME.
+ */
+export interface ActivationLlmConfig {
+  backend: "openai";
+  baseUrl: string;
+  model: string;
+  /** Per-call timeout (default: global llm.timeoutMs when set, else 60000). */
+  timeoutMs?: number;
+  /** Environment variable NAME holding an optional bearer token. */
+  apiKeyEnv?: string;
+}
+
 export interface ActivationConfig {
   /** Base-level decay d in [0,2] (default 0.5). */
   decay: number;
@@ -169,6 +186,12 @@ export interface ActivationConfig {
   apply: boolean;
   /** Importance at/above which retirement needs the protective margin (default 0.66). */
   protectImportance: number;
+  /**
+   * Optional classifier-specific openai endpoint. When present the
+   * nature+importance classifier uses it instead of the global `llm`, and
+   * always disables thinking. Absent keeps the previous behavior.
+   */
+  llm?: ActivationLlmConfig;
   /** Retention weight learner bounds (optional; absent uses defaults). */
   learn?: RetentionLearnConfig;
 }
@@ -782,6 +805,7 @@ export function loadConfig(configPath: string): AppConfig {
           "apply",
           "protectImportance",
           "learn",
+          "llm",
         ].includes(k)
       ) {
         throw new Error(`unknown activation field: ${k}`);
@@ -889,6 +913,60 @@ export function loadConfig(configPath: string): AppConfig {
     ) {
       throw new Error("activation.protectImportance must be a number in 0..1");
     }
+    let activationLlm: ActivationLlmConfig | undefined;
+    if ("llm" in a && a["llm"] !== undefined) {
+      const l = a["llm"];
+      if (!isPlainObject(l)) throw new Error("activation.llm must be an object");
+      const allowed = ["backend", "baseUrl", "model", "timeoutMs", "apiKeyEnv"];
+      for (const k of Object.keys(l)) {
+        if (!allowed.includes(k)) throw new Error(`unknown activation.llm field: ${k}`);
+      }
+      if (l["backend"] !== "openai") {
+        throw new Error('activation.llm.backend must be "openai"');
+      }
+      const baseUrl = l["baseUrl"];
+      if (!isLoopbackHttpUrl(baseUrl)) {
+        throw new Error(
+          "activation.llm.baseUrl must be an http(s) URL on loopback (127.0.0.1, ::1, or localhost)",
+        );
+      }
+      const model = l["model"];
+      if (
+        typeof model !== "string" ||
+        model.length === 0 ||
+        model.length > 200 ||
+        model.includes("\u0000") ||
+        /[\r\n]/.test(model)
+      ) {
+        throw new Error("activation.llm.model must be a non-empty single-line string");
+      }
+      let timeoutMs: number | undefined;
+      if (l["timeoutMs"] !== undefined) {
+        const eT = checkRange("activation.llm.timeoutMs", l["timeoutMs"], 500, 300000);
+        if (eT) throw new Error(eT);
+        timeoutMs = l["timeoutMs"] as number;
+      }
+      let apiKeyEnv: string | undefined;
+      if (l["apiKeyEnv"] !== undefined) {
+        const v = l["apiKeyEnv"];
+        if (
+          typeof v !== "string" ||
+          v.length === 0 ||
+          v.length > 128 ||
+          !/^[A-Za-z_][A-Za-z0-9_]*$/.test(v)
+        ) {
+          throw new Error("activation.llm.apiKeyEnv must be an environment variable name");
+        }
+        apiKeyEnv = v;
+      }
+      activationLlm = {
+        backend: "openai",
+        baseUrl,
+        model,
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(apiKeyEnv !== undefined ? { apiKeyEnv } : {}),
+      };
+    }
     let learn: RetentionLearnConfig | undefined;
     if ("learn" in a && a["learn"] !== undefined) {
       const l = a["learn"];
@@ -951,6 +1029,7 @@ export function loadConfig(configPath: string): AppConfig {
       batchMax: batchMax as number,
       apply,
       protectImportance,
+      ...(activationLlm !== undefined ? { llm: activationLlm } : {}),
       ...(learn !== undefined ? { learn } : {}),
     };
   }

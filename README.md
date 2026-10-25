@@ -175,7 +175,7 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 
   `R = base + kind + importance + nature + links + expired + consolidated`。判定は `R < tauRetire` かつ `ageHours >=` nature 別の最小経過時間 (`minAgeHoursByNature`: `GREETING/CHATOPS:24`, `EMOTION/TRANSIENT:72`、他は `minAgeHours=72`) で引退、`R >= tauReactivate` (-0.5) で再活性化する。
 - `activation.preview {scope, limit?, cursor?, includeRetired?}` は読み取り専用で、`R` 昇順の `{id,status,kind,label,nature,A,importance,factors,reason,uses,ageHours,decision}` を返す。`factors` は `{base,kind,importance,nature,links,expired,consolidated,total}` で合計は `A` と一致する。`reason` は retire のときだけ `OUTDATED / CONSOLIDATED / LOW_ACTIVATION`。heat・usage・audit・importance・status は一切書かない。`nextCursor` は採点時刻を内包して頁間の `R` を固定する。
-- `maintain.activation {scope, limit?}` (write op、`idempotencyKey` 必須) は (a) 未採点・bodyHash 陳腐化・nature 欠損・分類器 version (`source=llm:v*`) が古い active+retired 記憶を最大 `activation.batchMax=20` (上限 200) 件だけ分類器で nature+importance 採点する。LLM 無効・欠落時は採点をスキップし `degraded:true`。(b) scope の `R` を再計算し、`activation.apply` が true のときだけ遷移を適用する。1 パス最大 2,000 件の有界スキャンと scope 別 continuation cursor は従来どおり。
+- `maintain.activation {scope, limit?}` (write op、`idempotencyKey` 必須) は (a) 未採点・bodyHash 陳腐化・nature 欠損・分類器 version かモデル id (`source=llm:<version>:<model>`) が古い active+retired 記憶を最大 `activation.batchMax=20` (上限 200) 件だけ分類器で nature+importance 採点する。モデルを切り替えると旧 `llm:v2` 行を含む全採点が一度だけ陳腐化して再採点される。LLM 無効・欠落時は採点をスキップし `degraded:true` (ただし `activation.llm` があればグローバル `llm.enabled=false` でも分類器は動く)。(b) scope の `R` を再計算し、`activation.apply` が true のときだけ遷移を適用する。1 パス最大 2,000 件の有界スキャンと scope 別 continuation cursor は従来どおり。
 - 引退理由は支配要因で決める: expired 適用 → `OUTDATED`、consolidated 点だけが閾値を跨がせた → `CONSOLIDATED`、それ以外 → `LOW_ACTIVATION`。再活性化は `STILL_USEFUL`。
 - 自動引退の全理由 (`LOW_ACTIVATION` / 旧 `LOW_SIGNAL` / `OUTDATED` / `CONSOLIDATED`) を再検討する。`reconsiderLegacy` は廃止。利用者が `record.retire` で `NO_LONGER_USEFUL` にした行は自動再活性化しない。直近の再活性化が `USER_REQUESTED` の行は自動引退しない。
 - `activation.protectImportance` (既定 0.66 ≒ 2/3) 以上の重要度は通常の `tauRetire` では引退せず `R < tauRetire - 1` を要求する。
@@ -203,7 +203,7 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 
 旧承認スキーマの DB (candidates 表等) は起動失敗 (stderr 固定文 + 非ゼロ終了) し、変更・削除・移行はしない。旧ファイルを退避し、`dbPath` に新しいファイルを指定すること。
 
-現行スキーマは `user_version=9`。v2〜v8 の既存 DB は単一の `BEGIN IMMEDIATE` 移行でその場で更新する（拒否しない）。v6 からは `record_importance` と `cluster_summaries` の両方が作成され、activation の v7 (`record_importance` 保持) からは既存の重要度行を保ったまま `cluster_summaries` だけを追加する。v8 (`cluster_summaries` 保持) からは既存行を保ったまま回転 cursor の `consolidate_scope_state` だけを追加する。既に v9 のファイルは DDL を伴わない fast path で開く。
+現行スキーマは `user_version=12`。v2〜v11 の既存 DB は単一の `BEGIN IMMEDIATE` 移行でその場で更新する（拒否しない）。v11 までは `record_importance.source` の CHECK をモデル id 付き `llm:v2:<model>` を受け付ける形へ行保持のまま再構築する。v6 からは `record_importance` と `cluster_summaries` の両方が作成され、activation の v7 (`record_importance` 保持) からは既存の重要度行を保ったまま `cluster_summaries` だけを追加する。v8 (`cluster_summaries` 保持) からは既存行を保ったまま回転 cursor の `consolidate_scope_state` だけを追加する。既に v12 のファイルは DDL を伴わない fast path で開く。
 
 ## テスト
 
@@ -240,6 +240,7 @@ npm run smoke:episodes   # 実 LLM での取込 -> episode 索引スモーク (�
 - `llm.backend` は `"onnx"` (既定。現行のプロセス内 Qwen2.5-1.5B) または `"openai"`。`openai` は OpenAI 互換の `/v1/chat/completions` を呼ぶ。
 - `llm.baseUrl` は `openai` では必須で、`http(s)://127.0.0.1[:port]`、`http(s)://[::1][:port]`、`http(s)://localhost[:port]` のいずれか (任意で `/v1` を付加可能)。それ以外のホスト・任意パス・URL 内の資格情報は起動時に拒否する。外部送信は行わない。
 - `llm.model` は必須。`llm.apiKeyEnv` はトークンを持つ**環境変数名**のみを指定し、鍵そのものを設定ファイルに書かない。`llm.disableThinking` は既定 true で、リクエストに `chat_template_kwargs: {"enable_thinking": false}` を付け、応答の `<think>…</think>` を除去する。
+- `activation.llm` (任意) は保持分類器 (nature + importance) 専用の `{backend:"openai", baseUrl, model, timeoutMs?, apiKeyEnv?}`。指定時は分類器だけがこのエンドポイント/モデルを使い、`distill / consolidate / associate` はグローバル `llm` のまま。検証規則は `llm` と同じ (loopback のみ、`apiKeyEnv` は変数名のみ) で、分類器リクエストは常に `enable_thinking:false` を送る (35B の reasoning budget を消費させない)。実運用ではメインモデル `huihui-ornith-35b` を指し、9B は `llm` に残す。
 - 例 (llama.cpp `llama-server`):
 
 ```json
