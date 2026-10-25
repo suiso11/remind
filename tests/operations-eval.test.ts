@@ -10,15 +10,31 @@ let cachedStatus: number | null | undefined;
 let cachedReport: Record<string, unknown> | null = null;
 let cachedStderr = "";
 let cachedStdoutHead = "";
+let cachedErrorCode = "";
+let cachedSignal = "";
+
+// The evaluator performs ~296 real `node cli.js` subprocess calls (seeding is
+// two calls per record and the 10/30/60 scales add lifecycle/retrieval/queue
+// probes). Local Linux wall time is ~25 s of which ~99% is process startup
+// (~80 ms/call, min 80 ms, max 94 ms in the report). Wall time therefore
+// scales with per-spawn cost, not evaluator logic: a Windows runner with
+// Defender real-time scanning under `node --test` file concurrency can hit
+// ~1 s per spawn, so 300 s (the old budget) left almost no margin and twice
+// killed a healthy child with exit=null/empty stdout. 600 s keeps a hung
+// child bounded while covering ~2 s per spawn. The evaluator itself kills any
+// single CLI call at 30 s, so a genuine hang still surfaces as failures.
+const EVALUATOR_TIMEOUT_MS = 600000;
 
 before(() => {
   const r = spawnSync(process.execPath, [evaluator], {
     encoding: "buffer",
-    timeout: 300000,
+    timeout: EVALUATOR_TIMEOUT_MS,
     killSignal: "SIGKILL",
     maxBuffer: 4 * 1024 * 1024,
     shell: false,
   });
+  cachedErrorCode = r.error ? String((r.error as NodeJS.ErrnoException).code ?? "none") : "none";
+  cachedSignal = r.signal ?? "none";
   cachedStatus = r.status;
   const out: Buffer = Buffer.isBuffer(r.stdout) ? r.stdout : Buffer.from(String(r.stdout ?? ""));
   const first = out.toString("utf8").split("\n")[0] ?? "";
@@ -36,7 +52,8 @@ before(() => {
   if (cachedStatus !== 0 || cachedReport === null) {
     process.stderr.write(
       `[operations-eval] evaluator exit=${String(cachedStatus)} ` +
-      `error=${r.error ? String((r.error as Error).name) : "none"}\n` +
+      `error=${r.error ? String((r.error as Error).name) : "none"} ` +
+      `code=${cachedErrorCode} signal=${cachedSignal}\n` +
       `[operations-eval] stdout(first 4096 bytes): ${cachedStdoutHead}\n` +
       `[operations-eval] stderr(first 2048 bytes): ${cachedStderr}\n`,
     );
@@ -48,6 +65,7 @@ function diag(): string {
   const failures = (cachedReport?.["invariants"] as { failures?: unknown[] } | null)?.failures;
   const parts = [
     `evaluator exit=${String(cachedStatus)}`,
+    `errorCode=${cachedErrorCode} signal=${cachedSignal}`,
     `invariantFailures=${JSON.stringify(failures ?? "no-report")}`,
     `stderr=${JSON.stringify(cachedStderr.slice(0, 1024))}`,
   ];

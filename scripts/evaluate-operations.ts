@@ -873,6 +873,15 @@ function main(): void {
     scales.push(r.report);
     invariants.push(...r.invariants);
     if (r.failed) failed = true;
+    // Progress goes to stderr only (stdout stays the single-line JSON report).
+    // If a slow platform runner kills this process, the test's failure
+    // diagnostics print the captured stderr, making the slow phase attributable
+    // (wall time and real CLI spawn count) instead of an empty "no-report".
+    const wallMs = r.report.resources["wallMs"];
+    const calls = r.report.latency["cliCalls"];
+    process.stderr.write(
+      `[ops-eval] scale ${String(s)} done wallMs=${String(wallMs)} cliCalls=${String(calls)} failed=${String(r.failed)}\n`,
+    );
   }
   // Optional model leg: opt-in only, never downloaded, never required.
   let modelLeg: Record<string, unknown>;
