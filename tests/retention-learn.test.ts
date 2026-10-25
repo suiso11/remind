@@ -18,7 +18,8 @@ import {
 } from "../src/config.js";
 import { eventAppend, recallRecords, rememberRecord } from "../src/store.js";
 import {
-  HARVEST_MAX_NEW,
+  HARVEST_AUDIT_MAX_NEW,
+  HARVEST_EXPOSURE_MAX_NEW,
   RETENTION_EXAMPLES_MAX,
   fitRetentionWeights,
   harvestRetentionExamples,
@@ -333,7 +334,7 @@ describe("retention learner: harvest", () => {
         .prepare(`SELECT COUNT(*) AS n FROM retention_examples WHERE recallId IN ('x00001','x00002','x00003','x00004','x00005')`)
         .get() as { n: number };
       assert.equal(oldest.n, 0);
-      assert.equal(HARVEST_MAX_NEW, 2000);
+      assert.equal(HARVEST_EXPOSURE_MAX_NEW, 2000);
     } finally {
       ctx.cleanup();
     }
@@ -391,7 +392,7 @@ describe("retention learner: harvest", () => {
         `INSERT INTO audit(ts, op, targetId, code, scope, bytes, limitN, runId, recallId, reasonCode)
          VALUES (?, 'record.retire', ?, 'OK', ?, NULL, NULL, NULL, NULL, 'NO_LONGER_USEFUL')`,
       );
-      const total = HARVEST_MAX_NEW + 200;
+      const total = HARVEST_AUDIT_MAX_NEW + 200;
       ctx.db.exec("BEGIN");
       for (let i = 1; i <= total; i++) {
         const ts = new Date(Date.UTC(2026, 0, 1, 0, 0, 0) + i * 1000).toISOString();
@@ -400,12 +401,12 @@ describe("retention learner: harvest", () => {
       ctx.db.exec("COMMIT");
 
       const first = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-02T00:00:00.000Z");
-      assert.equal(first.harvested, HARVEST_MAX_NEW);
+      assert.equal(first.harvested, HARVEST_AUDIT_MAX_NEW);
       // Simulate the bounded table's pruning deleting the harvested evidence.
       ctx.db.prepare(`DELETE FROM retention_examples`).run();
 
       const second = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-02T00:00:00.000Z");
-      assert.equal(second.harvested, total - HARVEST_MAX_NEW);
+      assert.equal(second.harvested, total - HARVEST_AUDIT_MAX_NEW);
       const newest = ctx.db
         .prepare(`SELECT COUNT(*) AS n FROM retention_examples WHERE recallId = ?`)
         .get(`audit:${total}`) as { n: number };
@@ -419,6 +420,43 @@ describe("retention learner: harvest", () => {
         )
         .get(id) as { rid: number };
       assert.equal(state.lastKey, String(maxRow.rid));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("harvests user transitions even when an exposure backlog exhausts its budget", () => {
+    const ctx = setup();
+    try {
+      const id = remember(ctx.db, ctx.config, "starved-transition", "2026-01-01T00:00:00.000Z");
+      // One older, successful explicit retirement.
+      audit(ctx.db, "record.retire", id, "NO_LONGER_USEFUL", "2026-01-01T00:30:00.000Z");
+      // A full exposure budget of mature rows. Under the old shared budget the
+      // exposures were collected first and consumed every candidate slot.
+      const insert = ctx.db.prepare(
+        `INSERT INTO exposures(ts, recallId, runId, scope, recordId, snippetBytes, truncated, limitN)
+         VALUES (?, ?, NULL, ?, ?, 10, 0, 10)`,
+      );
+      ctx.db.exec("BEGIN");
+      for (let i = 0; i < HARVEST_EXPOSURE_MAX_NEW; i++) {
+        const ts = new Date(Date.UTC(2026, 0, 1, 1, 0, 0) + i * 1000).toISOString();
+        insert.run(ts, `recall-backlog-${i}`, SCOPE, id);
+      }
+      ctx.db.exec("COMMIT");
+
+      const first = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-03T00:00:00.000Z");
+      assert.equal(first.harvested, HARVEST_EXPOSURE_MAX_NEW + 1);
+      const transition = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_examples WHERE source = 'user_retire'`)
+        .get() as { n: number };
+      assert.equal(transition.n, 1, "the older transition must not be starved");
+      const exposures = ctx.db
+        .prepare(`SELECT COUNT(*) AS n FROM retention_examples WHERE source = 'exposure'`)
+        .get() as { n: number };
+      assert.equal(exposures.n, HARVEST_EXPOSURE_MAX_NEW);
+
+      const second = harvestRetentionExamples(ctx.db, ctx.config, SCOPE, "2026-01-03T00:00:00.000Z");
+      assert.equal(second.harvested, 0, "harvest remains idempotent");
     } finally {
       ctx.cleanup();
     }

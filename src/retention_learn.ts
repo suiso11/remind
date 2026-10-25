@@ -54,8 +54,14 @@ export {
   type RetentionWeights,
 } from "./retention_model.js";
 
-/** Maximum new examples inserted by one harvest call. */
-export const HARVEST_MAX_NEW = 2000;
+/**
+ * Maximum new exposure examples inserted by one harvest call. Kept separate
+ * from the user-transition budget so a large backlog of unlabeled exposures
+ * can never starve explicit user labels.
+ */
+export const HARVEST_EXPOSURE_MAX_NEW = 2000;
+/** Maximum new explicit user-transition examples inserted by one harvest call. */
+export const HARVEST_AUDIT_MAX_NEW = 500;
 /** Hard table cap; oldest rows are pruned after every harvest. */
 export const RETENTION_EXAMPLES_MAX = 20000;
 /** Weight of a calibrated exposure label. */
@@ -199,8 +205,11 @@ function writeHarvestCursor(
 }
 
 /**
- * Harvest up to HARVEST_MAX_NEW new labeled examples for a scope, then prune
- * the table to the newest RETENTION_EXAMPLES_MAX rows. Idempotent: existing
+ * Harvest up to HARVEST_AUDIT_MAX_NEW explicit user transitions and
+ * HARVEST_EXPOSURE_MAX_NEW exposure outcomes for a scope, then prune the
+ * table to the newest RETENTION_EXAMPLES_MAX rows. The per-source budgets are
+ * independent and both bounded: user transitions are collected first so a
+ * backlog of exposures cannot consume their budget. Idempotent: existing
  * (recallId, recordId, source) rows are never relabeled.
  *
  * Progress is tracked in retention_harvest_state per (scope, source), not by
@@ -245,72 +254,13 @@ export function harvestRetentionExamples(
     const auditCursor = readHarvestCursor(db, scope, HARVEST_SOURCE_AUDIT);
 
     const candidates: Candidate[] = [];
-    const remainingSlots = (): number => HARVEST_MAX_NEW - candidates.length;
 
-    // (a) Exposure outcomes whose label horizon has elapsed.
-    const exposureTie =
-      exposureCursor !== null && exposureCursor.lastKey2 !== null
-        ? `AND (e.ts > ? OR (e.ts = ? AND (e.recallId > ? OR
-             (e.recallId = ? AND e.recordId > ?))))`
-        : "";
-    const exposureParams: Array<string | number> = [scope, cutoff];
-    if (exposureCursor !== null && exposureCursor.lastKey2 !== null) {
-      exposureParams.push(
-        exposureCursor.lastTs,
-        exposureCursor.lastTs,
-        exposureCursor.lastKey,
-        exposureCursor.lastKey,
-        exposureCursor.lastKey2,
-      );
-    }
-    exposureParams.push(remainingSlots());
-    const exposures = db
-      .prepare(
-        `SELECT e.recallId AS recallId, e.recordId AS recordId, MIN(e.ts) AS ts
-           FROM exposures e
-          WHERE e.scope = ?
-            AND e.ts < ?
-            AND NOT EXISTS (
-              SELECT 1 FROM retention_examples x
-               WHERE x.recallId = e.recallId
-                 AND x.recordId = e.recordId
-                 AND x.source = '${EXPOSURE_SOURCE}')
-            ${exposureTie}
-          GROUP BY e.recallId, e.recordId
-          ORDER BY ts ASC, e.recallId ASC, e.recordId ASC
-          LIMIT ?`,
-      )
-      .all(...exposureParams) as unknown as Array<{
-      recallId: string;
-      recordId: string;
-      ts: string;
-    }>;
-    const usedStmt = db.prepare(
-      `SELECT 1 AS ok FROM usage WHERE scope = ? AND recallId = ? AND recordId = ? LIMIT 1`,
-    );
-    let exposureProgress: HarvestCursor | null = null;
-    for (const row of exposures) {
-      if (remainingSlots() <= 0) break;
-      const used = usedStmt.get(scope, row.recallId, row.recordId) !== undefined;
-      candidates.push({
-        recallId: row.recallId,
-        recordId: row.recordId,
-        source: EXPOSURE_SOURCE,
-        ts: row.ts,
-        label: used ? 1 : 0,
-        weight: EXPOSURE_WEIGHT,
-      });
-      exposureProgress = {
-        lastTs: row.ts,
-        lastKey: row.recallId,
-        lastKey2: row.recordId,
-      };
-    }
-
-    // (b) Explicit user transitions. 'audit:'+rowid is the stable recallId.
-    // Only successful audit rows count: rejected/skipped actions keep their
-    // requested reason code but carry a non-OK result code, so they must not
-    // become labels for a transition that never happened.
+    // (a) Explicit user transitions first, with their own bounded budget.
+    // 'audit:'+rowid is the stable recallId. Only successful audit rows count:
+    // rejected/skipped actions keep their requested reason code but carry a
+    // non-OK result code, so they must not become labels for a transition that
+    // never happened. Harvesting these before exposures guarantees that a
+    // large exposure backlog cannot starve explicit user labels.
     const auditTie =
       auditCursor !== null && Number.isFinite(Number(auditCursor.lastKey))
         ? `AND (a.ts > ? OR (a.ts = ? AND a.rowid > ?))`
@@ -319,7 +269,7 @@ export function harvestRetentionExamples(
     if (auditCursor !== null && Number.isFinite(Number(auditCursor.lastKey))) {
       auditParams.push(auditCursor.lastTs, auditCursor.lastTs, Number(auditCursor.lastKey));
     }
-    auditParams.push(remainingSlots());
+    auditParams.push(HARVEST_AUDIT_MAX_NEW);
     const transitions = db
       .prepare(
         `SELECT a.rowid AS rid, a.targetId AS recordId, a.ts AS ts, a.reasonCode AS reasonCode
@@ -345,8 +295,9 @@ export function harvestRetentionExamples(
       reasonCode: string;
     }>;
     let auditProgress: HarvestCursor | null = null;
+    let auditCount = 0;
     for (const row of transitions) {
-      if (remainingSlots() <= 0) break;
+      if (auditCount >= HARVEST_AUDIT_MAX_NEW) break;
       const positive = row.reasonCode === "USER_REQUESTED";
       candidates.push({
         recallId: `audit:${row.rid}`,
@@ -356,7 +307,71 @@ export function harvestRetentionExamples(
         label: positive ? 1 : 0,
         weight: USER_TRANSITION_WEIGHT,
       });
+      auditCount++;
       auditProgress = { lastTs: row.ts, lastKey: String(row.rid), lastKey2: null };
+    }
+
+    // (b) Exposure outcomes whose label horizon has elapsed, with their own
+    // independent bounded budget. Exposures resume at (ts, recallId, recordId).
+    const exposureTie =
+      exposureCursor !== null && exposureCursor.lastKey2 !== null
+        ? `AND (e.ts > ? OR (e.ts = ? AND (e.recallId > ? OR
+             (e.recallId = ? AND e.recordId > ?))))`
+        : "";
+    const exposureParams: Array<string | number> = [scope, cutoff];
+    if (exposureCursor !== null && exposureCursor.lastKey2 !== null) {
+      exposureParams.push(
+        exposureCursor.lastTs,
+        exposureCursor.lastTs,
+        exposureCursor.lastKey,
+        exposureCursor.lastKey,
+        exposureCursor.lastKey2,
+      );
+    }
+    exposureParams.push(HARVEST_EXPOSURE_MAX_NEW);
+    const exposures = db
+      .prepare(
+        `SELECT e.recallId AS recallId, e.recordId AS recordId, MIN(e.ts) AS ts
+           FROM exposures e
+          WHERE e.scope = ?
+            AND e.ts < ?
+            AND NOT EXISTS (
+              SELECT 1 FROM retention_examples x
+               WHERE x.recallId = e.recallId
+                 AND x.recordId = e.recordId
+                 AND x.source = '${EXPOSURE_SOURCE}')
+            ${exposureTie}
+          GROUP BY e.recallId, e.recordId
+          ORDER BY ts ASC, e.recallId ASC, e.recordId ASC
+          LIMIT ?`,
+      )
+      .all(...exposureParams) as unknown as Array<{
+      recallId: string;
+      recordId: string;
+      ts: string;
+    }>;
+    const usedStmt = db.prepare(
+      `SELECT 1 AS ok FROM usage WHERE scope = ? AND recallId = ? AND recordId = ? LIMIT 1`,
+    );
+    let exposureProgress: HarvestCursor | null = null;
+    let exposureCount = 0;
+    for (const row of exposures) {
+      if (exposureCount >= HARVEST_EXPOSURE_MAX_NEW) break;
+      const used = usedStmt.get(scope, row.recallId, row.recordId) !== undefined;
+      candidates.push({
+        recallId: row.recallId,
+        recordId: row.recordId,
+        source: EXPOSURE_SOURCE,
+        ts: row.ts,
+        label: used ? 1 : 0,
+        weight: EXPOSURE_WEIGHT,
+      });
+      exposureCount++;
+      exposureProgress = {
+        lastTs: row.ts,
+        lastKey: row.recallId,
+        lastKey2: row.recordId,
+      };
     }
 
     let harvested = 0;
