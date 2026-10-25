@@ -71,6 +71,7 @@ import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol
 import {
   harvestRetentionExamples,
   loadActiveRetentionWeights,
+  loadRetentionWeightsVersion,
   maybeLearn,
   type ActiveRetentionWeights,
   type LearnSkipReason,
@@ -421,6 +422,8 @@ interface PreviewCursor {
   id: string;
   /** Pinned evaluation clock so later pages use the exact same scores. */
   now: string;
+  /** Pinned weight snapshot (null = config/default prior). */
+  wv: number | null;
 }
 
 function encodeCursor(c: PreviewCursor): string {
@@ -440,7 +443,13 @@ function decodeCursor(raw: string): PreviewCursor | null {
     if (typeof id !== "string" || id.length < 1 || id.length > 256) return null;
     if (typeof now !== "string" || now.length < 1 || now.length > 64) return null;
     if (!Number.isFinite(Date.parse(now))) return null;
-    return { a, id, now };
+    // The weights snapshot is part of the pagination contract. A cursor
+    // minted before snapshots were pinned is rejected like any other
+    // malformed cursor, so pages never mix two models.
+    if (!Object.prototype.hasOwnProperty.call(o, "wv")) return null;
+    const wv = o["wv"];
+    if (wv !== null && (typeof wv !== "number" || !Number.isInteger(wv) || wv < 1)) return null;
+    return { a, id, now, wv };
   } catch {
     return null;
   }
@@ -551,7 +560,17 @@ export function activationPreview(
   const bounds: ActivationConfig = activationBounds(config);
   let active: ActiveRetentionWeights;
   try {
-    active = loadActiveRetentionWeights(db, config);
+    if (cursor === null) {
+      active = loadActiveRetentionWeights(db, config);
+    } else {
+      // Continuation pages score with the snapshot the first page used.
+      // A snapshot that vanished (rollback/prune) makes the cursor invalid.
+      const pinned = loadRetentionWeightsVersion(db, config, cursor.wv);
+      if (pinned === null) {
+        return applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+      }
+      active = pinned;
+    }
   } catch {
     return applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
   }
@@ -633,6 +652,7 @@ export function activationPreview(
               a: items[items.length - 1].A,
               id: items[items.length - 1].id,
               now,
+              wv: active.version,
             })
           : null,
       /** null = config/default prior weights (no accepted learner version). */
@@ -1014,7 +1034,10 @@ export async function maintainActivation(
     };
     try {
       learn = { ...learn, ...harvestRetentionExamples(db, config, p.scope, nowValid) };
-    } catch {
+    } catch (e) {
+      // A cap breach rolled the harvest back; surface the same
+      // STORE_UNAVAILABLE that the canonical write path reports.
+      if (e instanceof Error && e.message === "db over cap") throw e;
       degraded = true;
     }
     // Optimize/accept under the same lease and maintenance deadline. The
@@ -1034,7 +1057,8 @@ export async function maintainActivation(
         learn.trainLoss = outcome.trainLoss;
         learn.holdoutLoss = outcome.holdoutLoss;
         learn.baselineHoldoutLoss = outcome.baselineHoldoutLoss;
-      } catch {
+      } catch (e) {
+        if (e instanceof Error && e.message === "db over cap") throw e;
         degraded = true;
         learn.skipped = "error";
       }

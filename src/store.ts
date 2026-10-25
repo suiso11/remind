@@ -617,6 +617,17 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
     baselineHoldoutLoss REAL NOT NULL,
     accepted INTEGER NOT NULL,
     createdAt TEXT NOT NULL)`);
+  // Durable per-scope harvest cursors. retention_examples is bounded and
+  // pruned, so the cursor (not the example table) must remember how far each
+  // source was consumed; otherwise pruning makes the oldest transitions
+  // eligible again forever and starves newer ones.
+  db.exec(`CREATE TABLE IF NOT EXISTS retention_harvest_state(
+    scope TEXT NOT NULL,
+    source TEXT NOT NULL,
+    lastTs TEXT NOT NULL,
+    lastKey TEXT NOT NULL,
+    lastKey2 TEXT NULL,
+    PRIMARY KEY(scope, source))`);
   db.exec(`CREATE TABLE IF NOT EXISTS projection_queue(recordId TEXT PRIMARY KEY, attempts INTEGER NOT NULL, nextAt TEXT NOT NULL)`);
   // Derived lexical indexes (rebuildable; never canonical).
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(recordId UNINDEXED, body)`);

@@ -44,6 +44,7 @@ import {
   type RetentionWeights,
 } from "./retention_model.js";
 import { loadActivationInputs, type ActivationInput } from "./retention_inputs.js";
+import { assertDbUnderCap } from "./store.js";
 
 // Re-export the model helpers that belonged to this module before the split.
 export {
@@ -148,10 +149,81 @@ export function retentionFeatures(
   return snapshotFor(input, ts, params);
 }
 
+/** Durable cursor source names in retention_harvest_state. */
+const HARVEST_SOURCE_EXPOSURE = "exposure";
+const HARVEST_SOURCE_AUDIT = "audit";
+
+interface HarvestCursor {
+  lastTs: string;
+  lastKey: string;
+  lastKey2: string | null;
+}
+
+/** Additive schema; the init migration also creates it for fresh databases. */
+function ensureHarvestStateSchema(db: DatabaseSync): void {
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS retention_harvest_state(
+       scope TEXT NOT NULL,
+       source TEXT NOT NULL,
+       lastTs TEXT NOT NULL,
+       lastKey TEXT NOT NULL,
+       lastKey2 TEXT NULL,
+       PRIMARY KEY(scope, source))`,
+  );
+}
+
+function readHarvestCursor(
+  db: DatabaseSync,
+  scope: string,
+  source: string,
+): HarvestCursor | null {
+  const row = db
+    .prepare(
+      `SELECT lastTs, lastKey, lastKey2 FROM retention_harvest_state
+        WHERE scope = ? AND source = ?`,
+    )
+    .get(scope, source) as
+    | { lastTs: string; lastKey: string; lastKey2: string | null }
+    | undefined;
+  if (row === undefined) return null;
+  if (!Number.isFinite(Date.parse(row.lastTs))) return null;
+  if (typeof row.lastKey !== "string" || row.lastKey.length === 0) return null;
+  return {
+    lastTs: row.lastTs,
+    lastKey: row.lastKey,
+    lastKey2: typeof row.lastKey2 === "string" ? row.lastKey2 : null,
+  };
+}
+
+function writeHarvestCursor(
+  db: DatabaseSync,
+  scope: string,
+  source: string,
+  cursor: HarvestCursor,
+): void {
+  db.prepare(
+    `INSERT INTO retention_harvest_state(scope, source, lastTs, lastKey, lastKey2)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(scope, source) DO UPDATE SET
+       lastTs = excluded.lastTs,
+       lastKey = excluded.lastKey,
+       lastKey2 = excluded.lastKey2`,
+  ).run(scope, source, cursor.lastTs, cursor.lastKey, cursor.lastKey2);
+}
+
 /**
  * Harvest up to HARVEST_MAX_NEW new labeled examples for a scope, then prune
  * the table to the newest RETENTION_EXAMPLES_MAX rows. Idempotent: existing
  * (recallId, recordId, source) rows are never relabeled.
+ *
+ * Progress is tracked in retention_harvest_state per (scope, source), not by
+ * the bounded example table: pruning may delete old examples, but the cursor
+ * still prevents the same audit/exposure identities from consuming the next
+ * candidate budget. Exposures resume at (ts, recallId, recordId), audit rows
+ * at (ts, rowid). All writes (inserts, pruning, cursor advance) commit in one
+ * BEGIN IMMEDIATE transaction only while the database is under dbMaxBytes;
+ * a cap breach rolls the whole harvest back so no derived row leaks past the
+ * limit that a later canonical write would reject.
  */
 export function harvestRetentionExamples(
   db: DatabaseSync,
@@ -159,6 +231,7 @@ export function harvestRetentionExamples(
   scope: string,
   now: string,
 ): HarvestResult {
+  const nowMs = Date.parse(now);
   const empty = (): HarvestResult => {
     const row = db
       .prepare(
@@ -169,143 +242,200 @@ export function harvestRetentionExamples(
       .get() as { n: number; p: number };
     return { harvested: 0, examples: row.n, positives: row.p };
   };
-  const nowMs = Date.parse(now);
   if (!Number.isFinite(nowMs)) return empty();
   const learn = retentionLearnBounds(config);
   const cutoff = new Date(nowMs - Math.max(0, learn.labelHorizonMs)).toISOString();
 
-  const candidates: Candidate[] = [];
-  const remainingSlots = (): number => HARVEST_MAX_NEW - candidates.length;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    ensureHarvestStateSchema(db);
+    const exposureCursor = readHarvestCursor(db, scope, HARVEST_SOURCE_EXPOSURE);
+    const auditCursor = readHarvestCursor(db, scope, HARVEST_SOURCE_AUDIT);
 
-  // (a) Exposure outcomes whose label horizon has elapsed.
-  const exposures = db
-    .prepare(
-      `SELECT e.recallId AS recallId, e.recordId AS recordId, MIN(e.ts) AS ts
-         FROM exposures e
-        WHERE e.scope = ?
-          AND e.ts < ?
-          AND NOT EXISTS (
-            SELECT 1 FROM retention_examples x
-             WHERE x.recallId = e.recallId
-               AND x.recordId = e.recordId
-               AND x.source = '${EXPOSURE_SOURCE}')
-        GROUP BY e.recallId, e.recordId
-        ORDER BY ts ASC
-        LIMIT ?`,
-    )
-    .all(scope, cutoff, remainingSlots()) as unknown as Array<{
-    recallId: string;
-    recordId: string;
-    ts: string;
-  }>;
-  const usedStmt = db.prepare(
-    `SELECT 1 AS ok FROM usage WHERE scope = ? AND recallId = ? AND recordId = ? LIMIT 1`,
-  );
-  for (const row of exposures) {
-    if (remainingSlots() <= 0) break;
-    const used = usedStmt.get(scope, row.recallId, row.recordId) !== undefined;
-    candidates.push({
-      recallId: row.recallId,
-      recordId: row.recordId,
-      source: EXPOSURE_SOURCE,
-      ts: row.ts,
-      label: used ? 1 : 0,
-      weight: EXPOSURE_WEIGHT,
-    });
-  }
+    const candidates: Candidate[] = [];
+    const remainingSlots = (): number => HARVEST_MAX_NEW - candidates.length;
 
-  // (b) Explicit user transitions. 'audit:'+rowid is the stable recallId.
-  const transitions = db
-    .prepare(
-      `SELECT a.rowid AS rid, a.targetId AS recordId, a.ts AS ts, a.reasonCode AS reasonCode
-         FROM audit a
-        WHERE a.scope = ?
-          AND a.targetId IS NOT NULL
-          AND a.ts <= ?
-          AND a.op IN (${TRANSITION_OPS.map(() => "?").join(",")})
-          AND a.reasonCode IN ('USER_REQUESTED','NO_LONGER_USEFUL')
-          AND NOT EXISTS (
-            SELECT 1 FROM retention_examples x
-             WHERE x.recallId = 'audit:' || a.rowid
-               AND x.recordId = a.targetId)
-        ORDER BY a.ts ASC, a.rowid ASC
-        LIMIT ?`,
-    )
-    .all(
-      scope,
-      now,
-      ...TRANSITION_OPS,
-      remainingSlots(),
-    ) as unknown as Array<{
-    rid: number;
-    recordId: string;
-    ts: string;
-    reasonCode: string;
-  }>;
-  for (const row of transitions) {
-    if (remainingSlots() <= 0) break;
-    const positive = row.reasonCode === "USER_REQUESTED";
-    candidates.push({
-      recallId: `audit:${row.rid}`,
-      recordId: row.recordId,
-      source: positive ? USER_REACTIVATE_SOURCE : USER_RETIRE_SOURCE,
-      ts: row.ts,
-      label: positive ? 1 : 0,
-      weight: USER_TRANSITION_WEIGHT,
-    });
-  }
-
-  let harvested = 0;
-  if (candidates.length > 0) {
-    const params = activationBounds(config);
-    const ids = [...new Set(candidates.map((c) => c.recordId))];
-    const inputs = loadActivationInputs(db, scope, {
-      recordIds: ids,
-      maxRecords: ids.length,
-      now,
-      expiryGraceDays: params.expiryGraceDays,
-    });
-    const byId = new Map(inputs.map((i) => [i.recordId, i]));
-    const insert = db.prepare(
-      `INSERT OR IGNORE INTO retention_examples(
-         recallId, recordId, source, ts, label, weight, features, createdAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
-    for (const candidate of candidates) {
-      const input = byId.get(candidate.recordId);
-      if (input === undefined) continue;
-      const features = snapshotFor(input, candidate.ts, params);
-      const res = insert.run(
-        candidate.recallId,
-        candidate.recordId,
-        candidate.source,
-        candidate.ts,
-        candidate.label,
-        candidate.weight,
-        JSON.stringify(features),
-        now,
+    // (a) Exposure outcomes whose label horizon has elapsed.
+    const exposureTie =
+      exposureCursor !== null && exposureCursor.lastKey2 !== null
+        ? `AND (e.ts > ? OR (e.ts = ? AND (e.recallId > ? OR
+             (e.recallId = ? AND e.recordId > ?))))`
+        : "";
+    const exposureParams: Array<string | number> = [scope, cutoff];
+    if (exposureCursor !== null && exposureCursor.lastKey2 !== null) {
+      exposureParams.push(
+        exposureCursor.lastTs,
+        exposureCursor.lastTs,
+        exposureCursor.lastKey,
+        exposureCursor.lastKey,
+        exposureCursor.lastKey2,
       );
-      if (Number(res.changes) > 0) harvested++;
     }
+    exposureParams.push(remainingSlots());
+    const exposures = db
+      .prepare(
+        `SELECT e.recallId AS recallId, e.recordId AS recordId, MIN(e.ts) AS ts
+           FROM exposures e
+          WHERE e.scope = ?
+            AND e.ts < ?
+            AND NOT EXISTS (
+              SELECT 1 FROM retention_examples x
+               WHERE x.recallId = e.recallId
+                 AND x.recordId = e.recordId
+                 AND x.source = '${EXPOSURE_SOURCE}')
+            ${exposureTie}
+          GROUP BY e.recallId, e.recordId
+          ORDER BY ts ASC, e.recallId ASC, e.recordId ASC
+          LIMIT ?`,
+      )
+      .all(...exposureParams) as unknown as Array<{
+      recallId: string;
+      recordId: string;
+      ts: string;
+    }>;
+    const usedStmt = db.prepare(
+      `SELECT 1 AS ok FROM usage WHERE scope = ? AND recallId = ? AND recordId = ? LIMIT 1`,
+    );
+    let exposureProgress: HarvestCursor | null = null;
+    for (const row of exposures) {
+      if (remainingSlots() <= 0) break;
+      const used = usedStmt.get(scope, row.recallId, row.recordId) !== undefined;
+      candidates.push({
+        recallId: row.recallId,
+        recordId: row.recordId,
+        source: EXPOSURE_SOURCE,
+        ts: row.ts,
+        label: used ? 1 : 0,
+        weight: EXPOSURE_WEIGHT,
+      });
+      exposureProgress = {
+        lastTs: row.ts,
+        lastKey: row.recallId,
+        lastKey2: row.recordId,
+      };
+    }
+
+    // (b) Explicit user transitions. 'audit:'+rowid is the stable recallId.
+    // Only successful audit rows count: rejected/skipped actions keep their
+    // requested reason code but carry a non-OK result code, so they must not
+    // become labels for a transition that never happened.
+    const auditTie =
+      auditCursor !== null && Number.isFinite(Number(auditCursor.lastKey))
+        ? `AND (a.ts > ? OR (a.ts = ? AND a.rowid > ?))`
+        : "";
+    const auditParams: Array<string | number | null> = [scope, now, ...TRANSITION_OPS];
+    if (auditCursor !== null && Number.isFinite(Number(auditCursor.lastKey))) {
+      auditParams.push(auditCursor.lastTs, auditCursor.lastTs, Number(auditCursor.lastKey));
+    }
+    auditParams.push(remainingSlots());
+    const transitions = db
+      .prepare(
+        `SELECT a.rowid AS rid, a.targetId AS recordId, a.ts AS ts, a.reasonCode AS reasonCode
+           FROM audit a
+          WHERE a.scope = ?
+            AND a.targetId IS NOT NULL
+            AND a.ts <= ?
+            AND a.code = 'OK'
+            AND a.op IN (${TRANSITION_OPS.map(() => "?").join(",")})
+            AND a.reasonCode IN ('USER_REQUESTED','NO_LONGER_USEFUL')
+            AND NOT EXISTS (
+              SELECT 1 FROM retention_examples x
+               WHERE x.recallId = 'audit:' || a.rowid
+                 AND x.recordId = a.targetId)
+            ${auditTie}
+          ORDER BY a.ts ASC, a.rowid ASC
+          LIMIT ?`,
+      )
+      .all(...auditParams) as unknown as Array<{
+      rid: number;
+      recordId: string;
+      ts: string;
+      reasonCode: string;
+    }>;
+    let auditProgress: HarvestCursor | null = null;
+    for (const row of transitions) {
+      if (remainingSlots() <= 0) break;
+      const positive = row.reasonCode === "USER_REQUESTED";
+      candidates.push({
+        recallId: `audit:${row.rid}`,
+        recordId: row.recordId,
+        source: positive ? USER_REACTIVATE_SOURCE : USER_RETIRE_SOURCE,
+        ts: row.ts,
+        label: positive ? 1 : 0,
+        weight: USER_TRANSITION_WEIGHT,
+      });
+      auditProgress = { lastTs: row.ts, lastKey: String(row.rid), lastKey2: null };
+    }
+
+    let harvested = 0;
+    if (candidates.length > 0) {
+      const params = activationBounds(config);
+      const ids = [...new Set(candidates.map((c) => c.recordId))];
+      const inputs = loadActivationInputs(db, scope, {
+        recordIds: ids,
+        maxRecords: ids.length,
+        now,
+        expiryGraceDays: params.expiryGraceDays,
+      });
+      const byId = new Map(inputs.map((i) => [i.recordId, i]));
+      const insert = db.prepare(
+        `INSERT OR IGNORE INTO retention_examples(
+           recallId, recordId, source, ts, label, weight, features, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const candidate of candidates) {
+        const input = byId.get(candidate.recordId);
+        if (input === undefined) continue;
+        const features = snapshotFor(input, candidate.ts, params);
+        const res = insert.run(
+          candidate.recallId,
+          candidate.recordId,
+          candidate.source,
+          candidate.ts,
+          candidate.label,
+          candidate.weight,
+          JSON.stringify(features),
+          now,
+        );
+        if (Number(res.changes) > 0) harvested++;
+      }
+    }
+
+    // Keep only the newest rows globally (derived ledger, safe to prune).
+    db.prepare(
+      `DELETE FROM retention_examples
+        WHERE rowid NOT IN (
+          SELECT rowid FROM retention_examples
+           ORDER BY ts DESC, rowid DESC
+           LIMIT ${RETENTION_EXAMPLES_MAX})`,
+    ).run();
+
+    // Advance each source independently of what pruning retained.
+    if (exposureProgress !== null) {
+      writeHarvestCursor(db, scope, HARVEST_SOURCE_EXPOSURE, exposureProgress);
+    }
+    if (auditProgress !== null) {
+      writeHarvestCursor(db, scope, HARVEST_SOURCE_AUDIT, auditProgress);
+    }
+
+    const totals = db
+      .prepare(
+        `SELECT COUNT(*) AS n,
+                COALESCE(SUM(CASE WHEN label > 0 THEN 1 ELSE 0 END), 0) AS p
+           FROM retention_examples`,
+      )
+      .get() as { n: number; p: number };
+    assertDbUnderCap(db, config);
+    db.exec("COMMIT");
+    return { harvested, examples: totals.n, positives: totals.p };
+  } catch (e) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    throw e;
   }
-
-  // Keep only the newest rows globally (derived ledger, safe to prune).
-  db.prepare(
-    `DELETE FROM retention_examples
-      WHERE rowid NOT IN (
-        SELECT rowid FROM retention_examples
-         ORDER BY ts DESC, rowid DESC
-         LIMIT ${RETENTION_EXAMPLES_MAX})`,
-  ).run();
-
-  const totals = db
-    .prepare(
-      `SELECT COUNT(*) AS n,
-              COALESCE(SUM(CASE WHEN label > 0 THEN 1 ELSE 0 END), 0) AS p
-         FROM retention_examples`,
-    )
-    .get() as { n: number; p: number };
-  return { harvested, examples: totals.n, positives: totals.p };
 }
 
 /* ------------------------------------------------------------------ */
@@ -570,18 +700,66 @@ function fullGradient(theta: readonly number[], hold: GradientHold): number[] {
   for (const ex of hold.examples) mass += ex.weight;
   if (mass <= 0) return grad;
   for (const ex of hold.examples) {
-    const p = sigmoid(scale * dot(w, ex) + intercept);
+    const R = dot(w, ex);
+    const p = sigmoid(scale * R + intercept);
     const dR = (ex.weight * (p - ex.label)) / mass;
-    grad[n] += dR * dot(w, ex);
+    // d/dw_k of sigmoid(a*R+b) includes the logistic scale: (p-y)*a*phi_k.
+    grad[n] += dR * R;
     grad[n + 1] += dR;
     for (let i = 0; i < ex.idx.length; i++) {
-      grad[ex.idx[i]] += dR * ex.val[i];
+      grad[ex.idx[i]] += dR * scale * ex.val[i];
     }
   }
   for (let i = 0; i < n; i++) {
     grad[i] += 2 * hold.lambda * (w[i] - hold.prior[i]);
   }
   return grad;
+}
+
+/**
+ * MAP objective for a weight/scale/intercept triple:
+ * weighted log-loss + lambda * ||w - prior||^2. Exposed for gradient checks.
+ */
+export function retentionObjective(
+  examples: readonly RetentionTrainingExample[],
+  weights: RetentionWeights,
+  scale: number,
+  intercept: number,
+  prior: RetentionWeights,
+  lambda: number,
+): number {
+  const w = flattenWeights(weights);
+  const p = flattenWeights(prior);
+  const lam = Number.isFinite(lambda) && lambda > 0 ? lambda : 0;
+  let drift = 0;
+  for (let i = 0; i < w.length; i++) drift += (w[i] - p[i]) ** 2;
+  return weightedLogLoss(examples.map(prepareExample), w, scale, intercept) + lam * drift;
+}
+
+/**
+ * Analytic gradient of retentionObjective, split into weights/scale/intercept.
+ * The weight block includes the logistic scale (finite-difference checked in
+ * the tests), so the L2 prior keeps its stated strength at any fitted scale.
+ */
+export function retentionObjectiveGradient(
+  examples: readonly RetentionTrainingExample[],
+  weights: RetentionWeights,
+  scale: number,
+  intercept: number,
+  prior: RetentionWeights,
+  lambda: number,
+): { weights: number[]; scale: number; intercept: number } {
+  const lam = Number.isFinite(lambda) && lambda > 0 ? lambda : 0;
+  const grad = fullGradient(
+    [...flattenWeights(weights), scale, intercept],
+    { examples: examples.map(prepareExample), prior: flattenWeights(prior), lambda: lam },
+  );
+  const n = RETENTION_WEIGHT_COUNT;
+  return {
+    weights: grad.slice(0, n),
+    scale: grad[n],
+    intercept: grad[n + 1],
+  };
 }
 
 function scaleGradient(
@@ -735,6 +913,32 @@ export function loadActiveRetentionWeights(
     return row === null ? { version: null, weights: prior } : row;
   } catch {
     return { version: null, weights: prior };
+  }
+}
+
+/**
+ * Load the exact weight snapshot referenced by a preview cursor. A null
+ * version means the config/default prior (the first page used it); a numeric
+ * version must still exist as an accepted snapshot, otherwise the caller
+ * rejects the continuation instead of silently switching models.
+ */
+export function loadRetentionWeightsVersion(
+  db: DatabaseSync,
+  config: AppConfig,
+  version: number | null,
+): ActiveRetentionWeights | null {
+  if (version === null) {
+    return { version: null, weights: weightsFromParams(activationBounds(config)) };
+  }
+  try {
+    const row = db
+      .prepare(`SELECT version, weights FROM retention_weights WHERE version = ? AND accepted = 1`)
+      .get(version) as { version: number; weights: string } | undefined;
+    if (row === undefined) return null;
+    const weights = parseStoredWeights(row.weights);
+    return weights === null ? null : { version: row.version, weights };
+  } catch {
+    return null;
   }
 }
 
@@ -898,29 +1102,44 @@ export function maybeLearn(
     stored = fitRetentionWeights(examples, prior, bounds);
     trainLoss = stored.logLoss;
   }
-  const res = db
-    .prepare(
-      `INSERT INTO retention_weights(
-         weights, scale, intercept, nTrain, nPos, trainLoss, holdoutLoss,
-         baselineHoldoutLoss, accepted, createdAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      JSON.stringify(stored.weights),
-      stored.scale,
-      stored.intercept,
-      accepted ? n : train.length,
-      accepted ? positives : train.filter((e) => e.label > 0.5).length,
-      trainLoss,
-      holdoutLoss,
-      baselineHoldoutLoss,
-      accepted ? 1 : 0,
-      now,
-    );
+  const version = ((): number => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const res = db
+        .prepare(
+          `INSERT INTO retention_weights(
+             weights, scale, intercept, nTrain, nPos, trainLoss, holdoutLoss,
+             baselineHoldoutLoss, accepted, createdAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          JSON.stringify(stored.weights),
+          stored.scale,
+          stored.intercept,
+          accepted ? n : train.length,
+          accepted ? positives : train.filter((e) => e.label > 0.5).length,
+          trainLoss,
+          holdoutLoss,
+          baselineHoldoutLoss,
+          accepted ? 1 : 0,
+          now,
+        );
+      assertDbUnderCap(db, config);
+      db.exec("COMMIT");
+      return Number(res.lastInsertRowid);
+    } catch (e) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    }
+  })();
   return {
     attempted: true,
     accepted,
-    version: Number(res.lastInsertRowid),
+    version,
     skipped: null,
     examples: n,
     positives,
