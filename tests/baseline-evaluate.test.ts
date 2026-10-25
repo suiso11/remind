@@ -27,6 +27,8 @@ interface Attempt {
 
 let cachedStatus: number | null | undefined;
 let cachedReport: Record<string, unknown> | null = null;
+let cachedStderr = "";
+let cachedStdoutHead = "";
 
 before(() => {
   const r = spawnSync(process.execPath, [evaluator], {
@@ -43,6 +45,19 @@ before(() => {
     cachedReport = first ? (JSON.parse(first) as Record<string, unknown>) : null;
   } catch {
     cachedReport = null;
+  }
+  // Diagnostics only when the child failed: the report carries setup.reason
+  // and the evaluator's own stderr, which are the only way to attribute a
+  // platform-only subprocess failure from CI logs (bounded, never floods).
+  cachedStdoutHead = out.subarray(0, 4096).toString("utf8");
+  cachedStderr = (Buffer.isBuffer(r.stderr) ? r.stderr : Buffer.from(String(r.stderr ?? "")))
+    .subarray(0, 2048).toString("utf8");
+  if (cachedStatus !== 0 || cachedReport === null) {
+    process.stderr.write(
+      `[baseline-eval] evaluator exit=${String(cachedStatus)}\n` +
+      `[baseline-eval] stdout(first 4096 bytes): ${cachedStdoutHead}\n` +
+      `[baseline-eval] stderr(first 2048 bytes): ${cachedStderr}\n`,
+    );
   }
 });
 
@@ -73,7 +88,11 @@ function close(a: number, b: number): boolean {
 describe("baseline evaluator single-run consumer proof", () => {
   it("actual process exits 0 with ok setup and honest denominators", () => {
     const rep = report();
-    assert.equal(cachedStatus, 0);
+    assert.equal(
+      cachedStatus,
+      0,
+      `evaluator exited ${String(cachedStatus)}: setup=${JSON.stringify(rep["setup"])} invariants=${JSON.stringify(rep["invariants"])}`,
+    );
     const setup = rep["setup"] as { status?: string };
     assert.equal(setup?.status, "ok");
     const denom = rep["denominators"] as { plannedPositive?: number; plannedNegative?: number; plannedNormal?: number; executedNormal?: number; normalFailures?: number };

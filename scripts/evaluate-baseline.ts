@@ -42,7 +42,16 @@ import {
   rawBodyFor,
 } from "./fixtures/baseline-v1.js";
 
-const CLI_TIMEOUT_MS = 6000;
+// Wall-time budgets for the spawned CLI must not encode a Linux-only spawn
+// cost. A Windows CI runner under Defender real-time scanning can charge ~1 s
+// per `node cli.js` spawn (see the operations evaluator budget fix), and a
+// transient stall there once exceeded the old 5 s `cliMs` deadline during
+// seeding (setup aborted at the 6th seed, exit 1, all 36 quality rows lost).
+// The fixture has no hang of its own, so keep one bounded kill while giving
+// the child the same 30 s per-call deadline the operations evaluator uses.
+const CLI_BUDGET_MS = 30000;
+const BUSY_TIMEOUT_MS = 2000;
+const CLI_TIMEOUT_MS = CLI_BUDGET_MS + 5000;
 const MAX_BUFFER = 64 * 1024;
 const MAX_STDERR = 16 * 1024;
 const RESPONSE_MAX_BYTES = 8192;
@@ -187,7 +196,7 @@ function expectedConfig(dir: string): Record<string, unknown> {
       snippetMaxCp: 200,
       responseMaxBytes: 8192,
     },
-    timeouts: { cliMs: 5000, busyMs: 2000 },
+    timeouts: { cliMs: CLI_BUDGET_MS, busyMs: BUSY_TIMEOUT_MS },
     dbMaxBytes: 104857600,
   };
 }
@@ -716,7 +725,7 @@ function main(): void {
           bodyMaxCp: 2000, queryMaxCp: 500, tagsMax: 5, linksMax: 8, sourceRefsMax: 8,
           limitDefault: 10, limitMax: 25, snippetMaxCp: 200, responseMaxBytes: 8192,
         },
-        timeouts: { cliMs: 5000, busyMs: 2000 },
+        timeouts: { cliMs: CLI_BUDGET_MS, busyMs: BUSY_TIMEOUT_MS },
         dbMaxBytes: 104857600,
       };
       fs.writeFileSync(corruptCfgPath, JSON.stringify(corruptCfg), "utf8");
@@ -795,7 +804,7 @@ function main(): void {
       syntheticOnly: true,
       mode: { name: "M1-lexical-graph", model: null, semanticCompletion: false, acceptanceThresholds: null, futureM2Delta: null },
       runtime: { node: process.version, platform: process.platform, arch: process.arch, runUTC },
-      config: { allowedScopes: [SCOPE_P, SCOPE_W], limits: (expectedConfig(dir) as { limits: unknown }).limits, timeouts: { cliMs: 5000, busyMs: 2000 }, dbMaxBytes: 104857600 },
+      config: { allowedScopes: [SCOPE_P, SCOPE_W], limits: (expectedConfig(dir) as { limits: unknown }).limits, timeouts: { cliMs: CLI_BUDGET_MS, busyMs: BUSY_TIMEOUT_MS }, dbMaxBytes: 104857600 },
       aliasToId: Object.fromEntries(aliasToId),
       queries: BASELINE_QUERIES.map((q) => ({
         id: q.id,
