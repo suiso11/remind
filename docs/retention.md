@@ -62,7 +62,7 @@
 
 ## 可逆引退・蒸留・統合（M3 で実装済み）
 
-- 状態・スキーマ表現は `records.status` の第 4 値 `retired` に確定した（既存行を保持する savepoint 再構築で移行し、`user_version` は単一の直列化された `BEGIN IMMEDIATE` 移行の完了時に `SCHEMA_VERSION` の `3` へ更新される。既に `3` のファイルは書込みロックを取らない fast path で起動する）。
+- 状態・スキーマ表現は `records.status` の第 4 値 `retired` に確定した（既存行を保持する savepoint 再構築で移行し、`user_version` は単一の直列化された `BEGIN IMMEDIATE` 移行の完了時に `SCHEMA_VERSION` の `12` へ更新される。既に `12` のファイルは書込みロックを取らない fast path で起動する）。
 - `record.retire / record.reactivate` は `active <-> retired` の可逆遷移（冪等・固定理由コード・メタデータのみ監査）。`superseded / archived` は動かさない。通常想起・一覧（既定）・raw 下降・グラフ・ベクトルは active のみ。
 - 利用者指示の明示的検索は `record.search`（active + retired、`archived / superseded` 除外、各 item は `revision` を含む、heat・再活性化・feedback 露出なし）。一度の取出しは再活性化しない。
  - 内容・文脈の判定は外部送信なしのローカル小規模 LLM が行う。既定 (`llm.backend: "onnx"`) は `onnx-community/Qwen2.5-1.5B-Instruct` @ `d54957e3`（基盤 `Qwen/Qwen2.5-1.5B-Instruct`、license `apache-2.0`、`@huggingface/transformers@4.3.1 + onnxruntime-node@1.30.0`、量子化 ONNX `onnx/model_q4.onnx` をオフライン生成、greedy 決定論）で、取得は `npm run provision:llm` のみ。`llm.backend: "openai"` では同じ ChatML プロンプトをループバック (`127.0.0.1` / `::1` / `localhost`) の OpenAI 互換 `/v1/chat/completions` に送る。`llm.baseUrl` は loopback 以外を起動時に拒否し、外部送信は行わない。`llm.model` は必須、`llm.apiKeyEnv` は鍵を持つ環境変数名のみ、`llm.disableThinking` (既定 true) は `enable_thinking: false` と `<think>…</think>` 除去を行う。
