@@ -24,7 +24,7 @@
  *
  * Autonomous ops (all direct-commit, no approval/TTY):
  *   event.append, record.remember, record.get, record.list,
- *   record.recall, record.search, record.feedback, record.correct,
+ *   record.recall, record.search, record.stats, record.feedback, record.correct,
  *   record.archive, record.retire, record.reactivate, maintain.distill,
  *   maintain.episodes, maintain.associate, maintain.activation,
  *   maintain.consolidate, activation.preview
@@ -69,6 +69,7 @@ import {
   reactivateRecord,
   recallRecords,
   recordSources,
+  recordStats,
   rememberRecord,
   retireRecord,
   searchRecords,
@@ -309,6 +310,8 @@ export function handleValidatedRequest(
       return listRecords(db, config, params);
     case "record.sources":
       return recordSources(db, config, params);
+    case "record.stats":
+      return recordStats(db, config, params);
     case "event.get":
       return getEvent(db, config, params);
     case "event.range":
@@ -372,6 +375,7 @@ const STORE_OPS = new Set([
   "record.recall",
   "record.search",
   "record.sources",
+  "record.stats",
   "event.get",
   "event.range",
   "episode.list",
