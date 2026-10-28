@@ -345,7 +345,7 @@ describe("activation: data loading", () => {
       loaded = loadActivationInputs(ctx.db, SCOPE);
       assert.equal(loaded.find((r) => r.recordId === id)?.importance, null);
 
-      assert.equal(SCHEMA_VERSION, 12);
+      assert.equal(SCHEMA_VERSION, 13);
       assert.throws(
         () =>
           ctx.db

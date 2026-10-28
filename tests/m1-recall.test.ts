@@ -862,13 +862,14 @@ describe("canonical bodyNorm fallback without derived indexes", () => {
       assert.deepEqual(secondIds, firstIds);
       // Snippets only: no canonical body key, no raw text exposure.
       const items = (first.data as {
-        items: Array<{ id: string; snippet: string; truncated: boolean; tags: string[]; createdAt: string }>;
+        items: Array<{ id: string; snippet: string; truncated: boolean; tags: string[]; createdAt: string; evidence: string | null }>;
       }).items;
       for (const it of items) {
         // F-I01-01 additive record-identity fields join the adopted snippet
         // contract; no body/raw-text keys appear.
         assert.deepEqual(Object.keys(it).sort(), [
           "createdAt",
+          "evidence",
           "id",
           "kind",
           "revision",
