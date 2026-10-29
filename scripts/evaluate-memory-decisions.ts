@@ -34,6 +34,7 @@ import {
   type RecallItem,
 } from "./baseline-score.js";
 import { runGovernanceSuite, type GovernanceReport, type GovernanceStore } from "./decision-governance.js";
+import { scoreLinks, scoreSummary } from "./cultivation-quality.js";
 
 export const DECISIONS_VERSION = "memory-decisions-v1";
 export const DECISIONS_SCOPE = "personal/default";
@@ -736,6 +737,23 @@ interface BranchResult {
   utility: Record<number, number>;
 }
 
+type ThreadUtilities = Record<
+  string,
+  {
+    short: { utilities: Record<Action, number>; oracle: Action };
+    full: { utilities: Record<Action, number>; oracle: Action };
+  }
+>;
+
+interface StreamResult {
+  invariants: string[];
+  perThread: ThreadUtilities;
+  headroom: Record<number, number>;
+  reversal: number;
+  diversity: Record<string, number>;
+  labels: Array<Record<string, unknown>>;
+}
+
 function checkpoint(dbPath: string): void {
   const db = new DatabaseSync(dbPath);
   try {
@@ -806,7 +824,7 @@ function branchUtility(
   }
 }
 
-function lifecycleSuite(): { invariants: string[]; report: Record<string, unknown> } {
+function runLifecycleStream(streamIndex: number): StreamResult {
   const ws = new Workspace("remind-lifecycle-");
   const invariants: string[] = [];
   try {
@@ -898,35 +916,35 @@ function lifecycleSuite(): { invariants: string[]; report: Record<string, unknow
     }
     if ((fixedByHorizon[4] ?? 0) < -1e-9) invariants.push("lifecycle headroom is negative");
 
+    const labels = threads.map((t) => {
+      const heat = heatOf(ws.dbPath, t.id);
+      const exposures = exposureCount(ws.dbPath, t.id);
+      if (heat < 0 || exposures < 0) throw new HarnessError(`label feature read failed: ${t.key}`);
+      return {
+        stream: `lifecycle-${streamIndex}`,
+        features: {
+          kind: "user_fact",
+          ageHours: 0,
+          links: 0,
+          heat,
+          exposures,
+          hasConflict: false,
+        },
+        utility: {
+          keep: perThread[t.key]!.full.utilities.keep,
+          retire: perThread[t.key]!.full.utilities.retire,
+          correct: perThread[t.key]!.full.utilities.correct,
+        },
+      };
+    });
+
     return {
       invariants,
-      report: {
-        perThread,
-        headroom: fixedByHorizon,
-        horizonReversal: reversals / threads.length,
-        oracleDiversity: diversity,
-        labels: threads.map((t) => {
-          const heat = heatOf(ws.dbPath, t.id);
-          const exposures = exposureCount(ws.dbPath, t.id);
-          if (heat < 0 || exposures < 0) throw new HarnessError(`label feature read failed: ${t.key}`);
-          return {
-            stream: "lifecycle",
-            features: {
-              kind: "user_fact",
-              ageHours: 0,
-              links: 0,
-              heat,
-              exposures,
-              hasConflict: false,
-            },
-            utility: {
-              keep: perThread[t.key]!.full.utilities.keep,
-              retire: perThread[t.key]!.full.utilities.retire,
-              correct: perThread[t.key]!.full.utilities.correct,
-            },
-          };
-        }),
-      },
+      perThread,
+      headroom: fixedByHorizon,
+      reversal: reversals / threads.length,
+      diversity,
+      labels,
     };
   } finally {
     ws.cleanup();
@@ -936,6 +954,80 @@ function lifecycleSuite(): { invariants: string[]; report: Record<string, unknow
 /* ------------------------------------------------------------------ */
 /* Governance: Epistemics gates                                       */
 /* ------------------------------------------------------------------ */
+
+function mean(values: number[]): number {
+  return values.length === 0 ? 0 : values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+/** Deterministic percentile bootstrap (mean) over stream-level values. */
+function bootstrapCI(values: number[], seed: number): [number, number] {
+  if (values.length === 0) return [0, 0];
+  let state = seed >>> 0;
+  const rand = (): number => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const means: number[] = [];
+  for (let b = 0; b < 1000; b++) {
+    let sum = 0;
+    for (let i = 0; i < values.length; i++) sum += values[Math.floor(rand() * values.length)]!;
+    means.push(sum / values.length);
+  }
+  means.sort((a, b) => a - b);
+  return [means[Math.floor(means.length * 0.025)]!, means[Math.floor(means.length * 0.975)]!];
+}
+
+function lifecycleSuite(streams: number): { invariants: string[]; report: Record<string, unknown> } {
+  const invariants: string[] = [];
+  const results: StreamResult[] = [];
+  for (let i = 0; i < streams; i++) {
+    try {
+      const r = runLifecycleStream(i);
+      results.push(r);
+      invariants.push(...r.invariants);
+    } catch (e) {
+      invariants.push(`lifecycle stream ${i} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (results.length === 0) {
+    return { invariants, report: { streams: 0, headroom: {}, horizonReversal: 0, labels: [] } };
+  }
+  const headroom: Record<number, number> = {};
+  const headroomCI: Record<number, [number, number]> = {};
+  for (const h of [2, 4]) {
+    const values = results.map((r) => r.headroom[h] ?? 0);
+    headroom[h] = mean(values);
+    headroomCI[h] = bootstrapCI(values, 0x9e3779b9 ^ h);
+  }
+  const reversalValues = results.map((r) => r.reversal);
+  const reversal = mean(reversalValues);
+  const diversity: Record<string, number> = { keep: 0, retire: 0, correct: 0 };
+  for (const r of results) {
+    for (const a of ["keep", "retire", "correct"]) diversity[a] = (diversity[a] ?? 0) + (r.diversity[a] ?? 0);
+  }
+  return {
+    invariants,
+    report: {
+      streams: results.length,
+      perThread: results[0]!.perThread,
+      perStream: results.map((r, i) => ({
+        stream: i,
+        headroom: r.headroom,
+        horizonReversal: r.reversal,
+        oracleDiversity: r.diversity,
+      })),
+      headroom,
+      headroomCI,
+      horizonReversal: reversal,
+      reversalCI: bootstrapCI(reversalValues, 0x85ebca6b),
+      oracleDiversity: diversity,
+      labels: results.flatMap((r) => r.labels),
+    },
+  };
+}
 
 function governanceSuite(): { invariants: string[]; report: GovernanceReport } {
   const ws = new Workspace("remind-governance-");
@@ -1050,11 +1142,20 @@ function consolidateSuite(llmConfigPath: string | null): { invariants: string[];
   const ws = new Workspace("remind-consolidate-", true, overrides);
   const invariants: string[] = [];
   try {
-    const members = [
+    const trueMembers = [
       seedRecord(ws, "consolidate-a", "Orchard project: the harvest starts on Friday.", "user:alice"),
       seedRecord(ws, "consolidate-b", "Orchard project: the crates arrive on Thursday.", "user:alice"),
       seedRecord(ws, "consolidate-c", "Orchard project: the barn is reserved for sorting.", "user:alice"),
     ];
+    // Similar topic and vocabulary, but not part of the true fact. A grounded
+    // summary should not cite or link it.
+    const decoy = seedRecord(
+      ws,
+      "consolidate-decoy",
+      "Orchard project: the barn gate code is 9921.",
+      "user:alice",
+    );
+    const members = [...trueMembers, decoy];
     for (const member of members) {
       const r = getRecord(ws, member.id);
       if (typeof r.bodyHash !== "string") throw new HarnessError("record.get missing bodyHash");
@@ -1085,7 +1186,26 @@ function consolidateSuite(llmConfigPath: string | null): { invariants: string[];
     const summaryKind = summary.kind === "summary";
     const summarySource = typeof summary.source === "string" && summary.source.includes("derived");
     const linkCoverage = members.filter((m) => summaryLinks.includes(m.id)).length / members.length;
+    const trueLinkCoverage = trueMembers.filter((m) => summaryLinks.includes(m.id)).length / trueMembers.length;
     const linksAreMembers = summaryLinks.length > 0 && summaryLinks.every((id) => members.some((m) => m.id === id));
+    const linkQuality = scoreLinks(summaryLinks, {
+      required: trueMembers.map((m) => m.id),
+      forbidden: [decoy.id],
+    });
+    const summarySourceIds = Array.isArray(summary.sourceRefs)
+      ? summary.sourceRefs.filter((v): v is string => typeof v === "string")
+      : [];
+    const summaryQuality = scoreSummary(
+      bodyOf(summary),
+      trueMembers.map((m) => bodyOf(getRecord(ws, m.id))),
+      trueMembers.map((m) => m.eventId),
+      summarySourceIds,
+      {
+        mustInclude: ["harvest starts on Friday", "crates arrive on Thursday", "barn is reserved for sorting"],
+        mustExclude: ["9921", "gate code"],
+        requiredSourceIds: trueMembers.map((m) => m.eventId),
+      },
+    );
     const sources = sourceCount(ws, summary.id);
     const beforeSecond = countKind(ws.dbPath, "summary");
     const second = ws.must(
@@ -1113,6 +1233,9 @@ function consolidateSuite(llmConfigPath: string | null): { invariants: string[];
         summarySource,
         linksAreMembers,
         linkCoverage,
+        trueLinkCoverage,
+        linkQuality,
+        summaryQuality,
         sources,
         membersActive,
         unchanged,
@@ -1158,12 +1281,20 @@ function main(): void {
   let outPath: string | null = null;
   let labelsPath: string | null = null;
   let llmConfigPath: string | null = null;
+  let lifecycleStreams = 2;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--out" && i + 1 < args.length) outPath = args[++i]!;
     else if (args[i] === "--labels" && i + 1 < args.length) labelsPath = args[++i]!;
     else if (args[i] === "--llm-config" && i + 1 < args.length) llmConfigPath = args[++i]!;
-    else if (args[i] === "--help" || args[i] === "-h") {
-      process.stderr.write("usage: evaluate-memory-decisions [--out <json>] [--labels <jsonl>] [--llm-config <path>]\n");
+    else if (args[i] === "--streams" && i + 1 < args.length) {
+      const n = Number(args[++i]);
+      if (!Number.isInteger(n) || n < 1 || n > 8) {
+        process.stderr.write("error: --streams must be an integer 1..8\n");
+        process.exit(2);
+      }
+      lifecycleStreams = n;
+    } else if (args[i] === "--help" || args[i] === "-h") {
+      process.stderr.write("usage: evaluate-memory-decisions [--out <json>] [--labels <jsonl>] [--llm-config <path>] [--streams <1..8>]\n");
       process.stdout.write("\n");
       process.exit(0);
     } else {
@@ -1198,7 +1329,7 @@ function main(): void {
 
   let lifecycle: Record<string, unknown> = {};
   try {
-    const r = lifecycleSuite();
+    const r = lifecycleSuite(lifecycleStreams);
     lifecycle = r.report;
     invariants.push(...r.invariants);
   } catch (e) {

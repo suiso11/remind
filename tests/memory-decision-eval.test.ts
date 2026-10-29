@@ -92,12 +92,18 @@ describe("memory decision evaluator", () => {
     assert.ok(typeof support["zeroExposureRate"] === "number");
   });
 
-  it("produces counterfactual lifecycle decisions with headroom and reversal", () => {
+  it("produces counterfactual lifecycle decisions with headroom, reversal, and stream CIs", () => {
     const lifecycle = objectAt(report()["lifecycle"], "lifecycle");
+    assert.ok(typeof lifecycle["streams"] === "number" && (lifecycle["streams"] as number) >= 2);
     const headroom = objectAt(lifecycle["headroom"], "lifecycle.headroom");
     assert.ok(typeof headroom["2"] === "number" && (headroom["2"] as number) > 0);
     assert.ok(typeof headroom["4"] === "number" && (headroom["4"] as number) > 0);
+    const headroomCI = objectAt(lifecycle["headroomCI"], "lifecycle.headroomCI");
+    assert.ok(Array.isArray(headroomCI["2"]) && (headroomCI["2"] as unknown[]).length === 2);
     assert.ok(typeof lifecycle["horizonReversal"] === "number" && (lifecycle["horizonReversal"] as number) > 0);
+    assert.ok(Array.isArray(lifecycle["reversalCI"]) && (lifecycle["reversalCI"] as unknown[]).length === 2);
+    const perStream = lifecycle["perStream"];
+    assert.ok(Array.isArray(perStream) && perStream.length === lifecycle["streams"]);
     const diversity = objectAt(lifecycle["oracleDiversity"], "lifecycle.oracleDiversity");
     assert.ok(Object.values(diversity).filter((n) => typeof n === "number" && n > 0).length >= 2);
   });
@@ -116,9 +122,11 @@ describe("memory decision evaluator", () => {
     const consolidate = objectAt(report()["consolidate"], "consolidate");
     assert.equal(consolidate["status"], "skipped");
     const lines = fs.readFileSync(labelsPath, "utf8").trim().split("\n");
-    assert.equal(lines.length, 4);
-    const row = JSON.parse(lines[0]!) as Record<string, unknown>;
-    assert.equal(row["stream"], "lifecycle");
+    assert.equal(lines.length, 8);
+    const rows = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(new Set(rows.map((r) => r["stream"])).size, 2);
+    const row = rows[0]!;
+    assert.ok(typeof row["stream"] === "string" && row["stream"].startsWith("lifecycle-"));
     const features = objectAt(row["features"], "labels.features");
     for (const key of ["kind", "ageHours", "links", "heat", "exposures", "hasConflict"]) {
       assert.ok(key in features, `missing label feature ${key}`);
@@ -126,7 +134,7 @@ describe("memory decision evaluator", () => {
     objectAt(row["utility"], "labels.utility");
   });
 
-  it("rejects fitting the four-state lifecycle labels", () => {
+  it("rejects fitting the eight-state lifecycle labels", () => {
     const r = spawnSync(process.execPath, [fitScript, "--input", labelsPath], {
       encoding: "utf8",
       timeout: 60000,

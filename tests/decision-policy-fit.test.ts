@@ -60,6 +60,15 @@ describe("decision-policy-fit", () => {
     assert.equal(report.holdoutN, 30);
     assert.ok(report.holdoutUtility > report.bestFixedUtility);
     assert.equal(report.holdoutAccuracy, 1);
+    assert.equal(report.loso.length, 3);
+    for (const f of report.loso) {
+      assert.equal(f.trainN, 60);
+      assert.equal(f.holdoutN, 30);
+      assert.ok(f.policyUtility > f.bestFixedUtility, f.stream);
+      assert.ok(f.holdoutLoss < f.baselineLoss, f.stream);
+    }
+    assert.ok(report.losoMeanPolicyUtility > report.losoMeanBestFixedUtility);
+    assert.ok(report.losoMeanLossImprovement > 1e-4);
   });
 
   it("rejects a label-noise fixture", () => {
@@ -78,7 +87,11 @@ describe("decision-policy-fit", () => {
 
   it("skips a single stream and reports prevalence-unverified without prevalence evidence", () => {
     const single = run(Array.from({ length: 40 }, (_, i) => separableRow("only", i)));
-    assert.equal(single.report.reason, "skipped: <2 streams");
+    assert.equal(single.report.reason, "skipped: <3 streams");
+    const two = run(["s1", "s2"].flatMap((s) => Array.from({ length: 30 }, (_, i) => separableRow(s, i))));
+    assert.equal(two.report.accepted, false);
+    assert.equal(two.report.reason, "skipped: <3 streams");
+    assert.deepEqual(two.report.loso, []);
     const noPrev = threeStreams(separableRow).map((l) => {
       const o = JSON.parse(l);
       delete o.prevalence;
