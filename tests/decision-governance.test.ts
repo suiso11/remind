@@ -64,9 +64,11 @@ describe("runGovernanceSuite", () => {
     const r = runGovernanceSuite(fakeStore());
     assert.deepEqual(r.invariants, []);
     assert.equal(r.ok, true);
-    assert.match(r.gates.G1_poison!.detail, /model-free: no durable auto-write/);
+    assert.equal(r.gates.G1_poison!.skipped, true);
+    assert.match(r.gates.G1_poison!.detail, /skipped: model-free; no automatic durable write path/);
     assert.match(r.gates.G4_quality!.detail, /governanceByInaction: false/);
-    assert.match(r.gates.leak_count_matched!.detail, /real=3 noop=3/);
+    assert.equal(r.gates.leak_count_matched!.skipped, true);
+    assert.match(r.gates.leak_count_matched!.detail, /n\/a: deterministic suite; no sampled arms/);
   });
 
   it("fails reversibility and the quality gate when retire is a no-op", () => {

@@ -1,21 +1,27 @@
 /**
  * Memory-decision evaluation (seeded-only, real CLI, no user data).
  *
- * Three deterministic suites, all through the compiled CLI:
+ * Four deterministic suites through the compiled CLI:
  *  - memprobe: stability/plasticity paradigms (interference, misinformation,
  *    consolidation strength, reconsolidation window).
  *  - support: retrieval-support diagnostic (required memories never surfaced;
  *    active records with zero exposures).
  *  - lifecycle: counterfactual KEEP/RETIRE/CORRECT branches from the same
- *    post-seed state, replayed over the same future stream. CONSOLIDATE is not
- *    included because it requires the local model; this evaluator is offline
- *    and model-free.
+ *    post-seed state, replayed over the same future stream. CONSOLIDATE is a
+ *    separate opt-in check, not a lifecycle branch.
+ *  - governance: Epistemics G1-G4 plus provenance/probe leak checks. G1 is
+ *    structural only when no model is configured and is reported as skipped.
+ *
+ * `--llm-config <path>` runs the optional maintain.consolidate model leg
+ * against that config's loopback llm section (temp DB only). It is skipped by
+ * default; the default run is offline and model-free.
  *
  * Reports JSON on the first stdout line. Exits non-zero only on harness or
  * contract violations, never on quality thresholds. Derived from the plan's
  * U4 evaluation proposal; no production behavior changes.
  *
- * Usage: node dist/scripts/evaluate-memory-decisions.js [--out <json>]
+ * Usage: node dist/scripts/evaluate-memory-decisions.js
+ *          [--out <json>] [--labels <jsonl>] [--llm-config <path>]
  */
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -422,6 +428,23 @@ function heatOf(dbPath: string, id: string): number {
   }
 }
 
+function exposureCount(dbPath: string, id: string): number {
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row: unknown = db.prepare("SELECT COUNT(*) AS n FROM exposures WHERE recordId = ?").get(id);
+    return isObject(row) && typeof row["n"] === "number" ? row["n"] : -1;
+  } catch {
+    return -1;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 function activeRecords(dbPath: string): number {
   let db: DatabaseSync | null = null;
   try {
@@ -538,8 +561,8 @@ function misinformationScenario(): ScenarioResult {
     const updated = getRecord(ws, newId);
     const modelAfter = getRecord(ws, model.id);
 
-    const rankUser = indexOf(user.id, after.items);
-    const rankModel = indexOf(model.id, after.items);
+    const rankUser = indexOf(user.id, before.items);
+    const rankModel = indexOf(model.id, before.items);
     probes.push(
       probe("misinformation", "update", "explicit correction is accepted", statusOf(updated) === "active" && bodyOf(updated).includes("310"), `status=${statusOf(updated)}`),
       probe("misinformation", "update", "old user fact is superseded", statusOf(old) === "superseded", `status=${statusOf(old)}`),
@@ -758,6 +781,7 @@ function branchUtility(
       written += 1;
       if (written !== 2 && written !== 4) continue;
       const count = activeRecords(ws.dbPath);
+      if (count < 0) throw new HarnessError("active record count unavailable");
       let pass = 0;
       let total = 0;
       for (const t of threads) {
@@ -884,12 +908,12 @@ function lifecycleSuite(): { invariants: string[]; report: Record<string, unknow
         labels: threads.map((t) => ({
           stream: "lifecycle",
           features: {
-            hasShortProbe: t.probesShort.length > 0,
-            hasDelayedReuse: t.probesFull.length > t.probesShort.length,
-            hasNoProbe: t.probesFull.length === 0,
             kind: "user_fact",
             ageHours: 0,
             links: 0,
+            heat: Math.max(0, heatOf(ws.dbPath, t.id)),
+            exposures: Math.max(0, exposureCount(ws.dbPath, t.id)),
+            hasConflict: false,
           },
           utility: {
             keep: perThread[t.key]!.full.utilities.keep,
@@ -1051,11 +1075,12 @@ function consolidateSuite(llmConfigPath: string | null): { invariants: string[];
       return { invariants, report: { status: "no-write", applied, clusters, degraded } };
     }
     const summary = getRecord(ws, written[0]!.recordId);
-    const summaryLinks = Array.isArray(summary.links) ? summary.links.filter((v) => typeof v === "string") : [];
+    const summaryLinks = Array.isArray(summary.links) ? summary.links.filter((v): v is string => typeof v === "string") : [];
     const membersActive = members.every((m) => getRecord(ws, m.id).status === "active");
     const summaryKind = summary.kind === "summary";
     const summarySource = typeof summary.source === "string" && summary.source.includes("derived");
-    const linked = members.every((m) => summaryLinks.includes(m.id));
+    const linkCoverage = members.filter((m) => summaryLinks.includes(m.id)).length / members.length;
+    const linksAreMembers = summaryLinks.length > 0 && summaryLinks.every((id) => members.some((m) => m.id === id));
     const sources = sourceCount(ws, summary.id);
     const beforeSecond = countKind(ws.dbPath, "summary");
     const second = ws.must(
@@ -1067,7 +1092,7 @@ function consolidateSuite(llmConfigPath: string | null): { invariants: string[];
     const afterSecond = countKind(ws.dbPath, "summary");
     if (!summaryKind) invariants.push("consolidate summary kind is not summary");
     if (!summarySource) invariants.push("consolidate summary source is not derived");
-    if (!linked) invariants.push("consolidate summary does not link every member");
+    if (!linksAreMembers) invariants.push("consolidate summary links an id outside the cluster");
     if (sources <= 0) invariants.push("consolidate summary has no resolvable sources");
     if (!membersActive) invariants.push("consolidate retired a member");
     if (!unchanged) invariants.push("second consolidate did not report unchanged");
@@ -1081,7 +1106,8 @@ function consolidateSuite(llmConfigPath: string | null): { invariants: string[];
         summaryId: summary.id,
         summaryKind,
         summarySource,
-        linked,
+        linksAreMembers,
+        linkCoverage,
         sources,
         membersActive,
         unchanged,

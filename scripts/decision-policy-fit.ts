@@ -9,17 +9,18 @@ const L2 = 0.02;
 const MIN_N = 30;
 const MIN_HOLDOUT = 6;
 const MIN_IMPROVEMENT = 1e-4;
-const NUM_KEYS = ["hasShortProbe", "hasDelayedReuse", "hasNoProbe", "ageHours", "links"] as const;
+const MIN_UTILITY_MARGIN = 1e-6;
+const NUM_KEYS = ["ageHours", "links", "heat", "exposures"] as const;
 
 export interface PolicyRow {
   stream: string;
   features: {
-    hasShortProbe: boolean;
-    hasDelayedReuse: boolean;
-    hasNoProbe: boolean;
     kind: string;
     ageHours: number;
     links: number;
+    heat: number;
+    exposures: number;
+    hasConflict: boolean;
   };
   utility: Record<Action, number>;
   prevalence?: number;
@@ -31,6 +32,8 @@ export interface PolicyFitReport {
   n: number;
   trainN: number;
   holdoutN: number;
+  trainStreams: number;
+  holdoutStreams: number;
   featureNames: string[];
   weights: Record<Action, number[]> | null;
   trainLoss: number | null;
@@ -38,11 +41,43 @@ export interface PolicyFitReport {
   baselineHoldoutLoss: number | null;
   trainAccuracy: number | null;
   holdoutAccuracy: number | null;
+  holdoutUtility: number | null;
+  bestFixedUtility: number | null;
   prevalenceBuckets: Record<string, { n: number; modelLoss: number; baselineLoss: number; ok: boolean }>;
   autoApply: false;
 }
 
 const isNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+function parseRow(value: unknown, fail: (m: string) => never): PolicyRow {
+  if (!isObject(value)) return fail("row must be an object");
+  const { stream, features: f, utility: u, prevalence } = value;
+  if (typeof stream !== "string") return fail("stream must be string");
+  if (!isObject(f)) return fail("features must be an object");
+  if (!isObject(u)) return fail("utility must be an object");
+  const { kind, ageHours, links, heat, exposures, hasConflict } = f;
+  if (typeof kind !== "string") return fail("features.kind must be string");
+  if (!isNum(ageHours)) return fail("features.ageHours must be a finite number");
+  if (!isNum(links)) return fail("features.links must be a finite number");
+  if (!isNum(heat)) return fail("features.heat must be a finite number");
+  if (!isNum(exposures)) return fail("features.exposures must be a finite number");
+  if (typeof hasConflict !== "boolean") return fail("features.hasConflict must be boolean");
+  const { keep, retire, correct } = u;
+  if (!isNum(keep) || !isNum(retire) || !isNum(correct)) {
+    return fail("utility.keep/retire/correct must be finite numbers");
+  }
+  const row: PolicyRow = {
+    stream,
+    features: { kind, ageHours, links, heat, exposures, hasConflict },
+    utility: { keep, retire, correct },
+  };
+  if (prevalence !== undefined) {
+    if (!isNum(prevalence) || prevalence < 0 || prevalence > 1) return fail("prevalence must be a number in [0,1]");
+    row.prevalence = prevalence;
+  }
+  return row;
+}
 
 export function parseRows(text: string): PolicyRow[] {
   const rows: PolicyRow[] = [];
@@ -51,25 +86,13 @@ export function parseRows(text: string): PolicyRow[] {
     const fail = (m: string): never => {
       throw new Error(`line ${i + 1}: ${m}`);
     };
-    let r: any;
+    let value: unknown;
     try {
-      r = JSON.parse(line);
+      value = JSON.parse(line);
     } catch {
       return fail("invalid JSON");
     }
-    const f = r?.features;
-    const u = r?.utility;
-    if (typeof r?.stream !== "string") fail("stream must be string");
-    if (!f || typeof f.kind !== "string") fail("features.kind must be string");
-    for (const k of ["hasShortProbe", "hasDelayedReuse", "hasNoProbe"]) {
-      if (typeof f[k] !== "boolean") fail(`features.${k} must be boolean`);
-    }
-    if (!isNum(f.ageHours) || !isNum(f.links)) fail("features.ageHours/links must be finite numbers");
-    if (!u || !ACTIONS.every((a) => isNum(u[a]))) fail("utility.keep/retire/correct must be finite numbers");
-    if (r.prevalence !== undefined && !(isNum(r.prevalence) && r.prevalence >= 0 && r.prevalence <= 1)) {
-      fail("prevalence must be a number in [0,1]");
-    }
-    rows.push(r as PolicyRow);
+    rows.push(parseRow(value, fail));
   });
   return rows;
 }
@@ -90,37 +113,60 @@ function meanLoss(ps: number[][], ys: number[]): number {
   return ys.reduce((s, y, i) => s - Math.log(Math.max(ps[i][y], 1e-12)), 0) / ys.length;
 }
 
+const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
+
 export function fitPolicy(rows: PolicyRow[]): PolicyFitReport {
   const n = rows.length;
   const empty: PolicyFitReport = {
-    accepted: false, reason: "", n, trainN: 0, holdoutN: 0, featureNames: [], weights: null,
-    trainLoss: null, holdoutLoss: null, baselineHoldoutLoss: null, trainAccuracy: null,
-    holdoutAccuracy: null, prevalenceBuckets: {}, autoApply: false,
+    accepted: false, reason: "", n, trainN: 0, holdoutN: 0, trainStreams: 0, holdoutStreams: 0,
+    featureNames: [], weights: null, trainLoss: null, holdoutLoss: null, baselineHoldoutLoss: null,
+    trainAccuracy: null, holdoutAccuracy: null, holdoutUtility: null, bestFixedUtility: null,
+    prevalenceBuckets: {}, autoApply: false,
   };
-  const skip = (reason: string, extra: Partial<PolicyFitReport> = {}): PolicyFitReport => ({ ...empty, ...extra, reason });
-  if (n < MIN_N) return skip(`skipped: n=${n} < ${MIN_N}`);
+  const result = (reason: string, extra: Partial<PolicyFitReport> = {}): PolicyFitReport => ({
+    ...empty, ...extra, reason, accepted: reason === "accepted",
+  });
+  if (n < MIN_N) return result(`skipped: n=${n} < ${MIN_N}`);
 
-  // Stream-ordered (stable, so input order breaks ties); last 20% is holdout.
-  const sorted = rows.map((r, i) => ({ r, i })).sort((a, b) => (a.r.stream < b.r.stream ? -1 : a.r.stream > b.r.stream ? 1 : a.i - b.i)).map((x) => x.r);
-  const holdoutN = Math.floor(n * 0.2);
-  const trainN = n - holdoutN;
-  if (holdoutN < MIN_HOLDOUT) return skip(`skipped: holdout=${holdoutN} < ${MIN_HOLDOUT}`, { trainN, holdoutN });
-  const train = sorted.slice(0, trainN);
-  const hold = sorted.slice(trainN);
+  // Group by stream (sorted by stream id, input order within a stream). A stream is never split.
+  const byStream = new Map<string, PolicyRow[]>();
+  for (const r of rows) {
+    const g = byStream.get(r.stream);
+    if (g) g.push(r);
+    else byStream.set(r.stream, [r]);
+  }
+  const streams = [...byStream.keys()].sort();
+  if (streams.length < 2) return result("skipped: <2 streams");
+
+  // Take whole streams from the end until the holdout is large enough; keep >=1 stream for train.
+  const target = Math.max(MIN_HOLDOUT, Math.ceil(0.2 * n));
+  let cut = streams.length;
+  let holdoutN = 0;
+  while (cut > 1 && holdoutN < target) {
+    cut--;
+    holdoutN += byStream.get(streams[cut])?.length ?? 0;
+  }
+  const train = streams.slice(0, cut).flatMap((s) => byStream.get(s) ?? []);
+  const hold = streams.slice(cut).flatMap((s) => byStream.get(s) ?? []);
+  const trainN = train.length;
+  const split = { trainN, holdoutN, trainStreams: cut, holdoutStreams: streams.length - cut };
+  if (holdoutN < MIN_HOLDOUT) return result(`skipped: holdout=${holdoutN} < ${MIN_HOLDOUT}`, split);
+
   const label = (r: PolicyRow) => argmax(ACTIONS.map((a) => r.utility[a]));
   const ytr = train.map(label);
   const yho = hold.map(label);
-  if (new Set(ytr).size < 2) return skip("skipped: <2 distinct argmax classes in train", { trainN, holdoutN });
+  if (new Set(ytr).size < 2) return result("skipped: <2 distinct argmax classes in train", split);
 
   const kinds = [...new Set(train.map((r) => r.features.kind))].sort();
-  const featureNames = ["bias", ...NUM_KEYS, ...kinds.map((k) => `kind=${k}`)];
-  const raw = (r: PolicyRow) => NUM_KEYS.map((k) => Number(r.features[k]));
+  const featureNames = ["bias", ...NUM_KEYS, "hasConflict", ...kinds.map((k) => `kind=${k}`)];
+  const raw = (r: PolicyRow) => NUM_KEYS.map((k) => r.features[k]);
   // Standardize numeric columns with train statistics only.
-  const mean = NUM_KEYS.map((_, j) => train.reduce((s, r) => s + raw(r)[j], 0) / trainN);
-  const std = NUM_KEYS.map((_, j) => Math.sqrt(train.reduce((s, r) => s + (raw(r)[j] - mean[j]) ** 2, 0) / trainN) || 1);
+  const mu = NUM_KEYS.map((_, j) => mean(train.map((r) => raw(r)[j])));
+  const sd = NUM_KEYS.map((_, j) => Math.sqrt(mean(train.map((r) => (raw(r)[j] - mu[j]) ** 2))) || 1);
   const vec = (r: PolicyRow) => [
     1,
-    ...raw(r).map((v, j) => (v - mean[j]) / std[j]),
+    ...raw(r).map((v, j) => (v - mu[j]) / sd[j]),
+    r.features.hasConflict ? 1 : 0,
     ...kinds.map((k) => (r.features.kind === k ? 1 : 0)),
   ];
   const xtr = train.map(vec);
@@ -147,16 +193,17 @@ export function fitPolicy(rows: PolicyRow[]): PolicyFitReport {
   const counts = [0, 0, 0];
   ytr.forEach((y) => counts[y]++);
   const prior = counts.map((c) => (c + 1) / (trainN + 3));
-  const base = yho.map(() => prior);
   const trainLoss = meanLoss(ptr, ytr);
   const holdoutLoss = meanLoss(pho, yho);
-  const baselineHoldoutLoss = meanLoss(base, yho);
+  const baselineHoldoutLoss = meanLoss(yho.map(() => prior), yho);
   const acc = (ps: number[][], ys: number[]) => ys.filter((y, i) => argmax(ps[i]) === y).length / ys.length;
 
+  const holdoutUtility = mean(hold.map((r, i) => r.utility[ACTIONS[argmax(pho[i])]]));
+  const bestFixedUtility = Math.max(...ACTIONS.map((a) => mean(hold.map((r) => r.utility[a]))));
+
   const buckets: PolicyFitReport["prevalenceBuckets"] = {};
-  const names = ["low", "mid", "high"];
-  names.forEach((name, b) => {
-    const idx = hold.map((r, i) => i).filter((i) => {
+  ["low", "mid", "high"].forEach((name, b) => {
+    const idx = hold.map((_, i) => i).filter((i) => {
       const p = hold[i].prevalence;
       return p !== undefined && (p < 1 / 3 ? 0 : p < 2 / 3 ? 1 : 2) === b;
     });
@@ -166,19 +213,24 @@ export function fitPolicy(rows: PolicyRow[]): PolicyFitReport {
     buckets[name] = { n: idx.length, modelLoss, baselineLoss, ok: modelLoss <= baselineLoss };
   });
 
-  const weights = Object.fromEntries(ACTIONS.map((a, c) => [a, W[c]])) as Record<Action, number[]>;
+  const weights: Record<Action, number[]> = { keep: W[0], retire: W[1], correct: W[2] };
   const improvement = baselineHoldoutLoss - holdoutLoss;
+  const badBuckets = Object.entries(buckets).filter(([, v]) => !v.ok).map(([k]) => k);
   let reason = "accepted";
-  if (!(improvement > MIN_IMPROVEMENT)) reason = `rejected: holdout log-loss improvement ${improvement.toFixed(6)} <= ${MIN_IMPROVEMENT}`;
-  else {
-    const bad = Object.entries(buckets).filter(([, v]) => !v.ok).map(([k]) => k);
-    if (bad.length) reason = `rejected: prevalence bucket worse than baseline: ${bad.join(",")}`;
+  if (!(holdoutUtility > bestFixedUtility + MIN_UTILITY_MARGIN)) {
+    reason = `rejected: holdout utility ${holdoutUtility.toFixed(6)} does not beat best fixed action ${bestFixedUtility.toFixed(6)}`;
+  } else if (!(improvement > MIN_IMPROVEMENT)) {
+    reason = `rejected: holdout log-loss improvement ${improvement.toFixed(6)} <= ${MIN_IMPROVEMENT}`;
+  } else if (Object.keys(buckets).length < 2) {
+    reason = "prevalence-unverified";
+  } else if (badBuckets.length > 0) {
+    reason = `rejected: prevalence bucket worse than baseline: ${badBuckets.join(",")}`;
   }
-  return {
-    ...empty, accepted: reason === "accepted", reason, trainN, holdoutN, featureNames, weights,
-    trainLoss, holdoutLoss, baselineHoldoutLoss, trainAccuracy: acc(ptr, ytr),
-    holdoutAccuracy: acc(pho, yho), prevalenceBuckets: buckets,
-  };
+  return result(reason, {
+    ...split, featureNames, weights, trainLoss, holdoutLoss, baselineHoldoutLoss,
+    trainAccuracy: acc(ptr, ytr), holdoutAccuracy: acc(pho, yho), holdoutUtility, bestFixedUtility,
+    prevalenceBuckets: buckets,
+  });
 }
 
 function main(argv: string[]): number {
@@ -196,7 +248,7 @@ function main(argv: string[]): number {
   try {
     report = fitPolicy(parseRows(fs.readFileSync(input, "utf8")));
   } catch (e) {
-    process.stderr.write(`decision-policy-fit: ${(e as Error).message}\n`);
+    process.stderr.write(`decision-policy-fit: ${e instanceof Error ? e.message : String(e)}\n`);
     return 2;
   }
   const json = JSON.stringify(report, null, 2) + "\n";

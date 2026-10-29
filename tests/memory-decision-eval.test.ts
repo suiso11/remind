@@ -119,7 +119,7 @@ describe("memory decision evaluator", () => {
     const row = JSON.parse(lines[0]!) as Record<string, unknown>;
     assert.equal(row["stream"], "lifecycle");
     const features = objectAt(row["features"], "labels.features");
-    for (const key of ["hasShortProbe", "hasDelayedReuse", "hasNoProbe", "kind", "ageHours", "links"]) {
+    for (const key of ["kind", "ageHours", "links", "heat", "exposures", "hasConflict"]) {
       assert.ok(key in features, `missing label feature ${key}`);
     }
     objectAt(row["utility"], "labels.utility");
