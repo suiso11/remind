@@ -13,7 +13,7 @@
   - VitaBench 型の反事実ライフサイクル（KEEP / RETIRE / CORRECT）
   - Epistemics 型の governance（G1–G4、leak 検査）
   - 評価ラベルからのオフライン fit（自動適用なし）
-- 検証: `npm test` **453 件成功**。実モデル smoke は exit 0（`maintain.consolidate` は opt-in）。
+- 検証: `npm test` **464 件成功**（master の #41/#42 を含む）。実モデル smoke は exit 0（`maintain.consolidate` は opt-in）。
 - 本レポートの実装は**本番未デプロイ**。production の保持重み学習はまだ 1 度も受理されていない（後述）。
 
 ## 1. 論文と採否
@@ -93,7 +93,7 @@
 
 ## 4. 実測と検証
 
-- `npm test`: **453 件成功**（125 suites）。
+- `npm test`: **464 件成功**（129 suites。master の #41/#42 を含む）。
 - 実モデル smoke（`--llm-config ~/.config/remind/memory.config.json`）: exit 0。
   - `maintain.consolidate`: applied 1、sentencesKept 1、sources 3、linkCoverage 1.0、2 回目 unchanged。
   - governance: 全 gate pass（G1 skipped、count-matched n/a）。
