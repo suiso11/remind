@@ -565,7 +565,7 @@ describe("privacy metadata: cultivation propagation", () => {
           return "the kayak paddle leans by the side door";
         }
         if (prompt.includes("Merge these related memories")) {
-          return "the kayak paddle leans by the side door";
+          return "the kayak paddle is stored by the side door";
         }
         return "KEEP";
       };
