@@ -359,10 +359,8 @@ function heatOf(dbPath: string, id: string): number {
   let db: DatabaseSync | null = null;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
-    const row = db.prepare("SELECT usedCount FROM note_heat WHERE recordId = ?").get(id) as
-      | { usedCount?: unknown }
-      | undefined;
-    return typeof row?.usedCount === "number" ? row.usedCount : 0;
+    const row: unknown = db.prepare("SELECT usedCount FROM note_heat WHERE recordId = ?").get(id);
+    return isObject(row) && typeof row["usedCount"] === "number" ? row["usedCount"] : 0;
   } catch {
     return -1;
   } finally {
@@ -378,10 +376,10 @@ function activeRecords(dbPath: string): number {
   let db: DatabaseSync | null = null;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
-    const row = db.prepare("SELECT COUNT(*) AS n FROM records WHERE status = 'active' AND scope = ?").get(
-      DECISIONS_SCOPE,
-    ) as { n?: unknown } | undefined;
-    return typeof row?.n === "number" ? row.n : -1;
+    const row: unknown = db
+      .prepare("SELECT COUNT(*) AS n FROM records WHERE status = 'active' AND scope = ?")
+      .get(DECISIONS_SCOPE);
+    return isObject(row) && typeof row["n"] === "number" ? row["n"] : -1;
   } catch {
     return -1;
   } finally {
@@ -397,15 +395,13 @@ function exposureStats(dbPath: string): { exposedDistinct: number; active: numbe
   let db: DatabaseSync | null = null;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
-    const exposed = db.prepare("SELECT COUNT(DISTINCT recordId) AS n FROM exposures").get() as
-      | { n?: unknown }
-      | undefined;
-    const active = db
+    const exposed: unknown = db.prepare("SELECT COUNT(DISTINCT recordId) AS n FROM exposures").get();
+    const active: unknown = db
       .prepare("SELECT COUNT(*) AS n FROM records WHERE status = 'active' AND scope = ?")
-      .get(DECISIONS_SCOPE) as { n?: unknown } | undefined;
+      .get(DECISIONS_SCOPE);
     return {
-      exposedDistinct: typeof exposed?.n === "number" ? exposed.n : -1,
-      active: typeof active?.n === "number" ? active.n : -1,
+      exposedDistinct: isObject(exposed) && typeof exposed["n"] === "number" ? exposed["n"] : -1,
+      active: isObject(active) && typeof active["n"] === "number" ? active["n"] : -1,
     };
   } catch {
     return { exposedDistinct: -1, active: -1 };
@@ -695,7 +691,8 @@ function branchUtility(
   copyDb(baseDbPath, branchDir);
   const ws = new Workspace(branchDir, false);
   const expected: Record<string, string | null> = {};
-  for (const t of threads) expected[t.key] = t.expected[action] ?? t.id;
+  for (const t of threads) expected[t.key] = t.expected.keep;
+  expected[target.key] = target.expected[action];
 
   try {
     if (action === "retire") retire(ws, target.id);
@@ -703,7 +700,6 @@ function branchUtility(
       const newId = correct(ws, target.id, target.replacement, "user:alice", [target.eventId]);
       expected[target.key] = target.key === "conflict" ? newId : null;
     }
-    if (action === "keep" && target.key === "conflict") expected[target.key] = null;
 
     const utility: Record<number, number> = {};
     let written = 0;
@@ -756,7 +752,9 @@ function lifecycleSuite(): { invariants: string[]; report: Record<string, unknow
     };
     threads.push(seed("exact", "The vault passphrase is ORCHID-42.", "The vault passphrase is TULIP-77.", ["vault passphrase ORCHID-42"]));
     threads.push(seed("recurrent", "The daily standup is at 9:30.", "The daily standup is at 10:30.", ["daily standup time 9:30"]));
-    threads.push(seed("conflict", "The project deadline is October 10.", "The project deadline is October 20.", ["project deadline October"]));
+    const conflict = seed("conflict", "The project deadline is October 10.", "The project deadline is October 20.", ["project deadline October"]);
+    conflict.expected.keep = null;
+    threads.push(conflict);
     threads.push(seed("transient", "The courier will call at 3pm on Tuesday about the parcel.", "The courier will call at 5pm on Tuesday about the parcel.", [], ["courier parcel delivery log"]));
     // Filler rows keep the recall window competitive without being probed.
     for (let i = 0; i < 4; i++) {
@@ -917,6 +915,10 @@ function main(): void {
     invariants.push(`lifecycle suite failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
+  const sorted = [...LATENCIES].sort((a, b) => a - b);
+  const p50 = sorted.length > 0 ? (sorted[Math.floor(sorted.length * 0.5)] ?? null) : null;
+  const p95 = sorted.length > 0 ? (sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? null) : null;
+
   const report = {
     version: DECISIONS_VERSION,
     scope: DECISIONS_SCOPE,
@@ -931,18 +933,12 @@ function main(): void {
     invariants,
     latency: {
       calls: LATENCIES.length,
-      p50: null as number | null,
-      p95: null as number | null,
+      p50,
+      p95,
       totalMs: Number(process.hrtime.bigint() - started) / 1e6,
     },
     ok: invariants.length === 0,
   };
-
-  const sorted = [...LATENCIES].sort((a, b) => a - b);
-  if (sorted.length > 0) {
-    report.latency.p50 = sorted[Math.floor(sorted.length * 0.5)] ?? null;
-    report.latency.p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? null;
-  }
 
   const line = JSON.stringify(report) + "\n";
   process.stdout.write(line);
