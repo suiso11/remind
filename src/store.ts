@@ -2468,6 +2468,141 @@ export function listRecords(
   }
 }
 
+/**
+ * record.stats {scope}: bounded aggregate counts for one scope.
+ *
+ * - byKind / importance cover active records only; byStatus covers every
+ *   status. Buckets use the actual importance range [0,1] produced by the
+ *   classifier (`importance / 3` with an integer 0..3). External ledgers are
+ *   not range-checked by the schema, so out-of-range values are clamped into
+ *   the first/last bucket and `scored` always equals the bucket sum.
+ * - A record_importance row is counted as scored only while its bodyHash
+ *   matches the current record body (the same freshness rule used by
+ *   activation.preview / loadActivationInputs). Missing or stale rows are
+ *   counted as unscored.
+ * - One read transaction, GROUP BY aggregates only: no per-record loop and
+ *   no bodies in the response. Follows record.list: writes one metadata-only
+ *   audit row and stays readable over the configured DB cap.
+ */
+export function recordStats(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  for (const k of Object.keys(params)) {
+    if (k !== "scope") return budgeted(bad(), config);
+  }
+  const nScope = parseScope(params["scope"]);
+  if (!nScope) return budgeted(bad(), config);
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      const byStatus: Record<string, number> = {
+        active: 0,
+        superseded: 0,
+        archived: 0,
+        retired: 0,
+      };
+      const byKind: Record<string, number> = {};
+      for (const k of RECORD_KINDS) byKind[k] = 0;
+      const buckets = [
+        { lt: 0.2, count: 0 },
+        { lt: 0.4, count: 0 },
+        { lt: 0.6, count: 0 },
+        { lt: 0.8, count: 0 },
+        { lt: 1.0001, count: 0 },
+      ];
+      let scored = 0;
+      try {
+        const statusRows = db
+          .prepare(`SELECT status, COUNT(*) AS n FROM records WHERE scope = ? GROUP BY status`)
+          .all(nScope) as Array<{ status: string; n: number }>;
+        for (const r of statusRows) {
+          if (Object.prototype.hasOwnProperty.call(byStatus, r.status)) {
+            byStatus[r.status] = Number(r.n);
+          }
+        }
+        const kindRows = db
+          .prepare(
+            `SELECT kind, COUNT(*) AS n FROM records
+             WHERE scope = ? AND status = 'active' GROUP BY kind`,
+          )
+          .all(nScope) as Array<{ kind: string; n: number }>;
+        for (const r of kindRows) {
+          if (Object.prototype.hasOwnProperty.call(byKind, r.kind)) {
+            byKind[r.kind] = Number(r.n);
+          }
+        }
+        const imp = db
+          .prepare(
+            `SELECT
+               COUNT(*) AS scored,
+               SUM(CASE WHEN i.importance < 0.2 THEN 1 ELSE 0 END) AS b1,
+               SUM(CASE WHEN i.importance >= 0.2 AND i.importance < 0.4 THEN 1 ELSE 0 END) AS b2,
+               SUM(CASE WHEN i.importance >= 0.4 AND i.importance < 0.6 THEN 1 ELSE 0 END) AS b3,
+               SUM(CASE WHEN i.importance >= 0.6 AND i.importance < 0.8 THEN 1 ELSE 0 END) AS b4,
+               SUM(CASE WHEN i.importance >= 0.8 THEN 1 ELSE 0 END) AS b5
+             FROM records r
+             JOIN record_importance i
+               ON i.recordId = r.id AND i.bodyHash = r.bodyHash
+             WHERE r.scope = ? AND r.status = 'active'`,
+          )
+          .get(nScope) as
+          | { scored: number; b1: number; b2: number; b3: number; b4: number; b5: number }
+          | undefined;
+        scored = Number(imp?.scored ?? 0);
+        buckets[0]!.count = Number(imp?.b1 ?? 0);
+        buckets[1]!.count = Number(imp?.b2 ?? 0);
+        buckets[2]!.count = Number(imp?.b3 ?? 0);
+        buckets[3]!.count = Number(imp?.b4 ?? 0);
+        buckets[4]!.count = Number(imp?.b5 ?? 0);
+      } catch {
+        throw new Error("read failed");
+      }
+      const active = byStatus["active"] ?? 0;
+      const stored = budgeted(
+        ok({
+          scope: nScope,
+          byKind,
+          byStatus,
+          importance: {
+            scored,
+            unscored: Math.max(0, active - scored),
+            buckets,
+          },
+          computedAt: now,
+        }),
+        config,
+      );
+      if (!stored.ok) throw new Error("response over budget");
+      auditInsert(db, {
+        ts: now,
+        op: "record.stats",
+        targetId: null,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: null,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* graph.page: bounded linked-memory graph for Companion              */
 /* ------------------------------------------------------------------ */
