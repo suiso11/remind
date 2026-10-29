@@ -86,7 +86,7 @@ import {
   parseSummaryBody,
   resolveLlmDir,
 } from "./llm.js";
-import { countCp, hasControl, requestHashFor } from "./normalize.js";
+import { bodyHashFor, countCp, hasControl, normalizeBody, requestHashFor } from "./normalize.js";
 import { applyResponseBudget, fail, ok, type ResponseEnvelope } from "./protocol.js";
 import { isScopeAuthorized } from "./store.js";
 
@@ -578,6 +578,7 @@ export async function maintainDistill(
         planned.push({ review: extra.review, action: keepOf(extra.target.id, extra.target.revision), retry: false });
       }
     }
+    const plannedSummaryHashes = new Set<string>();
     for (const s of deduped) {
       if (!renewOrAbort()) {
         settleOwned(items.map((it) => it.queueId));
@@ -633,6 +634,23 @@ export async function maintainDistill(
         }
         continue;
       }
+      // A merge that reproduces an existing active body adds no new memory.
+      // This happens when a source is itself a summary/correction; keep
+      // instead of creating a cross-batch duplicate summary.
+      const summaryHash = bodyHashFor(normalizeBody(summaryBody));
+      let duplicateActive = false;
+      try {
+        duplicateActive = db
+          .prepare(`SELECT 1 AS one FROM records WHERE scope = ? AND status = 'active' AND bodyHash = ? LIMIT 1`)
+          .get(p.scope, summaryHash) !== undefined;
+      } catch {
+        duplicateActive = true; // fail closed: never write when the check cannot run
+      }
+      if (duplicateActive || plannedSummaryHashes.has(summaryHash)) {
+        planned.push({ review: s.review, action: keepOf(target.id, target.revision), retry: false });
+        continue;
+      }
+      plannedSummaryHashes.add(summaryHash);
       // Provenance union is conservative: when both sources together carry
       // more distinct source refs than sourceRefsMax, the merge is skipped
       // (audited keep) rather than written with truncated provenance.

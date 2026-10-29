@@ -882,6 +882,72 @@ describe("m3 distill reciprocal pair dedup", () => {
       ctx.cleanup();
     }
   });
+
+  it("keeps when the drafted summary equals an active source body", async () => {
+    // Cross-batch duplicate guard: a merge of a summary/correction with its
+    // source can reproduce an existing body. That must be an audited keep,
+    // not a second active summary with the same bodyHash.
+    const ctx = setup();
+    try {
+      const modelDir = path.join(ctx.dir, "fake-llm");
+      fs.mkdirSync(path.join(modelDir, "onnx"), { recursive: true });
+      for (const f of [
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "onnx/model_q4.onnx",
+      ]) {
+        fs.writeFileSync(path.join(modelDir, f), "{}");
+      }
+      ctx.config.llm = { modelDir, timeoutMs: 5000, enabled: true, maxNewTokens: 48, maxPromptChars: 2000 };
+      const configPath = path.join(ctx.dir, "memory.config.json");
+      const bodyA = "the cabin spare key hangs inside the woodshed on a blue hook";
+      const bodyB = "the cabin spare key is on the blue hook in the woodshed";
+      const idA = remember(ctx.db, ctx.config, bodyA, "m3-dup-body-a");
+      const idB = remember(ctx.db, ctx.config, bodyB, "m3-dup-body-b");
+      const decide = async (prompt: string): Promise<string | null> => {
+        if (prompt.includes("What lasting fact")) return "the cabin spare key is a lasting fact";
+        if (prompt.includes("Other memories")) {
+          const head = prompt.split("Other memories")[0] ?? "";
+          if (!/cabin|blue hook|woodshed/i.test(head)) return "KEEP";
+          const peerRe = /^\s*(\d+)\.\s+"""(.*)"""\s*$/gm;
+          let m: RegExpExecArray | null;
+          while ((m = peerRe.exec(prompt)) !== null) {
+            if (/cabin|blue hook|woodshed/i.test(m[2] ?? "")) return `MERGE ${m[1]}`;
+          }
+          return "KEEP";
+        }
+        if (prompt.includes("What single fact do both memories")) {
+          return "the cabin spare key is on the blue hook in the woodshed";
+        }
+        if (prompt.includes("Merge these related memories")) return bodyA;
+        return "KEEP";
+      };
+      const res = await maintainDistill(
+        ctx.db,
+        ctx.config,
+        configPath,
+        { scope: "personal/default", limit: 10 },
+        "m3-dup-body-k1",
+        decide,
+        T3,
+      );
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const d = (res.data as { distill: { applied: number } }).distill;
+      assert.equal(d.applied, 0);
+      const summaries = ctx.db.prepare(`SELECT id FROM records WHERE kind='summary'`).all() as Array<{ id: string }>;
+      assert.equal(summaries.length, 0, `duplicate summary rows: ${summaries.length}`);
+      for (const id of [idA, idB]) {
+        const v = getRecord(ctx.db, ctx.config, { id, scope: "personal/default" });
+        assert.equal((v.data as { record: { status: string } }).record.status, "active");
+      }
+      assert.equal(countOpenCultivationReviews(ctx.db), 0);
+    } finally {
+      ctx.cleanup();
+    }
+  });
 });
 
 describe("m3 review fixes (orphan/degraded/singleflight/cursor/cancel/dup/search/prompts)", () => {
