@@ -65,6 +65,8 @@ export interface FakeMemoryHit {
   /** Additive F-I01-01 fields (optional; recorded when present, never required). */
   revision?: number;
   kind?: string;
+  /** v13 evidence quote (optional; null/absent for non-user_fact rows). */
+  evidence?: string | null;
 }
 
 export type FakeAdapterResult =
@@ -157,16 +159,24 @@ function validId(s: unknown): s is string {
 function validItem(v: unknown): v is FakeMemoryHit {
   if (!isPlainObject(v)) return false;
   // Adopted contract fields plus the additive F-I01-01 record-identity keys
-  // (revision, kind optional). Unknown extras beyond that set remain rejected.
+  // (revision, kind optional) and the v13 evidence quote. Unknown extras
+  // beyond that set remain rejected.
   const keys = Object.keys(v).sort().join(",");
   if (
     keys !== "createdAt,id,snippet,tags,truncated" &&
-    keys !== "createdAt,id,kind,revision,snippet,tags,truncated"
+    keys !== "createdAt,id,kind,revision,snippet,tags,truncated" &&
+    keys !== "createdAt,evidence,id,kind,revision,snippet,tags,truncated"
   ) {
     return false;
   }
   if (v["revision"] !== undefined && typeof v["revision"] !== "number") return false;
   if (v["kind"] !== undefined && typeof v["kind"] !== "string") return false;
+  if (v["evidence"] !== undefined && v["evidence"] !== null) {
+    const ev = v["evidence"];
+    if (typeof ev !== "string" || countCp(ev) > 400 || CONTROL_RE.test(ev) || hasLoneSurrogate(ev)) {
+      return false;
+    }
+  }
   if (!validId(v["id"])) return false;
   if (typeof v["snippet"] !== "string" || countCp(v["snippet"]) > 200) return false;
   if (hasLoneSurrogate(v["snippet"] as string)) return false;
@@ -344,6 +354,7 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
     };
     if (h.revision !== undefined) hit.revision = h.revision;
     if (h.kind !== undefined) hit.kind = h.kind;
+    if (h.evidence !== undefined) hit.evidence = h.evidence;
     hits.push(hit);
   }
   // The adapter only exposes the scope it actually requested: no cross-scope

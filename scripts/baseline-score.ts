@@ -277,21 +277,31 @@ export interface RecallItem {
   /** Additive F-I01-01 record-identity fields (optional). */
   revision?: number;
   kind?: string;
+  /** v13 evidence quote (optional; null/absent for non-user_fact rows). */
+  evidence?: string | null;
 }
 
 function validRecallItem(v: unknown): v is RecallItem {
   if (!isPlainObject(v)) return false;
   // Adopted contract fields plus the additive F-I01-01 keys (revision, kind
-  // optional). Unknown extras beyond that set remain rejected.
+  // optional) and the v13 evidence quote. Unknown extras beyond that set
+  // remain rejected.
   const keys = Object.keys(v).sort().join(",");
   if (
     keys !== "createdAt,id,snippet,tags,truncated" &&
-    keys !== "createdAt,id,kind,revision,snippet,tags,truncated"
+    keys !== "createdAt,id,kind,revision,snippet,tags,truncated" &&
+    keys !== "createdAt,evidence,id,kind,revision,snippet,tags,truncated"
   ) {
     return false;
   }
   if (v["revision"] !== undefined && typeof v["revision"] !== "number") return false;
   if (v["kind"] !== undefined && typeof v["kind"] !== "string") return false;
+  if (v["evidence"] !== undefined && v["evidence"] !== null) {
+    const ev = v["evidence"];
+    if (typeof ev !== "string" || [...ev].length > 400 || CONTROL_RE.test(ev) || hasLoneSurrogate(ev)) {
+      return false;
+    }
+  }
   if (!validRecallId(v["id"])) return false;
   if (typeof v["snippet"] !== "string" || [...(v["snippet"] as string)].length > 200) return false;
   if (hasLoneSurrogate(v["snippet"] as string)) return false;

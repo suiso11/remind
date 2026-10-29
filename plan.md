@@ -73,6 +73,7 @@
 | `record.remember` | 自律記憶化。record＋タグ＋正本リンク＋sourceRefs＋冪等＋監査の単一 txn で active 永続化。raw は書かない | `body/kind/provenance/scope/tags[]/links[]/sourceRefs[]/runId` |
 | `record.get` | 1 件取得。同一 scope の id を status によらず返す | `id/scope` |
 | `record.list` | 有界一覧。既定 active のみ。順序 `createdAt DESC, id ASC`、`since` inclusive / `until` exclusive | `scope/limit/since/until/status?` |
+| `record.stats` | 同一 scope の読み取り専用集計。active の kind 別件数・status 別件数・importance バケットを返す | `scope` |
 | `record.recall` | 有界ハイブリッド想起（§6）。利用を監査記録 | `query/tags[]/link/since/until/limit/scope/runId` |
 | `record.feedback` | 引用・採用の明示報告。露出検証＋usage追記＋heat加算を単一txnで実行。mere recallでは加算しない | `recallId/recordIds[]/scope/runId`（＋呼出者 `idempotencyKey` 必須） |
 | `record.correct` | 訂正。新 record 追記＋旧 `active → superseded` を同一 txn で行う。リンク・sourceRefs 再付与可 | `recordId/body/kind=correction/provenance/scope/links[]?/sourceRefs[]?` |

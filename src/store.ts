@@ -116,9 +116,12 @@ import {
  * derived/rebuildable and created with IF NOT EXISTS, so migration is
  * idempotent. Version 12 widens the record_importance source CHECK so a
  * model-qualified classifier stamp (`llm:v2:<model>`) fits; v9-v11 files are
- * rebuilt in place with every row preserved.
+ * rebuilt in place with every row preserved. Version 13 adds the nullable
+ * `evidence` quote column on records (the user's verbatim words grounding a
+ * user_fact); v12 files gain the column via one ALTER TABLE ADD COLUMN with
+ * every row kept.
  */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -139,6 +142,8 @@ export const LEGACY_SCHEMA_VERSION_9 = 9;
 export const LEGACY_SCHEMA_VERSION_10 = 10;
 /** Pre-model-qualified-importance-source stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_11 = 11;
+/** Pre-evidence-quote stamp; accepted and upgraded in place. */
+export const LEGACY_SCHEMA_VERSION_12 = 12;
 
 export const RECORD_KINDS = [
   "user_fact",
@@ -146,6 +151,9 @@ export const RECORD_KINDS = [
   "summary",
   "correction",
 ] as const;
+
+/** Max code points for the optional verbatim evidence quote (user_fact only). */
+export const EVIDENCE_MAX_CP = 400;
 
 export const ARCHIVE_REASONS = [
   "USER_ARCHIVED",
@@ -299,6 +307,41 @@ function ensurePrivacyColumns(db: DatabaseSync): void {
       }
       throw e;
     }
+  }
+}
+
+/**
+ * v13 additive migration: nullable `evidence` quote on records. The value is
+ * the user's verbatim words grounding a user_fact. ALTER TABLE ADD COLUMN
+ * only; legacy/summary/correction rows read back as NULL. Idempotent
+ * (PRAGMA table_info guard) and savepoint-based like the privacy migration.
+ */
+function ensureEvidenceColumn(db: DatabaseSync): void {
+  const hasColumn = (() => {
+    try {
+      const cols = db.prepare(`PRAGMA table_info(records)`).all() as Array<{ name: string }>;
+      return cols.some((c) => c.name === "evidence");
+    } catch {
+      return false; // unreadable catalog: CREATE below / callers handle it
+    }
+  })();
+  if (hasColumn) return;
+  db.exec(`SAVEPOINT ensure_evidence_column`);
+  try {
+    db.exec(`ALTER TABLE records ADD COLUMN evidence TEXT NULL`);
+    db.exec(`RELEASE SAVEPOINT ensure_evidence_column`);
+  } catch (e) {
+    try {
+      db.exec(`ROLLBACK TO SAVEPOINT ensure_evidence_column`);
+    } catch {
+      /* preserve the migration error */
+    }
+    try {
+      db.exec(`RELEASE SAVEPOINT ensure_evidence_column`);
+    } catch {
+      /* preserve the migration error */
+    }
+    throw e;
   }
 }
 
@@ -565,10 +608,13 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
     status TEXT NOT NULL CHECK(status IN ('active','superseded','archived','retired')),
     supersedes TEXT NULL, revision INTEGER NOT NULL, createdAt TEXT NOT NULL,
     privacySensitivity TEXT NULL CHECK(privacySensitivity IN ('normal','sensitive')),
-    privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity')))`);
+    privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity')),
+    evidence TEXT NULL)`);
   // F-I01-05 additive privacy columns for databases created before the
   // columns existed (nullable; old rows stay NULL = legacy/unknown privacy).
   ensurePrivacyColumns(db);
+  // v13 additive evidence quote for databases created before the column.
+  ensureEvidenceColumn(db);
   // P1 additive chunk columns (legacy rows NULL) for old databases.
   ensureRawChunkColumns(db);
   db.exec(`CREATE TABLE IF NOT EXISTS record_tags(recordId TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(recordId, tag))`);
@@ -1848,6 +1894,8 @@ interface NormalizedRemember {
   runId: string | null;
   /** F-I01-05: validated optional privacy (null = absent / legacy-compatible). */
   privacy: PrivacyMetadata | null;
+  /** Optional v13 verbatim quote (only user_fact; null = absent). */
+  evidence: string | null;
 }
 
 /**
@@ -1860,12 +1908,29 @@ function emptyRefsAllowed(kind: string, source: string): boolean {
   return /derived/i.test(source);
 }
 
+/**
+ * v13 optional evidence quote: the user's verbatim words grounding a
+ * user_fact. Presence is gated to kind=user_fact by the caller. NFC (never
+ * NFKC: this is a quote, not a normalized field), trimmed, 1..400 code
+ * points, no control characters. Oversize maps to LIMIT_EXCEEDED; shape
+ * errors map to BAD_REQUEST (no side effects).
+ */
+function parseEvidenceParam(v: unknown): string | null | "bad" | "over" {
+  if (v === undefined) return null;
+  if (typeof v !== "string") return "bad";
+  if (hasControl(v)) return "bad";
+  const n = v.normalize("NFC").trim();
+  if (countCp(n) < 1) return "bad";
+  if (countCp(n) > EVIDENCE_MAX_CP) return "over";
+  return n;
+}
+
 function parseRememberParams(
   config: AppConfig,
   params: Record<string, unknown>,
 ): { ok: true; value: NormalizedRemember } | { ok: false; res: ResponseEnvelope } {
   if (containsLoneSurrogateDeep(params)) return { ok: false, res: bad() };
-  const allowed = new Set(["body", "kind", "provenance", "scope", "tags", "links", "sourceRefs", "runId", "privacy"]);
+  const allowed = new Set(["body", "kind", "provenance", "scope", "tags", "links", "sourceRefs", "runId", "privacy", "evidence"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return { ok: false, res: bad() };
   }
@@ -1896,6 +1961,12 @@ function parseRememberParams(
   }
   const nRunId = parseRunId(runId);
   if (nRunId === "invalid") return { ok: false, res: bad() };
+  // v13 optional evidence: only user_fact may carry the user's verbatim words.
+  // NFC + trim (not NFKC/casefold), 1..400 code points, no control characters.
+  const nEvidence = parseEvidenceParam(params["evidence"]);
+  if (nEvidence === "bad") return { ok: false, res: bad() };
+  if (nEvidence === "over") return { ok: false, res: limitExceeded() };
+  if (nEvidence !== null && kind !== "user_fact") return { ok: false, res: bad() };
   // F-I01-05 optional privacy: strict shape; requirePrivacy rejects absence
   // (BAD_REQUEST, no side effects — validated before any DB access).
   const nPrivacy = parsePrivacyParam(params["privacy"]);
@@ -1915,6 +1986,7 @@ function parseRememberParams(
       sourceRefs: nRefs,
       runId: nRunId,
       privacy: nPrivacy,
+      evidence: nEvidence,
     },
   };
 }
@@ -2019,34 +2091,23 @@ export function rememberRecord(
   const parsed = parseRememberParams(config, params);
   if (!parsed.ok) return budgeted(parsed.res, config);
   const n = parsed.value;
-  const reqHash = requestHashFor(
-    "record.remember",
-    n.privacy === null
-      ? // Legacy compatibility: omit the key entirely when absent (pre-PR hash).
-        {
-          body: n.body,
-          kind: n.kind,
-          links: n.links,
-          observedAt: n.observedAt,
-          runId: n.runId,
-          scope: n.scope,
-          source: n.source,
-          sourceRefs: n.sourceRefs,
-          tags: n.tags,
-        }
-      : {
-          body: n.body,
-          kind: n.kind,
-          links: n.links,
-          observedAt: n.observedAt,
-          privacy: n.privacy,
-          runId: n.runId,
-          scope: n.scope,
-          source: n.source,
-          sourceRefs: n.sourceRefs,
-          tags: n.tags,
-        },
-  );
+  const hashParams: Record<string, unknown> = {
+    body: n.body,
+    kind: n.kind,
+    links: n.links,
+    observedAt: n.observedAt,
+    runId: n.runId,
+    scope: n.scope,
+    source: n.source,
+    sourceRefs: n.sourceRefs,
+    tags: n.tags,
+  };
+  // Legacy compatibility: omit absent keys entirely so pre-PR idempotency
+  // keys keep replaying. Evidence participates in the hash when present, so
+  // changing the quote under the same key is a CONFLICT, not a silent update.
+  if (n.privacy !== null) hashParams["privacy"] = n.privacy;
+  if (n.evidence !== null) hashParams["evidence"] = n.evidence;
+  const reqHash = requestHashFor("record.remember", hashParams);
 
   let saved: StoredOp | null = null;
   try {
@@ -2092,10 +2153,11 @@ export function rememberRecord(
       const probe: ResponseEnvelope = ok({ record: { id } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
-        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt, privacySensitivity, privacyOrigin)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1, ?, ?, ?)`,
+        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt, privacySensitivity, privacyOrigin, evidence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, 1, ?, ?, ?, ?)`,
       ).run(id, n.body, n.bodyNorm, bodyHashFor(n.bodyNorm), n.kind, n.source, n.observedAt, n.scope, now,
-        n.privacy === null ? null : n.privacy.sensitivity, n.privacy === null ? null : n.privacy.origin);
+        n.privacy === null ? null : n.privacy.sensitivity, n.privacy === null ? null : n.privacy.origin,
+        n.evidence);
       for (const t of n.tags) {
         db.prepare(`INSERT INTO record_tags(recordId, tag) VALUES (?, ?)`).run(id, t);
       }
@@ -2186,12 +2248,14 @@ export interface RecordView {
   sourceRefs: string[];
   /** F-I01-05: stored privacy metadata; null for legacy rows (absent privacy). */
   privacy: PrivacyMetadata | null;
+  /** v13: verbatim user quote; null when absent or for non-user_fact rows. */
+  evidence: string | null;
 }
 
 function readRecordView(db: DatabaseSync, id: string): RecordView | null {
   const row = db
     .prepare(
-      `SELECT id, body, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt, privacySensitivity, privacyOrigin
+      `SELECT id, body, bodyHash, kind, source, observedAt, scope, status, supersedes, revision, createdAt, privacySensitivity, privacyOrigin, evidence
        FROM records WHERE id = ?`,
     )
     .get(id) as
@@ -2209,6 +2273,7 @@ function readRecordView(db: DatabaseSync, id: string): RecordView | null {
         createdAt: string;
         privacySensitivity: string | null;
         privacyOrigin: string | null;
+        evidence: string | null;
       }
     | undefined;
   if (!row) return null;
@@ -2236,6 +2301,7 @@ function readRecordView(db: DatabaseSync, id: string): RecordView | null {
     revision: row.revision,
     createdAt: row.createdAt,
     privacy: privacyFromColumns(row.privacySensitivity, row.privacyOrigin),
+    evidence: row.evidence,
     tags,
     links,
     sourceRefs,
@@ -2346,9 +2412,9 @@ export function listRecords(
   const now = nowOverride ?? nowIso();
   try {
     return withTransaction(db, (): ResponseEnvelope => {
-      let rows: Array<{ id: string; kind: string; status: string; body: string; createdAt: string }>;
+      let rows: Array<{ id: string; kind: string; status: string; body: string; createdAt: string; evidence: string | null }>;
       try {
-        let sql = `SELECT id, kind, status, body, createdAt FROM records WHERE scope = ? AND status = ?`;
+        let sql = `SELECT id, kind, status, body, createdAt, evidence FROM records WHERE scope = ? AND status = ?`;
         const args: Array<string | number> = [nScope, nStatus];
         if (nSince !== null) {
           sql += ` AND createdAt >= ?`;
@@ -2360,7 +2426,7 @@ export function listRecords(
         }
         sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
         args.push(nLimit);
-        rows = db.prepare(sql).all(...args) as Array<{ id: string; kind: string; status: string; body: string; createdAt: string }>;
+        rows = db.prepare(sql).all(...args) as Array<{ id: string; kind: string; status: string; body: string; createdAt: string; evidence: string | null }>;
       } catch {
         throw new Error("read failed");
       }
@@ -2374,6 +2440,7 @@ export function listRecords(
           snippet: cps.length <= max ? r.body : cps.slice(0, max).join(""),
           truncated: cps.length > max,
           createdAt: r.createdAt,
+          evidence: r.evidence,
         };
       });
       const stored = budgeted(ok({ items }), config);
@@ -2391,6 +2458,141 @@ export function listRecords(
         reasonCode: null,
       });
       // Reads stay available over configured cap; audit still commits.
+      return stored;
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === "response over budget") return budgeted(fail("LIMIT_EXCEEDED"), config);
+    if (msg === "db over cap") return budgeted(fail("STORE_UNAVAILABLE"), config);
+    return budgeted(fail("STORE_UNAVAILABLE"), config);
+  }
+}
+
+/**
+ * record.stats {scope}: bounded aggregate counts for one scope.
+ *
+ * - byKind / importance cover active records only; byStatus covers every
+ *   status. Buckets use the actual importance range [0,1] produced by the
+ *   classifier (`importance / 3` with an integer 0..3). External ledgers are
+ *   not range-checked by the schema, so out-of-range values are clamped into
+ *   the first/last bucket and `scored` always equals the bucket sum.
+ * - A record_importance row is counted as scored only while its bodyHash
+ *   matches the current record body (the same freshness rule used by
+ *   activation.preview / loadActivationInputs). Missing or stale rows are
+ *   counted as unscored.
+ * - One read transaction, GROUP BY aggregates only: no per-record loop and
+ *   no bodies in the response. Follows record.list: writes one metadata-only
+ *   audit row and stays readable over the configured DB cap.
+ */
+export function recordStats(
+  db: DatabaseSync,
+  config: AppConfig,
+  params: Record<string, unknown>,
+  nowOverride?: string,
+): ResponseEnvelope {
+  if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
+  for (const k of Object.keys(params)) {
+    if (k !== "scope") return budgeted(bad(), config);
+  }
+  const nScope = parseScope(params["scope"]);
+  if (!nScope) return budgeted(bad(), config);
+  {
+    const denied = scopeGate(db, config, nScope);
+    if (denied) return denied;
+  }
+  const now = nowOverride ?? nowIso();
+  try {
+    return withTransaction(db, (): ResponseEnvelope => {
+      const byStatus: Record<string, number> = {
+        active: 0,
+        superseded: 0,
+        archived: 0,
+        retired: 0,
+      };
+      const byKind: Record<string, number> = {};
+      for (const k of RECORD_KINDS) byKind[k] = 0;
+      const buckets = [
+        { lt: 0.2, count: 0 },
+        { lt: 0.4, count: 0 },
+        { lt: 0.6, count: 0 },
+        { lt: 0.8, count: 0 },
+        { lt: 1.0001, count: 0 },
+      ];
+      let scored = 0;
+      try {
+        const statusRows = db
+          .prepare(`SELECT status, COUNT(*) AS n FROM records WHERE scope = ? GROUP BY status`)
+          .all(nScope) as Array<{ status: string; n: number }>;
+        for (const r of statusRows) {
+          if (Object.prototype.hasOwnProperty.call(byStatus, r.status)) {
+            byStatus[r.status] = Number(r.n);
+          }
+        }
+        const kindRows = db
+          .prepare(
+            `SELECT kind, COUNT(*) AS n FROM records
+             WHERE scope = ? AND status = 'active' GROUP BY kind`,
+          )
+          .all(nScope) as Array<{ kind: string; n: number }>;
+        for (const r of kindRows) {
+          if (Object.prototype.hasOwnProperty.call(byKind, r.kind)) {
+            byKind[r.kind] = Number(r.n);
+          }
+        }
+        const imp = db
+          .prepare(
+            `SELECT
+               COUNT(*) AS scored,
+               SUM(CASE WHEN i.importance < 0.2 THEN 1 ELSE 0 END) AS b1,
+               SUM(CASE WHEN i.importance >= 0.2 AND i.importance < 0.4 THEN 1 ELSE 0 END) AS b2,
+               SUM(CASE WHEN i.importance >= 0.4 AND i.importance < 0.6 THEN 1 ELSE 0 END) AS b3,
+               SUM(CASE WHEN i.importance >= 0.6 AND i.importance < 0.8 THEN 1 ELSE 0 END) AS b4,
+               SUM(CASE WHEN i.importance >= 0.8 THEN 1 ELSE 0 END) AS b5
+             FROM records r
+             JOIN record_importance i
+               ON i.recordId = r.id AND i.bodyHash = r.bodyHash
+             WHERE r.scope = ? AND r.status = 'active'`,
+          )
+          .get(nScope) as
+          | { scored: number; b1: number; b2: number; b3: number; b4: number; b5: number }
+          | undefined;
+        scored = Number(imp?.scored ?? 0);
+        buckets[0]!.count = Number(imp?.b1 ?? 0);
+        buckets[1]!.count = Number(imp?.b2 ?? 0);
+        buckets[2]!.count = Number(imp?.b3 ?? 0);
+        buckets[3]!.count = Number(imp?.b4 ?? 0);
+        buckets[4]!.count = Number(imp?.b5 ?? 0);
+      } catch {
+        throw new Error("read failed");
+      }
+      const active = byStatus["active"] ?? 0;
+      const stored = budgeted(
+        ok({
+          scope: nScope,
+          byKind,
+          byStatus,
+          importance: {
+            scored,
+            unscored: Math.max(0, active - scored),
+            buckets,
+          },
+          computedAt: now,
+        }),
+        config,
+      );
+      if (!stored.ok) throw new Error("response over budget");
+      auditInsert(db, {
+        ts: now,
+        op: "record.stats",
+        targetId: null,
+        code: stored.code,
+        scope: nScope,
+        bytes: Buffer.byteLength(JSON.stringify(stored), "utf8"),
+        limitN: null,
+        runId: null,
+        recallId: null,
+        reasonCode: null,
+      });
       return stored;
     });
   } catch (e) {
@@ -4194,18 +4396,19 @@ export function recallRecords(
         createdAt: string;
         revision: number;
         kind: string;
+        evidence: string | null;
       }>;
       try {
         items = ranked.map((id) => {
           const m = meta.get(id) as { createdAt: string; revision: number; kind: string };
           const row = db
-            .prepare(`SELECT body, createdAt FROM records WHERE id = ?`)
-            .get(id) as { body: string; createdAt: string };
+            .prepare(`SELECT body, createdAt, evidence FROM records WHERE id = ?`)
+            .get(id) as { body: string; createdAt: string; evidence: string | null };
           const { snippet, truncated } = snippetFor(row.body, config.limits.snippetMaxCp);
           const tags = (
             db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
           ).map((r) => r.tag);
-          return { id, snippet, truncated, tags, createdAt: m.createdAt, revision: m.revision, kind: m.kind };
+          return { id, snippet, truncated, tags, createdAt: m.createdAt, revision: m.revision, kind: m.kind, evidence: row.evidence };
         });
       } catch {
         throw new Error("read failed");
@@ -5375,12 +5578,13 @@ export function searchRecords(
         revision: number;
         createdAt: string;
         privacy: PrivacyMetadata | null;
+        evidence: string | null;
       }>;
       try {
         items = ranked.map((id) => {
           const row = db
-            .prepare(`SELECT body, createdAt, status, revision, privacySensitivity, privacyOrigin FROM records WHERE id = ?`)
-            .get(id) as { body: string; createdAt: string; status: string; revision: number; privacySensitivity: string | null; privacyOrigin: string | null };
+            .prepare(`SELECT body, createdAt, status, revision, privacySensitivity, privacyOrigin, evidence FROM records WHERE id = ?`)
+            .get(id) as { body: string; createdAt: string; status: string; revision: number; privacySensitivity: string | null; privacyOrigin: string | null; evidence: string | null };
           const { snippet, truncated } = snippetFor(row.body, config.limits.snippetMaxCp);
           const tags = (
             db.prepare(`SELECT tag FROM record_tags WHERE recordId = ? ORDER BY tag ASC`).all(id) as Array<{ tag: string }>
@@ -5394,6 +5598,7 @@ export function searchRecords(
             revision: row.revision,
             createdAt: row.createdAt,
             privacy: privacyFromColumns(row.privacySensitivity, row.privacyOrigin),
+            evidence: row.evidence,
           };
         });
       } catch {

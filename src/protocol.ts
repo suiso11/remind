@@ -93,6 +93,7 @@ export const READ_OPS = new Set([
   "record.recall",
   "record.search",
   "record.sources",
+  "record.stats",
   "event.get",
   "event.range",
   "episode.list",

@@ -30,6 +30,7 @@ import {
   reactivateRecord,
   recallRecords,
   recordSources,
+  recordStats,
   rememberRecord,
   retireRecord,
   searchRecords,
@@ -106,6 +107,8 @@ function runOpSync(db: DatabaseSync, req: Req, vector?: RecallVectorInput) {
       return listRecords(db, cfg, req.params);
     case "record.sources":
       return recordSources(db, cfg, req.params);
+    case "record.stats":
+      return recordStats(db, cfg, req.params);
     case "event.get":
       return getEvent(db, cfg, req.params);
     case "event.range":
