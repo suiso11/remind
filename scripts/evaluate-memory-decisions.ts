@@ -905,22 +905,27 @@ function lifecycleSuite(): { invariants: string[]; report: Record<string, unknow
         headroom: fixedByHorizon,
         horizonReversal: reversals / threads.length,
         oracleDiversity: diversity,
-        labels: threads.map((t) => ({
-          stream: "lifecycle",
-          features: {
-            kind: "user_fact",
-            ageHours: 0,
-            links: 0,
-            heat: Math.max(0, heatOf(ws.dbPath, t.id)),
-            exposures: Math.max(0, exposureCount(ws.dbPath, t.id)),
-            hasConflict: false,
-          },
-          utility: {
-            keep: perThread[t.key]!.full.utilities.keep,
-            retire: perThread[t.key]!.full.utilities.retire,
-            correct: perThread[t.key]!.full.utilities.correct,
-          },
-        })),
+        labels: threads.map((t) => {
+          const heat = heatOf(ws.dbPath, t.id);
+          const exposures = exposureCount(ws.dbPath, t.id);
+          if (heat < 0 || exposures < 0) throw new HarnessError(`label feature read failed: ${t.key}`);
+          return {
+            stream: "lifecycle",
+            features: {
+              kind: "user_fact",
+              ageHours: 0,
+              links: 0,
+              heat,
+              exposures,
+              hasConflict: false,
+            },
+            utility: {
+              keep: perThread[t.key]!.full.utilities.keep,
+              retire: perThread[t.key]!.full.utilities.retire,
+              correct: perThread[t.key]!.full.utilities.correct,
+            },
+          };
+        }),
       },
     };
   } finally {

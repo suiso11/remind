@@ -140,7 +140,7 @@ function g3Audit(store: GovernanceStore, ctx: Ctx): GovernanceGate {
   return { pass: fail.length === 0, detail: fail.length ? fail.join("; ") : `ops=${rows.map((r) => r.op).join(",")}; no content columns` };
 }
 
-interface G4Result { gate: GovernanceGate; adversaryPassed: boolean; real: Ctx; noop: Ctx }
+interface G4Result { gate: GovernanceGate; adversaryPassed: boolean; real: Ctx }
 
 function g4Quality(store: GovernanceStore): G4Result {
   const real: Ctx = { probes: [], ids: new Set() };
@@ -154,7 +154,6 @@ function g4Quality(store: GovernanceStore): G4Result {
     },
     adversaryPassed,
     real,
-    noop,
   };
 }
 

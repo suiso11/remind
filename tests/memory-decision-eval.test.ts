@@ -7,6 +7,7 @@ import * as path from "node:path";
 
 const repoRoot = path.resolve(__dirname, "..", "..");
 const evaluator = path.join(repoRoot, "dist", "scripts", "evaluate-memory-decisions.js");
+const fitScript = path.join(repoRoot, "dist", "scripts", "decision-policy-fit.js");
 const labelsPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "decision-labels-")), "labels.jsonl");
 
 // The evaluator performs ~320 real CLI spawns; the single-call budget is 30 s.
@@ -111,7 +112,7 @@ describe("memory decision evaluator", () => {
     }
   });
 
-  it("skips the model leg without a config and exports fit-ready labels", () => {
+  it("skips the model leg without a config and exports diagnostic labels", () => {
     const consolidate = objectAt(report()["consolidate"], "consolidate");
     assert.equal(consolidate["status"], "skipped");
     const lines = fs.readFileSync(labelsPath, "utf8").trim().split("\n");
@@ -123,5 +124,19 @@ describe("memory decision evaluator", () => {
       assert.ok(key in features, `missing label feature ${key}`);
     }
     objectAt(row["utility"], "labels.utility");
+  });
+
+  it("rejects fitting the four-state lifecycle labels", () => {
+    const r = spawnSync(process.execPath, [fitScript, "--input", labelsPath], {
+      encoding: "utf8",
+      timeout: 60000,
+      maxBuffer: 1024 * 1024,
+      shell: false,
+    });
+    assert.equal(r.status, 0, `fit stderr=${String(r.stderr).slice(0, 1024)}`);
+    const fit = JSON.parse(String(r.stdout)) as Record<string, unknown>;
+    assert.equal(fit["accepted"], false);
+    assert.ok(typeof fit["reason"] === "string" && fit["reason"].startsWith("skipped:"), String(fit["reason"]));
+    assert.equal(fit["autoApply"], false);
   });
 });
