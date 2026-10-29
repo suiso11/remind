@@ -5,8 +5,9 @@
 
 ## 0. 結論
 
+- **評価基盤は実装・テストした。だが、リンク付け・要約の品質、production の改善はまだ確認していない。**
 - 4 本の記憶論文と 1 本の継続学習論文を読み、**production の学習アルゴリズムとして採用したものはない**。
-- 採用したのは **評価プロトコル・統制ゲート・オフライン fit の受理条件**。remind は重みに記憶を内在化せず、raw 不変の外部記憶で忘却を扱うため、weight-level の継続 SFT / LoRA / replay は设计と衝突する。
+- 採用したのは **評価プロトコル・統制ゲート・オフライン fit の受理条件**。remind は重みに記憶を内在化せず、raw 不変の外部記憶で忘却を扱うため、weight-level の継続 SFT / LoRA / replay は設計と衝突する。
 - 実装したのは以下。既定はモデルを呼ばない。
   - MemProbe 型の安定性–可塑性診断
   - CMP 型の検索支持診断
@@ -15,6 +16,7 @@
   - 評価ラベルからのオフライン fit（自動適用なし）
 - 検証: `npm test` **464 件成功**（master の #41/#42 を含む）。実モデル smoke は exit 0（`maintain.consolidate` は opt-in）。
 - 本レポートの実装は**本番未デプロイ**。production の保持重み学習はまだ 1 度も受理されていない（後述）。
+- **未実証**: リンクの適合率・再現率、要約の事実忠実性・重要情報保持、未知ストリームでの判断改善、production の改善。現状の数値は診断値であり、品質の証明ではない。
 
 ## 1. 論文と採否
 
@@ -43,6 +45,7 @@
 - **実測**（実モデル smoke）: headroom 0.088（H=2）/ 0.0625（H=4）、horizon reversal 0.25、full-horizon の oracle は keep 3 / correct 1。
 - **不採用**: COMPRESS（remind に op がない）、VitaMem の学習 policy、CONSOLIDATE を lifecycle の action にすること。CONSOLIDATE は別の構造検査（opt-in）に分離。
 - **制約**: per-thread 分岐で他スレッドを KEEP に固定。スレッド間干渉の同時決定は測っていない。
+- **解釈**: H=2/4、未来列 4 件、4 スレッドの小さな条件での**診断値**。実運用の判断品質の根拠にするには、複数の独立ストリームでの再現性、信頼区間、記録間干渉を含む設計が必要。現時点の headroom/reversal を production の改善量として扱わない。
 
 ### 2.3 MemProbe — 安定性–可塑性の診断
 
@@ -61,6 +64,7 @@
 - **実装**: `supportSuite`。
   - 30 記録・10 必須クエリ。必須記憶が recall で返らない割合（支持失敗）と、active 記録のうち一度も露出されない割合（zero-exposure rate）を測る。
 - **実測**: 支持失敗 **0**、zero-exposure **0.6**（30 件中 12 件だけ露出）。
+- **解釈**: 支持失敗 0 は「評価用の 10 必須クエリでは required が返った」という範囲の結果。zero-exposure 0.6 の 18 記録は、**その効用がまだ同定されていない**。矛盾ではなく測定範囲の違いであり、「将来の未知クエリに対する有用性は未同定」と書き分ける。
 - **不採用**:
   - 本番 `record.recall` へのランダム露出。応答劣化・プライバシー・無関係提示のコスト。
   - per-query utility から保持 policy を作ること。論文自身が「集約は unseen query の保持判断を予測しない」と報告している。
@@ -77,6 +81,7 @@
 - **fit への適用**: `scripts/decision-policy-fit.ts`。
   - MAP fit、whole-stream holdout（2 ストリーム以上）、n>=30、prevalence 2 水準以上、holdout で best fixed action を上回ること、`autoApply:false`。
   - 現行 evaluator のラベルは 4 状態・1 ストリームなので **`skipped: n=4 < 30`**。診断用であり、このデータからは学習しない。
+- **解釈の限界**: `linkCoverage 1.0` は「summary の links が cluster メンバーだけを指す」被覆であり、**リンクの適合率・再現率ではない**。G2–G4 の pass はテストした条件での構造確認であり、モデル出力の毒耐性や要約内容の正しさを証明しない。fit の受理は合成 fixture で確認しただけで、**受理基準そのものの妥当性と未知ストリームでの改善は未検証**。
 - **不採用**: CQS を目標指標にすること（著者自身が外部 transfer を予測しないと報告）。skill/rule の cross-level transfer は remind の scope 外。
 
 ## 3. 実装マップ
@@ -101,6 +106,7 @@
   - lifecycle: headroom 0.088 / 0.0625、reversal 0.25、oracle keep 3 / correct 1。
   - latency: 391 CLI calls、p50 85.8ms、total 35.2s。
 - fit: 90 行の合成 fixture は受理、ノイズは拒否、evaluator の 4 行は `skipped: n=4 < 30`。
+- これらは評価条件内の**診断値**であり、リンク/要約の品質や production 改善の証明ではない。
 
 ## 5. 既存ドキュメントとの整合（重要な修正）
 
@@ -110,7 +116,39 @@
 - **本番 recall の探索露出は行わない**。CMP の測定は評価器内に限定。
 - **cross-batch 重複 summary の防止**は論文由来ではなく、production 観察から追加した修正（`src/distill.ts`）。統合草案が既存 active と同じ bodyHash なら keep。same-batch の重複も `plannedSummaryHashes` で防ぐ。
 
-## 6. 残件・限界
+## 6. まだ測っていない品質（リンク・要約）
+
+現状の評価は「判断の枠組み」と「構造・安全性」が中心で、**リンク付け・要約の内容品質は独立した指標になっていない**。ここを測らないと、どこで判断を誤ったかが見えない。
+
+### 6.1 リンク付け
+
+- **現状**: `linkCoverage` は summary の links が cluster メンバーだけを指す割合。**リンクすべきものを網羅したか／誤ったリンクを作ったか**は測っていない。`1.0` は「cluster 外を指していない」以上の意味を持たない。
+- **必要な指標**:
+  - 正解関係集合 `R` と予測リンク集合 `L` に対し、precision `|L∩R|/|L|`、recall `|L∩R|/|R|`。
+  - **誤リンク率**（false link）と**見逃し率**（miss）を別々に。どちらが悪化したかを分ける。
+  - 関係種別（related / consolidation / supersedes）ごとの内訳。strict（同一対象・同一関係）と loose（同一対象）を分ける。
+  - 判断単位（1 回の merge/remember）と記録単位の両方。
+- **必要なデータ**: 正解関係を持つ合成ケース（seeded-only）。実ユーザーデータは使わない。リンクは untrusted metadata なので、正解ラベルは evaluator 側で生成し、モデル入力には漏らさない（provenance ゲート）。
+
+### 6.2 要約
+
+- **現状**: `unchanged`（idempotence）、`kind/source/links/sources`、cited-reduce の anchor/YES-NO は**ガードレール**であり、内容の正しさの指標ではない。正しく引用していても重要情報を落とす／誤って統合する／時点を失うことはあり得る。
+- **必要な指標**:
+  - **事実忠実性**: 各文が引用元に支持されるか（支持文の precision/recall、根拠のない追加文の率）。
+  - **重要情報の保持**: 固有の対象・日付・金額・条件・出典の被覆率。
+  - **時点・更新順の保持**: 古い値と新しい値の区別、supersedes の向き。
+  - **出典の保持**: 文から sourceRefs への到達可能性（既存の構造検査を品質側でも使う）。
+  - extractive fallback と model 要約を別集計する。
+- **必要なデータ**: 合成記憶に正解の事実・時点・出典を埋め込み、要約と照合する。LLM-as-judge を既定にしない。
+
+### 6.3 lifecycle と fit の一般化
+
+- lifecycle の headroom/reversal は H=2/4・4 スレッド・未来列 4 件・per-thread KEEP の診断値。**複数の独立ストリーム、ブートストラップ信頼区間、スレッド間干渉**を含む再現が必要。
+- fit の n>=30 / prevalence 2 水準 / whole-stream holdout は安全柵だが、**受理基準自体の妥当性は未検証**。合成 fixture で受理されたことと、未知ストリームで判断が改善することは別に報告する。
+
+## 7. 残件・限界
+
+- **次の優先順**: (1) リンク・要約それぞれの正解ラベル付き評価、(2) 複数独立ストリームでの反事実評価と信頼区間、(3) 未知ストリームでの fit 受理ゲート検証。
 
 - 2609.06986 の長期保持 evaluator（`M_i,j`、final retention、forgetting、half-life）は **未実装**。U4 の PROPOSAL に残る。
 - lifecycle は per-thread 分岐で他スレッドを KEEP に固定。CONSOLIDATE は opt-in の別構造検査で、lifecycle の効用には含めない。
@@ -119,7 +157,7 @@
 - 実装は **本番未デプロイ**。production の保持重み learner は examples 701 / positives 29 で `minPositives:30` に届かず、`retention_weights` は空。最初の fit はまだ走っていない。
 - companion の learning proposals は 18 件すべて pending、applications 0。提案は作られるが適用されていない。
 
-## 7. 再現
+## 8. 再現
 
 ```bash
 npm test
