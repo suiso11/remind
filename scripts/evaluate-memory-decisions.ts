@@ -414,7 +414,7 @@ function sourceOf(record: RecordView): string {
 function heatOf(dbPath: string, id: string): number {
   let db: DatabaseSync | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    db = openDbForRead(dbPath);
     const row: unknown = db.prepare("SELECT usedCount FROM note_heat WHERE recordId = ?").get(id);
     return isObject(row) && typeof row["usedCount"] === "number" ? row["usedCount"] : 0;
   } catch {
@@ -431,7 +431,7 @@ function heatOf(dbPath: string, id: string): number {
 function exposureCount(dbPath: string, id: string): number {
   let db: DatabaseSync | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    db = openDbForRead(dbPath);
     const row: unknown = db.prepare("SELECT COUNT(*) AS n FROM exposures WHERE recordId = ?").get(id);
     return isObject(row) && typeof row["n"] === "number" ? row["n"] : -1;
   } catch {
@@ -448,7 +448,7 @@ function exposureCount(dbPath: string, id: string): number {
 function activeRecords(dbPath: string): number {
   let db: DatabaseSync | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    db = openDbForRead(dbPath);
     const row: unknown = db
       .prepare("SELECT COUNT(*) AS n FROM records WHERE status = 'active' AND scope = ?")
       .get(DECISIONS_SCOPE);
@@ -464,10 +464,23 @@ function activeRecords(dbPath: string): number {
   }
 }
 
+/**
+ * Read the evaluator's own DB. A read-only WAL open can fail on Windows when
+ * the -shm/-wal sidecars are unavailable (the CLI closed them); the evaluator
+ * owns the temp DB, so fall back to a normal open rather than reporting -1.
+ */
+function openDbForRead(dbPath: string): DatabaseSync {
+  try {
+    return new DatabaseSync(dbPath, { readOnly: true });
+  } catch {
+    return new DatabaseSync(dbPath);
+  }
+}
+
 function exposureStats(dbPath: string): { exposedDistinct: number; active: number } {
   let db: DatabaseSync | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    db = openDbForRead(dbPath);
     const exposed: unknown = db.prepare("SELECT COUNT(DISTINCT recordId) AS n FROM exposures").get();
     const active: unknown = db
       .prepare("SELECT COUNT(*) AS n FROM records WHERE status = 'active' AND scope = ?")
@@ -963,7 +976,7 @@ function governanceSuite(): { invariants: string[]; report: GovernanceReport } {
       retire: (id) => retire(ws, id),
       reactivate: (id) => reactivate(ws, id),
       auditFor: (targetId) => {
-        const db = new DatabaseSync(ws.dbPath, { readOnly: true });
+        const db = openDbForRead(ws.dbPath);
         try {
           const rows: unknown[] = db
             .prepare("SELECT op, code, targetId, reasonCode FROM audit WHERE targetId = ? ORDER BY rowid")
@@ -982,7 +995,7 @@ function governanceSuite(): { invariants: string[]; report: GovernanceReport } {
         }
       },
       auditColumns: () => {
-        const db = new DatabaseSync(ws.dbPath, { readOnly: true });
+        const db = openDbForRead(ws.dbPath);
         try {
           const rows: unknown[] = db.prepare("PRAGMA table_info(audit)").all();
           return rows.flatMap((row) => {
@@ -1006,7 +1019,7 @@ function governanceSuite(): { invariants: string[]; report: GovernanceReport } {
 /* ------------------------------------------------------------------ */
 
 function countKind(dbPath: string, kind: string): number {
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const db = openDbForRead(dbPath);
   try {
     const row: unknown = db
       .prepare("SELECT COUNT(*) AS n FROM records WHERE kind = ? AND scope = ?")

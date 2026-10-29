@@ -242,7 +242,13 @@ function heatOf(db: DatabaseSync, id: string): number {
 function heatViaPath(dbPath: string, id: string): number {
   let db: DatabaseSync | null = null;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      db = new DatabaseSync(dbPath, { readOnly: true });
+    } catch {
+      // Windows can reject a read-only WAL open after the CLI closed its
+      // sidecars; the evaluator owns this temp DB.
+      db = new DatabaseSync(dbPath);
+    }
     return heatOf(db, id);
   } catch {
     return -1;

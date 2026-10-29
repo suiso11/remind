@@ -40,8 +40,10 @@ before(() => {
     cachedReport = null;
   }
   if (cachedStatus !== 0 || cachedReport === null) {
+    const invariants = cachedReport?.["invariants"];
     process.stderr.write(
       `[memory-decisions] evaluator exit=${String(cachedStatus)} ` +
+        `invariants=${JSON.stringify(invariants)} ` +
         `stdout(first 4096 bytes): ${cachedStdoutHead} ` +
         `stderr(first 2048 bytes): ${cachedStderr}\n`,
     );
