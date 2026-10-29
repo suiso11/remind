@@ -1,10 +1,13 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 const repoRoot = path.resolve(__dirname, "..", "..");
 const evaluator = path.join(repoRoot, "dist", "scripts", "evaluate-memory-decisions.js");
+const labelsPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "decision-labels-")), "labels.jsonl");
 
 // The evaluator performs ~320 real CLI spawns; the single-call budget is 30 s.
 // This outer budget only needs headroom for process startup on loaded runners.
@@ -16,7 +19,7 @@ let cachedStderr = "";
 let cachedStdoutHead = "";
 
 before(() => {
-  const r = spawnSync(process.execPath, [evaluator], {
+  const r = spawnSync(process.execPath, [evaluator, "--labels", labelsPath], {
     encoding: "buffer",
     timeout: EVALUATOR_TIMEOUT_MS,
     killSignal: "SIGKILL",
@@ -96,5 +99,29 @@ describe("memory decision evaluator", () => {
     assert.ok(typeof lifecycle["horizonReversal"] === "number" && (lifecycle["horizonReversal"] as number) > 0);
     const diversity = objectAt(lifecycle["oracleDiversity"], "lifecycle.oracleDiversity");
     assert.ok(Object.values(diversity).filter((n) => typeof n === "number" && n > 0).length >= 2);
+  });
+
+  it("passes every governance gate", () => {
+    const governance = objectAt(report()["governance"], "governance");
+    assert.equal(governance["ok"], true);
+    const gates = objectAt(governance["gates"], "governance.gates");
+    for (const [name, gate] of Object.entries(gates)) {
+      assert.ok(typeof gate === "object" && gate !== null && !Array.isArray(gate), `${name} gate shape`);
+      assert.equal((gate as Record<string, unknown>)["pass"], true, name);
+    }
+  });
+
+  it("skips the model leg without a config and exports fit-ready labels", () => {
+    const consolidate = objectAt(report()["consolidate"], "consolidate");
+    assert.equal(consolidate["status"], "skipped");
+    const lines = fs.readFileSync(labelsPath, "utf8").trim().split("\n");
+    assert.equal(lines.length, 4);
+    const row = JSON.parse(lines[0]!) as Record<string, unknown>;
+    assert.equal(row["stream"], "lifecycle");
+    const features = objectAt(row["features"], "labels.features");
+    for (const key of ["hasShortProbe", "hasDelayedReuse", "hasNoProbe", "kind", "ageHours", "links"]) {
+      assert.ok(key in features, `missing label feature ${key}`);
+    }
+    objectAt(row["utility"], "labels.utility");
   });
 });

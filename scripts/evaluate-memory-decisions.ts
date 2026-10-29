@@ -27,6 +27,7 @@ import {
   validateRecallData,
   type RecallItem,
 } from "./baseline-score.js";
+import { runGovernanceSuite, type GovernanceReport, type GovernanceStore } from "./decision-governance.js";
 
 export const DECISIONS_VERSION = "memory-decisions-v1";
 export const DECISIONS_SCOPE = "personal/default";
@@ -53,12 +54,14 @@ interface CliResult {
 interface RecordView {
   id: string;
   body?: unknown;
+  bodyHash?: unknown;
   status?: unknown;
   kind?: unknown;
   source?: unknown;
   supersedes?: unknown;
   revision?: unknown;
   sourceRefs?: unknown;
+  links?: unknown;
 }
 
 interface Probe {
@@ -101,24 +104,24 @@ function configFor(dir: string): Record<string, unknown> {
   };
 }
 
-function invoke(configPath: string, request: Record<string, unknown>): CliResult {
+function invoke(configPath: string, request: Record<string, unknown>, timeoutMs = CLI_TIMEOUT_MS): CliResult {
   const line = Buffer.from(JSON.stringify(request) + "\n", "utf8");
   const start = process.hrtime.bigint();
   let status: number | null = null;
-  let stdoutBuf: AnyBuf = Buffer.alloc(0) as AnyBuf;
+  let stdoutBuf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let spawnFailed = false;
   try {
     const r = spawnSync(process.execPath, [CLI_PATH, "--config", configPath], {
       input: line,
-      timeout: CLI_TIMEOUT_MS,
+      timeout: timeoutMs,
       killSignal: "SIGKILL",
       maxBuffer: MAX_BUFFER,
       shell: false,
       encoding: "buffer",
     });
     status = r.status;
-    const raw = r.stdout as unknown;
-    stdoutBuf = (Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw ?? ""))) as AnyBuf;
+    const raw: unknown = r.stdout;
+    stdoutBuf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw ?? ""));
     spawnFailed = r.error !== undefined && r.error !== null;
   } catch {
     spawnFailed = true;
@@ -170,20 +173,20 @@ class Workspace {
   readonly dir: string;
   readonly configPath: string;
   readonly dbPath: string;
-  constructor(prefix: string, create = true) {
+  constructor(prefix: string, create = true, overrides?: Record<string, unknown>) {
     this.dir = create ? fs.mkdtempSync(path.join(os.tmpdir(), prefix)) : prefix;
     this.configPath = path.join(this.dir, "memory.config.json");
     this.dbPath = path.join(this.dir, "memory-decisions.db");
-    fs.writeFileSync(this.configPath, JSON.stringify(configFor(this.dir)), "utf8");
+    fs.writeFileSync(this.configPath, JSON.stringify({ ...configFor(this.dir), ...overrides }), "utf8");
   }
 
-  call(request: Record<string, unknown>): CliResult {
-    return invoke(this.configPath, request);
+  call(request: Record<string, unknown>, timeoutMs = CLI_TIMEOUT_MS): CliResult {
+    return invoke(this.configPath, request, timeoutMs);
   }
 
   /** Successful data or HarnessError with a fixed description (no content echo). */
-  must(request: Record<string, unknown>): unknown {
-    const r = this.call(request);
+  must(request: Record<string, unknown>, timeoutMs = CLI_TIMEOUT_MS): unknown {
+    const r = this.call(request, timeoutMs);
     if (!r.valid) throw new HarnessError(`invalid ${String(request["op"])}: ${r.invalidReason ?? "unknown"}`);
     if (!r.ok) throw new HarnessError(`op ${String(request["op"])} failed: ${r.code}`);
     return r.data;
@@ -205,12 +208,14 @@ function recordOf(data: unknown): RecordView | null {
   return {
     id: r["id"],
     body: r["body"],
+    bodyHash: r["bodyHash"],
     status: r["status"],
     kind: r["kind"],
     source: r["source"],
     supersedes: r["supersedes"],
     revision: r["revision"],
     sourceRefs: r["sourceRefs"],
+    links: r["links"],
   };
 }
 
@@ -249,7 +254,7 @@ function seedRecord(
   key: string,
   body: string,
   source: string,
-  kind: "user_fact" | "model_inference" = "user_fact",
+  kind: "user_fact" | "model_inference" | "summary" = "user_fact",
 ): { id: string; eventId: string } {
   const eventId = `${key}-ev`;
   ws.must({
@@ -313,6 +318,51 @@ function retire(ws: Workspace, id: string): void {
     op: "record.retire",
     idempotencyKey: `retire-${id}`,
     params: { id, scope: DECISIONS_SCOPE, reasonCode: "OUTDATED" },
+  });
+}
+
+function reactivate(ws: Workspace, id: string): void {
+  ws.must({
+    v: 1,
+    op: "record.reactivate",
+    idempotencyKey: `reactivate-${id}`,
+    params: { id, scope: DECISIONS_SCOPE, reasonCode: "STILL_USEFUL" },
+  });
+}
+
+function rememberDerived(
+  ws: Workspace,
+  key: string,
+  body: string,
+  links: string[],
+  sourceRefs: string[],
+): { id: string; eventId: string } {
+  const data = ws.must({
+    v: 1,
+    op: "record.remember",
+    idempotencyKey: `${key}-derived`,
+    params: {
+      body,
+      kind: "summary",
+      provenance: { source: "cultivation:llm-derived-cluster", observedAt: OBS },
+      scope: DECISIONS_SCOPE,
+      tags: [],
+      links,
+      sourceRefs,
+      runId: RUN,
+    },
+  });
+  const record = recordOf(data);
+  if (!record) throw new HarnessError("record.remember derived missing record");
+  return { id: record.id, eventId: sourceRefs[0] ?? "" };
+}
+
+function setTopic(ws: Workspace, id: string, bodyHash: string, topic: string): void {
+  ws.must({
+    v: 1,
+    op: "topic.set",
+    idempotencyKey: `topic-${id}`,
+    params: { id, scope: DECISIONS_SCOPE, bodyHash, topics: [topic] },
   });
 }
 
@@ -831,6 +881,211 @@ function lifecycleSuite(): { invariants: string[]; report: Record<string, unknow
         headroom: fixedByHorizon,
         horizonReversal: reversals / threads.length,
         oracleDiversity: diversity,
+        labels: threads.map((t) => ({
+          stream: "lifecycle",
+          features: {
+            hasShortProbe: t.probesShort.length > 0,
+            hasDelayedReuse: t.probesFull.length > t.probesShort.length,
+            hasNoProbe: t.probesFull.length === 0,
+            kind: "user_fact",
+            ageHours: 0,
+            links: 0,
+          },
+          utility: {
+            keep: perThread[t.key]!.full.utilities.keep,
+            retire: perThread[t.key]!.full.utilities.retire,
+            correct: perThread[t.key]!.full.utilities.correct,
+          },
+        })),
+      },
+    };
+  } finally {
+    ws.cleanup();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Governance: Epistemics gates                                       */
+/* ------------------------------------------------------------------ */
+
+function governanceSuite(): { invariants: string[]; report: GovernanceReport } {
+  const ws = new Workspace("remind-governance-");
+  try {
+    const store: GovernanceStore = {
+      dbPath: ws.dbPath,
+      seed: (key, body, source, kind) => seedRecord(ws, key, body, source, kind),
+      rememberDerived: (key, body, links, sourceRefs) => rememberDerived(ws, key, body, links, sourceRefs),
+      recall: (query) => {
+        const r = recall(ws, query);
+        return { recallId: r.recallId, ids: r.items.map((i) => i.id) };
+      },
+      searchIds: (query) => searchIds(ws, query),
+      get: (id) => {
+        const r = getRecord(ws, id);
+        return {
+          id: r.id,
+          body: typeof r.body === "string" ? r.body : "",
+          status: typeof r.status === "string" ? r.status : "",
+          kind: typeof r.kind === "string" ? r.kind : "",
+          source: typeof r.source === "string" ? r.source : "",
+        };
+      },
+      correct: (id, body, source, sourceRefs) => correct(ws, id, body, source, sourceRefs),
+      retire: (id) => retire(ws, id),
+      reactivate: (id) => reactivate(ws, id),
+      auditFor: (targetId) => {
+        const db = new DatabaseSync(ws.dbPath, { readOnly: true });
+        try {
+          const rows: unknown[] = db
+            .prepare("SELECT op, code, targetId, reasonCode FROM audit WHERE targetId = ? ORDER BY rowid")
+            .all(targetId);
+          return rows.flatMap((row) => {
+            if (!isObject(row)) return [];
+            const op = row["op"];
+            const code = row["code"];
+            const target = row["targetId"];
+            const reason = row["reasonCode"];
+            if (typeof op !== "string" || typeof code !== "string" || typeof target !== "string") return [];
+            return [{ op, code, targetId: target, reasonCode: typeof reason === "string" ? reason : null }];
+          });
+        } finally {
+          db.close();
+        }
+      },
+      auditColumns: () => {
+        const db = new DatabaseSync(ws.dbPath, { readOnly: true });
+        try {
+          const rows: unknown[] = db.prepare("PRAGMA table_info(audit)").all();
+          return rows.flatMap((row) => {
+            if (!isObject(row) || typeof row["name"] !== "string") return [];
+            return [row["name"]];
+          });
+        } finally {
+          db.close();
+        }
+      },
+    };
+    const report = runGovernanceSuite(store);
+    return { invariants: report.invariants, report };
+  } finally {
+    ws.cleanup();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Consolidate: opt-in model leg                                      */
+/* ------------------------------------------------------------------ */
+
+function countKind(dbPath: string, kind: string): number {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const row: unknown = db
+      .prepare("SELECT COUNT(*) AS n FROM records WHERE kind = ? AND scope = ?")
+      .get(kind, DECISIONS_SCOPE);
+    return isObject(row) && typeof row["n"] === "number" ? row["n"] : -1;
+  } catch {
+    return -1;
+  } finally {
+    db.close();
+  }
+}
+
+function sourceCount(ws: Workspace, id: string): number {
+  const data = ws.must({ v: 1, op: "record.sources", params: { id, scope: DECISIONS_SCOPE } });
+  if (!isObject(data) || !Array.isArray(data["sources"])) return -1;
+  return data["sources"].length;
+}
+
+function consolidateSuite(llmConfigPath: string | null): { invariants: string[]; report: Record<string, unknown> } {
+  if (llmConfigPath === null) {
+    return { invariants: [], report: { status: "skipped", reason: "no-llm-config" } };
+  }
+  const parsed: unknown = JSON.parse(fs.readFileSync(llmConfigPath, "utf8"));
+  if (!isObject(parsed) || !isObject(parsed["llm"])) {
+    throw new HarnessError("llm config missing llm section");
+  }
+  const llm = parsed["llm"];
+  if (llm["enabled"] !== true || llm["backend"] !== "openai") {
+    return { invariants: [], report: { status: "skipped", reason: "llm-not-openai-enabled" } };
+  }
+  const overrides: Record<string, unknown> = { llm };
+  const maintenance = parsed["maintenance"];
+  const consolidate = parsed["consolidate"];
+  if (isObject(maintenance)) overrides["maintenance"] = maintenance;
+  if (isObject(consolidate)) overrides["consolidate"] = consolidate;
+  const timeoutMs =
+    isObject(maintenance) && typeof maintenance["timeoutMs"] === "number"
+      ? maintenance["timeoutMs"] + 60000
+      : 180000;
+
+  const ws = new Workspace("remind-consolidate-", true, overrides);
+  const invariants: string[] = [];
+  try {
+    const members = [
+      seedRecord(ws, "consolidate-a", "Orchard project: the harvest starts on Friday.", "user:alice"),
+      seedRecord(ws, "consolidate-b", "Orchard project: the crates arrive on Thursday.", "user:alice"),
+      seedRecord(ws, "consolidate-c", "Orchard project: the barn is reserved for sorting.", "user:alice"),
+    ];
+    for (const member of members) {
+      const r = getRecord(ws, member.id);
+      if (typeof r.bodyHash !== "string") throw new HarnessError("record.get missing bodyHash");
+      setTopic(ws, member.id, r.bodyHash, "orchard");
+    }
+    const data = ws.must(
+      { v: 1, op: "maintain.consolidate", idempotencyKey: "consolidate-1", params: { scope: DECISIONS_SCOPE } },
+      timeoutMs,
+    );
+    if (!isObject(data)) throw new HarnessError("consolidate bad data");
+    const clusters = Array.isArray(data["clusters"]) ? data["clusters"] : [];
+    const applied = typeof data["applied"] === "number" ? data["applied"] : -1;
+    const degraded = data["degraded"] === true;
+    if (degraded) {
+      invariants.push("consolidate degraded with a configured model");
+      return { invariants, report: { status: "degraded", applied, clusters, degraded } };
+    }
+    const written = clusters.flatMap((cluster) => {
+      if (!isObject(cluster) || cluster["outcome"] !== "written" || typeof cluster["recordId"] !== "string") return [];
+      return [{ recordId: cluster["recordId"], topic: cluster["topic"], members: cluster["members"], sentencesKept: cluster["sentencesKept"] }];
+    });
+    if (written.length === 0) {
+      return { invariants, report: { status: "no-write", applied, clusters, degraded } };
+    }
+    const summary = getRecord(ws, written[0]!.recordId);
+    const summaryLinks = Array.isArray(summary.links) ? summary.links.filter((v) => typeof v === "string") : [];
+    const membersActive = members.every((m) => getRecord(ws, m.id).status === "active");
+    const summaryKind = summary.kind === "summary";
+    const summarySource = typeof summary.source === "string" && summary.source.includes("derived");
+    const linked = members.every((m) => summaryLinks.includes(m.id));
+    const sources = sourceCount(ws, summary.id);
+    const beforeSecond = countKind(ws.dbPath, "summary");
+    const second = ws.must(
+      { v: 1, op: "maintain.consolidate", idempotencyKey: "consolidate-2", params: { scope: DECISIONS_SCOPE } },
+      timeoutMs,
+    );
+    const secondClusters = isObject(second) && Array.isArray(second["clusters"]) ? second["clusters"] : [];
+    const unchanged = secondClusters.some((c) => isObject(c) && c["outcome"] === "unchanged");
+    const afterSecond = countKind(ws.dbPath, "summary");
+    if (!summaryKind) invariants.push("consolidate summary kind is not summary");
+    if (!summarySource) invariants.push("consolidate summary source is not derived");
+    if (!linked) invariants.push("consolidate summary does not link every member");
+    if (sources <= 0) invariants.push("consolidate summary has no resolvable sources");
+    if (!membersActive) invariants.push("consolidate retired a member");
+    if (!unchanged) invariants.push("second consolidate did not report unchanged");
+    if (afterSecond !== beforeSecond) invariants.push("second consolidate created a duplicate summary");
+    return {
+      invariants,
+      report: {
+        status: "ok",
+        applied,
+        clusters,
+        summaryId: summary.id,
+        summaryKind,
+        summarySource,
+        linked,
+        sources,
+        membersActive,
+        unchanged,
+        summaries: beforeSecond,
       },
     };
   } finally {
@@ -870,10 +1125,14 @@ function metrics(probes: Probe[]): Record<string, unknown> {
 function main(): void {
   const args = process.argv.slice(2);
   let outPath: string | null = null;
+  let labelsPath: string | null = null;
+  let llmConfigPath: string | null = null;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--out" && i + 1 < args.length) outPath = args[++i]!;
+    else if (args[i] === "--labels" && i + 1 < args.length) labelsPath = args[++i]!;
+    else if (args[i] === "--llm-config" && i + 1 < args.length) llmConfigPath = args[++i]!;
     else if (args[i] === "--help" || args[i] === "-h") {
-      process.stderr.write("usage: evaluate-memory-decisions [--out <json>]\n");
+      process.stderr.write("usage: evaluate-memory-decisions [--out <json>] [--labels <jsonl>] [--llm-config <path>]\n");
       process.stdout.write("\n");
       process.exit(0);
     } else {
@@ -915,6 +1174,24 @@ function main(): void {
     invariants.push(`lifecycle suite failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
+  let governance: GovernanceReport | null = null;
+  try {
+    const r = governanceSuite();
+    governance = r.report;
+    invariants.push(...r.invariants);
+  } catch (e) {
+    invariants.push(`governance suite failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  let consolidate: Record<string, unknown> = {};
+  try {
+    const r = consolidateSuite(llmConfigPath);
+    consolidate = r.report;
+    invariants.push(...r.invariants);
+  } catch (e) {
+    invariants.push(`consolidate suite failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   const sorted = [...LATENCIES].sort((a, b) => a - b);
   const p50 = sorted.length > 0 ? (sorted[Math.floor(sorted.length * 0.5)] ?? null) : null;
   const p95 = sorted.length > 0 ? (sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? null) : null;
@@ -923,13 +1200,15 @@ function main(): void {
     version: DECISIONS_VERSION,
     scope: DECISIONS_SCOPE,
     generatedAt: new Date().toISOString(),
-    model: "none (lexical only; lifecycle excludes consolidate)",
+    model: "none by default; optional --llm-config enables maintain.consolidate",
     memprobe: {
       scenarios: scenarios.map((s) => ({ name: s.name, metrics: metrics(s.probes), invariants: s.invariants })),
       overall: metrics(memprobes),
     },
     support,
     lifecycle,
+    governance,
+    consolidate,
     invariants,
     latency: {
       calls: LATENCIES.length,
@@ -947,6 +1226,16 @@ function main(): void {
       fs.writeFileSync(outPath, JSON.stringify(report, null, 2) + "\n", "utf8");
     } catch {
       process.stderr.write("error: cannot write report\n");
+      process.exit(2);
+    }
+  }
+  if (labelsPath) {
+    try {
+      const labels = lifecycle["labels"];
+      const rows = Array.isArray(labels) ? labels.map((row) => JSON.stringify(row)) : [];
+      fs.writeFileSync(labelsPath, rows.length > 0 ? rows.join("\n") + "\n" : "", "utf8");
+    } catch {
+      process.stderr.write("error: cannot write labels\n");
       process.exit(2);
     }
   }

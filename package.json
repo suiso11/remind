@@ -20,6 +20,7 @@
     "evaluate:baseline": "npm run build && node dist/scripts/evaluate-baseline.js",
     "eval:operations": "npm run build && node dist/scripts/evaluate-operations.js",
     "eval:decisions": "npm run build && node dist/scripts/evaluate-memory-decisions.js",
+    "eval:fit": "npm run build && node dist/scripts/decision-policy-fit.js",
     "clean": "node -e \"require('fs').rm('dist',{recursive:true,force:true},()=>{})\"",
     "provision:model": "npm run build && node dist/scripts/provision-model.js",
     "provision:llm": "npm run build && node dist/scripts/provision-llm.js",
