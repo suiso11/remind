@@ -40,7 +40,9 @@ export const DECISIONS_SCOPE = "personal/default";
 const OBS = "2026-09-01T00:00:00.000Z";
 const RUN = "memory-decisions-run";
 const LIMIT = 3;
-const CLI_TIMEOUT_MS = 30000;
+// Spawn-kill budget headroom: loaded Windows CI runners can stretch a CLI
+// startup past the harness op deadline; the product default stays 5000ms.
+const CLI_TIMEOUT_MS = 60000;
 const MAX_BUFFER = 256 * 1024;
 const RESPONSE_MAX_BYTES = 8192;
 const STORAGE_PENALTY = 0.02;
@@ -103,7 +105,7 @@ function configFor(dir: string): Record<string, unknown> {
       snippetMaxCp: 200,
       responseMaxBytes: 8192,
     },
-    timeouts: { cliMs: 5000, busyMs: 2000 },
+    timeouts: { cliMs: 30000, busyMs: 2000 },
     dbMaxBytes: 104857600,
     cultivation: { queueMax: 100, batchMax: 20, leaseTtlMs: 120000, reviewMaxAttempts: 5 },
     llm: { enabled: false },
