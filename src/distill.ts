@@ -578,6 +578,7 @@ export async function maintainDistill(
         planned.push({ review: extra.review, action: keepOf(extra.target.id, extra.target.revision), retry: false });
       }
     }
+    const plannedSummaryHashes = new Set<string>();
     for (const s of deduped) {
       if (!renewOrAbort()) {
         settleOwned(items.map((it) => it.queueId));
@@ -645,10 +646,11 @@ export async function maintainDistill(
       } catch {
         duplicateActive = true; // fail closed: never write when the check cannot run
       }
-      if (duplicateActive) {
+      if (duplicateActive || plannedSummaryHashes.has(summaryHash)) {
         planned.push({ review: s.review, action: keepOf(target.id, target.revision), retry: false });
         continue;
       }
+      plannedSummaryHashes.add(summaryHash);
       // Provenance union is conservative: when both sources together carry
       // more distinct source refs than sourceRefsMax, the merge is skipped
       // (audited keep) rather than written with truncated provenance.
