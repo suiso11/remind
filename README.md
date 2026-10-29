@@ -204,7 +204,7 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 
 旧承認スキーマの DB (candidates 表等) は起動失敗 (stderr 固定文 + 非ゼロ終了) し、変更・削除・移行はしない。旧ファイルを退避し、`dbPath` に新しいファイルを指定すること。
 
-現行スキーマは `user_version=13`。v2〜v12 の既存 DB は単一の `BEGIN IMMEDIATE` 移行でその場で更新する（拒否しない）。v12 までは `records.evidence` の nullable 列を `ALTER TABLE ADD COLUMN` で追加し、既存行は NULL のまま保持する。v11 までは `record_importance.source` の CHECK をモデル id 付き `llm:v2:<model>` を受け付ける形へ行保持のまま再構築する。v6 からは `record_importance` と `cluster_summaries` の両方が作成され、activation の v7 (`record_importance` 保持) からは既存の重要度行を保ったまま `cluster_summaries` だけを追加する。v8 (`cluster_summaries` 保持) からは既存行を保ったまま回転 cursor の `consolidate_scope_state` だけを追加する。既に v13 のファイルは DDL を伴わない fast path で開く。
+現行スキーマは `user_version=13`。v2〜v12 の既存 DB は単一の `BEGIN IMMEDIATE` 移行でその場で更新する（拒否しない）。v12 までは `records.evidence` の nullable 列を `ALTER TABLE ADD COLUMN` で追加し、既存行は NULL のまま保持する。v11 までは `record_importance.source` の CHECK をモデル id 付き `llm:v2:<model>` を受け付ける形へ行保持のまま再構築する。v7 で `record_importance` が、v8 で `cluster_summaries` が作成され、v7 (`record_importance` 保持) からは既存の重要度行を保ったまま `cluster_summaries` だけを追加する。v8 (`cluster_summaries` 保持) からは既存行を保ったまま回転 cursor の `consolidate_scope_state` だけを追加する。既に v13 のファイルは DDL を伴わない fast path で開く。
 
 ## テスト
 
