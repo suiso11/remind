@@ -43,6 +43,13 @@ export interface PolicyFitReport {
   holdoutAccuracy: number | null;
   holdoutUtility: number | null;
   bestFixedUtility: number | null;
+  loso: Array<{
+    stream: string; trainN: number; holdoutN: number; policyUtility: number;
+    bestFixedUtility: number; holdoutLoss: number; baselineLoss: number;
+  }>;
+  losoMeanPolicyUtility: number | null;
+  losoMeanBestFixedUtility: number | null;
+  losoMeanLossImprovement: number | null;
   prevalenceBuckets: Record<string, { n: number; modelLoss: number; baselineLoss: number; ok: boolean }>;
   autoApply: false;
 }
@@ -115,52 +122,17 @@ function meanLoss(ps: number[][], ys: number[]): number {
 
 const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
 
-export function fitPolicy(rows: PolicyRow[]): PolicyFitReport {
-  const n = rows.length;
-  const empty: PolicyFitReport = {
-    accepted: false, reason: "", n, trainN: 0, holdoutN: 0, trainStreams: 0, holdoutStreams: 0,
-    featureNames: [], weights: null, trainLoss: null, holdoutLoss: null, baselineHoldoutLoss: null,
-    trainAccuracy: null, holdoutAccuracy: null, holdoutUtility: null, bestFixedUtility: null,
-    prevalenceBuckets: {}, autoApply: false,
-  };
-  const result = (reason: string, extra: Partial<PolicyFitReport> = {}): PolicyFitReport => ({
-    ...empty, ...extra, reason, accepted: reason === "accepted",
-  });
-  if (n < MIN_N) return result(`skipped: n=${n} < ${MIN_N}`);
-
-  // Group by stream (sorted by stream id, input order within a stream). A stream is never split.
-  const byStream = new Map<string, PolicyRow[]>();
-  for (const r of rows) {
-    const g = byStream.get(r.stream);
-    if (g) g.push(r);
-    else byStream.set(r.stream, [r]);
-  }
-  const streams = [...byStream.keys()].sort();
-  if (streams.length < 2) return result("skipped: <2 streams");
-
-  // Take whole streams from the end until the holdout is large enough; keep >=1 stream for train.
-  const target = Math.max(MIN_HOLDOUT, Math.ceil(0.2 * n));
-  let cut = streams.length;
-  let holdoutN = 0;
-  while (cut > 1 && holdoutN < target) {
-    cut--;
-    holdoutN += byStream.get(streams[cut])?.length ?? 0;
-  }
-  const train = streams.slice(0, cut).flatMap((s) => byStream.get(s) ?? []);
-  const hold = streams.slice(cut).flatMap((s) => byStream.get(s) ?? []);
-  const trainN = train.length;
-  const split = { trainN, holdoutN, trainStreams: cut, holdoutStreams: streams.length - cut };
-  if (holdoutN < MIN_HOLDOUT) return result(`skipped: holdout=${holdoutN} < ${MIN_HOLDOUT}`, split);
-
+// Deterministic MAP multinomial fit on `train` (standardized/one-hot from train only), evaluated on `hold`.
+function fitOnce(train: PolicyRow[], hold: PolicyRow[]) {
   const label = (r: PolicyRow) => argmax(ACTIONS.map((a) => r.utility[a]));
   const ytr = train.map(label);
   const yho = hold.map(label);
-  if (new Set(ytr).size < 2) return result("skipped: <2 distinct argmax classes in train", split);
+  if (new Set(ytr).size < 2) return null;
+  const trainN = train.length;
 
   const kinds = [...new Set(train.map((r) => r.features.kind))].sort();
   const featureNames = ["bias", ...NUM_KEYS, "hasConflict", ...kinds.map((k) => `kind=${k}`)];
   const raw = (r: PolicyRow) => NUM_KEYS.map((k) => r.features[k]);
-  // Standardize numeric columns with train statistics only.
   const mu = NUM_KEYS.map((_, j) => mean(train.map((r) => raw(r)[j])));
   const sd = NUM_KEYS.map((_, j) => Math.sqrt(mean(train.map((r) => (raw(r)[j] - mu[j]) ** 2))) || 1);
   const vec = (r: PolicyRow) => [
@@ -193,13 +165,77 @@ export function fitPolicy(rows: PolicyRow[]): PolicyFitReport {
   const counts = [0, 0, 0];
   ytr.forEach((y) => counts[y]++);
   const prior = counts.map((c) => (c + 1) / (trainN + 3));
-  const trainLoss = meanLoss(ptr, ytr);
-  const holdoutLoss = meanLoss(pho, yho);
-  const baselineHoldoutLoss = meanLoss(yho.map(() => prior), yho);
+  return {
+    featureNames, W, ptr, pho, ytr, yho, prior,
+    trainLoss: meanLoss(ptr, ytr),
+    holdoutLoss: meanLoss(pho, yho),
+    baselineLoss: meanLoss(yho.map(() => prior), yho),
+    holdoutUtility: mean(hold.map((r, i) => r.utility[ACTIONS[argmax(pho[i])]])),
+    bestFixedUtility: Math.max(...ACTIONS.map((a) => mean(hold.map((r) => r.utility[a])))),
+  };
+}
+
+export function fitPolicy(rows: PolicyRow[]): PolicyFitReport {
+  const n = rows.length;
+  const empty: PolicyFitReport = {
+    accepted: false, reason: "", n, trainN: 0, holdoutN: 0, trainStreams: 0, holdoutStreams: 0,
+    featureNames: [], weights: null, trainLoss: null, holdoutLoss: null, baselineHoldoutLoss: null,
+    trainAccuracy: null, holdoutAccuracy: null, holdoutUtility: null, bestFixedUtility: null,
+    loso: [], losoMeanPolicyUtility: null, losoMeanBestFixedUtility: null, losoMeanLossImprovement: null,
+    prevalenceBuckets: {}, autoApply: false,
+  };
+  const result = (reason: string, extra: Partial<PolicyFitReport> = {}): PolicyFitReport => ({
+    ...empty, ...extra, reason, accepted: reason === "accepted",
+  });
+  if (n < MIN_N) return result(`skipped: n=${n} < ${MIN_N}`);
+
+  // Group by stream (sorted by stream id, input order within a stream). A stream is never split.
+  const byStream = new Map<string, PolicyRow[]>();
+  for (const r of rows) {
+    const g = byStream.get(r.stream);
+    if (g) g.push(r);
+    else byStream.set(r.stream, [r]);
+  }
+  const streams = [...byStream.keys()].sort();
+  if (streams.length < 3) return result("skipped: <3 streams");
+
+  // Take whole streams from the end until the holdout is large enough; keep >=1 stream for train.
+  const target = Math.max(MIN_HOLDOUT, Math.ceil(0.2 * n));
+  let cut = streams.length;
+  let holdoutN = 0;
+  while (cut > 1 && holdoutN < target) {
+    cut--;
+    holdoutN += byStream.get(streams[cut])?.length ?? 0;
+  }
+  const train = streams.slice(0, cut).flatMap((s) => byStream.get(s) ?? []);
+  const hold = streams.slice(cut).flatMap((s) => byStream.get(s) ?? []);
+  const trainN = train.length;
+  const split = { trainN, holdoutN, trainStreams: cut, holdoutStreams: streams.length - cut };
+  if (holdoutN < MIN_HOLDOUT) return result(`skipped: holdout=${holdoutN} < ${MIN_HOLDOUT}`, split);
+
+  const f = fitOnce(train, hold);
+  if (!f) return result("skipped: <2 distinct argmax classes in train", split);
+  const { featureNames, W, ptr, pho, ytr, yho, prior } = f;
   const acc = (ps: number[][], ys: number[]) => ys.filter((y, i) => argmax(ps[i]) === y).length / ys.length;
 
-  const holdoutUtility = mean(hold.map((r, i) => r.utility[ACTIONS[argmax(pho[i])]]));
-  const bestFixedUtility = Math.max(...ACTIONS.map((a) => mean(hold.map((r) => r.utility[a]))));
+  // Leave-one-stream-out: every stream is evaluated by a model that never saw it.
+  const loso: PolicyFitReport["loso"] = [];
+  let losoSkip = "";
+  for (const s of streams) {
+    const h = byStream.get(s) ?? [];
+    const t = streams.filter((o) => o !== s).flatMap((o) => byStream.get(o) ?? []);
+    if (h.length < MIN_HOLDOUT) { losoSkip = `skipped: loso fold ${s} holdout=${h.length} < ${MIN_HOLDOUT}`; break; }
+    const g = fitOnce(t, h);
+    if (!g) { losoSkip = `skipped: <2 distinct argmax classes in loso train (holdout ${s})`; break; }
+    loso.push({
+      stream: s, trainN: t.length, holdoutN: h.length, policyUtility: g.holdoutUtility,
+      bestFixedUtility: g.bestFixedUtility, holdoutLoss: g.holdoutLoss, baselineLoss: g.baselineLoss,
+    });
+  }
+  if (losoSkip) return result(losoSkip, split);
+  const losoMeanPolicyUtility = mean(loso.map((l) => l.policyUtility));
+  const losoMeanBestFixedUtility = mean(loso.map((l) => l.bestFixedUtility));
+  const losoMeanLossImprovement = mean(loso.map((l) => l.baselineLoss - l.holdoutLoss));
 
   const buckets: PolicyFitReport["prevalenceBuckets"] = {};
   ["low", "mid", "high"].forEach((name, b) => {
@@ -214,22 +250,25 @@ export function fitPolicy(rows: PolicyRow[]): PolicyFitReport {
   });
 
   const weights: Record<Action, number[]> = { keep: W[0], retire: W[1], correct: W[2] };
-  const improvement = baselineHoldoutLoss - holdoutLoss;
   const badBuckets = Object.entries(buckets).filter(([, v]) => !v.ok).map(([k]) => k);
+  const worseFolds = loso.filter((l) => !(l.policyUtility >= l.bestFixedUtility)).map((l) => l.stream);
   let reason = "accepted";
-  if (!(holdoutUtility > bestFixedUtility + MIN_UTILITY_MARGIN)) {
-    reason = `rejected: holdout utility ${holdoutUtility.toFixed(6)} does not beat best fixed action ${bestFixedUtility.toFixed(6)}`;
-  } else if (!(improvement > MIN_IMPROVEMENT)) {
-    reason = `rejected: holdout log-loss improvement ${improvement.toFixed(6)} <= ${MIN_IMPROVEMENT}`;
+  if (!(losoMeanPolicyUtility > losoMeanBestFixedUtility + MIN_UTILITY_MARGIN)) {
+    reason = `rejected: loso mean utility ${losoMeanPolicyUtility.toFixed(6)} does not beat best fixed action ${losoMeanBestFixedUtility.toFixed(6)}`;
+  } else if (worseFolds.length > 0) {
+    reason = `rejected: loso fold worse than best fixed action: ${worseFolds.join(",")}`;
+  } else if (!(losoMeanLossImprovement > MIN_IMPROVEMENT)) {
+    reason = `rejected: loso mean log-loss improvement ${losoMeanLossImprovement.toFixed(6)} <= ${MIN_IMPROVEMENT}`;
   } else if (Object.keys(buckets).length < 2) {
     reason = "prevalence-unverified";
   } else if (badBuckets.length > 0) {
     reason = `rejected: prevalence bucket worse than baseline: ${badBuckets.join(",")}`;
   }
   return result(reason, {
-    ...split, featureNames, weights, trainLoss, holdoutLoss, baselineHoldoutLoss,
-    trainAccuracy: acc(ptr, ytr), holdoutAccuracy: acc(pho, yho), holdoutUtility, bestFixedUtility,
-    prevalenceBuckets: buckets,
+    ...split, featureNames, weights, trainLoss: f.trainLoss, holdoutLoss: f.holdoutLoss,
+    baselineHoldoutLoss: f.baselineLoss, trainAccuracy: acc(ptr, ytr), holdoutAccuracy: acc(pho, yho),
+    holdoutUtility: f.holdoutUtility, bestFixedUtility: f.bestFixedUtility, prevalenceBuckets: buckets,
+    loso, losoMeanPolicyUtility, losoMeanBestFixedUtility, losoMeanLossImprovement,
   });
 }
 
