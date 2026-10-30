@@ -58,7 +58,7 @@ npm run build
 '{"v":1,"op":"record.archive","idempotencyKey":"arc-001","params":{"id":"<recordId>","scope":"personal/default","reasonCode":"USER_ARCHIVED"}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 
-- `record.get` は status によらず同一 scope の 1 件を返す。`record.list` は既定 active のみ。順序 `createdAt DESC, id ASC`。`since` inclusive、`until` exclusive。
+- `record.get` は status によらず同一 scope の 1 件を返す。`record.list` は既定 active のみ。順序 `createdAt DESC, id ASC`。`since` inclusive、`until` exclusive。item は `id / kind / status / snippet / truncated / createdAt / evidence / privacy{sensitivity,origin}` を返す。
 - `record.stats` は `scope` のみを受け取る読み取り専用の集計で、`{scope, byKind{user_fact,model_inference,summary,correction}, byStatus{active,superseded,archived,retired}, importance{scored,unscored,buckets[{lt,count}]}, computedAt}` を返す。`byKind` と `importance` は active のみ、`byStatus` は全 status。`buckets` は `[0.2,0.4,0.6,0.8,1.0001)` の上限で、重要度は分類器が `0..3 / 3` を保存するため実レンジは `[0,1]`。`record_importance.bodyHash` が現在本文と一致する行だけを scored とし、欠落・陳腐化は unscored に数える。本文は返さず、`record.list` と同様に metadata-only の audit を 1 行書く（heat/exposure/usage は書かない）。
 - `record.feedback` は引用・採用の明示報告のみ熱を加算する。見るだけでは加算しない。露出集合外の ID は全体拒否。
 - `record.correct` は新 revision 追記 + 旧 `active -> superseded` を同一 txn で行う。並行訂正は勝者 1 件、敗者は `CONFLICT`。`kind` は `correction` 固定。任意の `tags[]` は `record.remember` と同じ検証 (`tagsMax` 超過は `LIMIT_EXCEEDED`、非配列・不正要素は `BAD_REQUEST`) を受け、省略時は訂正対象 (supersede 対象) の旧版 tags を `tagsMax` まで継承し、明示時は置換、`[]` は全消去する。

@@ -2455,9 +2455,9 @@ export function listRecords(
   const now = nowOverride ?? nowIso();
   try {
     return withTransaction(db, (): ResponseEnvelope => {
-      let rows: Array<{ id: string; kind: string; status: string; body: string; createdAt: string; evidence: string | null }>;
+      let rows: Array<{ id: string; kind: string; status: string; body: string; createdAt: string; evidence: string | null; privacySensitivity: string | null; privacyOrigin: string | null }>;
       try {
-        let sql = `SELECT id, kind, status, body, createdAt, evidence FROM records WHERE scope = ? AND status = ?`;
+        let sql = `SELECT id, kind, status, body, createdAt, evidence, privacySensitivity, privacyOrigin FROM records WHERE scope = ? AND status = ?`;
         const args: Array<string | number> = [nScope, nStatus];
         if (nSince !== null) {
           sql += ` AND createdAt >= ?`;
@@ -2469,7 +2469,7 @@ export function listRecords(
         }
         sql += ` ORDER BY createdAt DESC, id ASC LIMIT ?`;
         args.push(nLimit);
-        rows = db.prepare(sql).all(...args) as Array<{ id: string; kind: string; status: string; body: string; createdAt: string; evidence: string | null }>;
+        rows = db.prepare(sql).all(...args) as Array<{ id: string; kind: string; status: string; body: string; createdAt: string; evidence: string | null; privacySensitivity: string | null; privacyOrigin: string | null }>;
       } catch {
         throw new Error("read failed");
       }
@@ -2484,6 +2484,7 @@ export function listRecords(
           truncated: cps.length > max,
           createdAt: r.createdAt,
           evidence: r.evidence,
+          privacy: privacyFromColumns(r.privacySensitivity, r.privacyOrigin),
         };
       });
       const stored = budgeted(ok({ items }), config);
