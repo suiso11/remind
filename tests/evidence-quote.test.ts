@@ -464,3 +464,26 @@ describe("evidence quote: migration and successors", () => {
     }
   });
 });
+
+describe("record.list privacy exposure", () => {
+  it("returns the stored privacy metadata for each item", () => {
+    const ctx = setup();
+    try {
+      const params = {
+        ...rememberParams(ctx, "ev-priv", "sensitive orchard note"),
+        privacy: { sensitivity: "sensitive", origin: "conversation" },
+      };
+      const res = rememberRecord(ctx.db, ctx.config, params, "ev-priv", OBS);
+      assert.equal(res.ok, true, JSON.stringify(res));
+      const id = (res.data as { record: { id: string } }).record.id;
+      const listed = listRecords(ctx.db, ctx.config, { scope: SCOPE, limit: 10 });
+      assert.equal(listed.ok, true, JSON.stringify(listed));
+      assert.deepEqual(itemById(listed.data, id)?.["privacy"], {
+        sensitivity: "sensitive",
+        origin: "conversation",
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
