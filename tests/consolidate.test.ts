@@ -929,7 +929,7 @@ describe("maintain.consolidate topic clusters", () => {
       const reopened = initDb(ctx.config, ctx.configPath);
       const uv = (reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version;
       assert.equal(uv, SCHEMA_VERSION);
-      assert.equal(SCHEMA_VERSION, 13);
+      assert.equal(SCHEMA_VERSION, 14);
       for (const table of ["record_importance", "cluster_summaries", "consolidate_scope_state"]) {
         const row = reopened.db
           .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type='table' AND name = ?`)

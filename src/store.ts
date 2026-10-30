@@ -121,7 +121,7 @@ import {
  * user_fact); v12 files gain the column via one ALTER TABLE ADD COLUMN with
  * every row kept.
  */
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 /** Original M1 stamp; still accepted and upgraded on open. */
 export const LEGACY_M1_USER_VERSION = 2;
 /** Pre-topic-origin schema stamp; accepted and upgraded in place. */
@@ -378,6 +378,34 @@ function ensureRawChunkColumns(db: DatabaseSync): void {
 }
 
 /**
+ * v14 additive migration: nullable raw-event speaker (`user` / `assistant` /
+ * `system`). Legacy combined rows stay NULL and are never guessed/split.
+ * Idempotent/savepoint-based like the chunk migration.
+ */
+function ensureRawSpeakerColumn(db: DatabaseSync): void {
+  const tableHasColumn = (table: string, col: string): boolean => {
+    try {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      return cols.some((c) => c.name === col);
+    } catch {
+      return false;
+    }
+  };
+  if (tableHasColumn("raw_events", "speaker")) return;
+  db.exec(`SAVEPOINT ensure_raw_speaker_column`);
+  try {
+    db.exec(
+      `ALTER TABLE raw_events ADD COLUMN speaker TEXT NULL CHECK(speaker IN ('user','assistant','system'))`,
+    );
+    db.exec(`RELEASE SAVEPOINT ensure_raw_speaker_column`);
+  } catch (e) {
+    try { db.exec(`ROLLBACK TO SAVEPOINT ensure_raw_speaker_column`); } catch { /* preserve error */ }
+    try { db.exec(`RELEASE SAVEPOINT ensure_raw_speaker_column`); } catch { /* preserve error */ }
+    throw e;
+  }
+}
+
+/**
  * P1 guarded migration for record_source_refs spans. Legacy tables used
  * PRIMARY KEY(recordId,eventId), which forbids the same eventId with a
  * different span. Rebuild once (every row copied; legacy spans stay NULL)
@@ -600,7 +628,8 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
     scope TEXT NOT NULL, runId TEXT NULL, createdAt TEXT NOT NULL,
     privacySensitivity TEXT NULL CHECK(privacySensitivity IN ('normal','sensitive')),
     privacyOrigin TEXT NULL CHECK(privacyOrigin IN ('conversation','self_activity')),
-    docId TEXT NULL, chunkSeq INTEGER NULL CHECK(chunkSeq BETWEEN 0 AND 100000))`);
+    docId TEXT NULL, chunkSeq INTEGER NULL CHECK(chunkSeq BETWEEN 0 AND 100000),
+    speaker TEXT NULL CHECK(speaker IN ('user','assistant','system')))`);
   db.exec(`CREATE TABLE IF NOT EXISTS records(
     id TEXT PRIMARY KEY, body TEXT NOT NULL, bodyNorm TEXT NOT NULL, bodyHash TEXT NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('user_fact','model_inference','summary','correction')),
@@ -617,6 +646,8 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   ensureEvidenceColumn(db);
   // P1 additive chunk columns (legacy rows NULL) for old databases.
   ensureRawChunkColumns(db);
+  // v14 additive speaker column for old databases.
+  ensureRawSpeakerColumn(db);
   db.exec(`CREATE TABLE IF NOT EXISTS record_tags(recordId TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(recordId, tag))`);
   db.exec(`CREATE TABLE IF NOT EXISTS record_links(fromId TEXT NOT NULL, toRef TEXT NOT NULL, PRIMARY KEY(fromId, toRef))`);
   db.exec(`CREATE TABLE IF NOT EXISTS record_source_refs(
@@ -1754,7 +1785,7 @@ export function eventAppend(
   nowOverride?: string,
 ): ResponseEnvelope {
   if (containsLoneSurrogateDeep(params)) return budgeted(bad(), config);
-  const allowed = new Set(["eventId", "sessionId", "turnId", "body", "provenance", "scope", "runId", "privacy", "chunk"]);
+  const allowed = new Set(["eventId", "sessionId", "turnId", "body", "provenance", "scope", "runId", "privacy", "chunk", "speaker"]);
   for (const k of Object.keys(params)) {
     if (!allowed.has(k)) return budgeted(bad(), config);
   }
@@ -1782,6 +1813,16 @@ export function eventAppend(
   if (requirePrivacyEnabled(config) && nPrivacy === null) return budgeted(bad(), config);
   const nChunk = parseChunkParam(params["chunk"]);
   if (nChunk === "invalid") return budgeted(bad(), config);
+  const rawSpeaker = params["speaker"];
+  if (
+    rawSpeaker !== undefined &&
+    rawSpeaker !== "user" &&
+    rawSpeaker !== "assistant" &&
+    rawSpeaker !== "system"
+  ) {
+    return budgeted(bad(), config);
+  }
+  const nSpeaker = rawSpeaker === undefined ? null : (rawSpeaker as string);
 
   // Legacy hash compatibility: absent keys are omitted entirely, so requests
   // without privacy/chunk hash byte-identically to the pre-slice normal form.
@@ -1797,6 +1838,7 @@ export function eventAppend(
   };
   if (nPrivacy !== null) hashedParams["privacy"] = nPrivacy;
   if (nChunk !== null) hashedParams["chunk"] = nChunk;
+  if (nSpeaker !== null) hashedParams["speaker"] = nSpeaker;
   const reqHash = requestHashFor("event.append", hashedParams);
 
   let saved: StoredOp | null = null;
@@ -1826,11 +1868,11 @@ export function eventAppend(
       const probe: ResponseEnvelope = ok({ event: { eventId } });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       db.prepare(
-        `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt, privacySensitivity, privacyOrigin, docId, chunkSeq)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO raw_events(eventId, sessionId, turnId, body, bodyNorm, source, observedAt, scope, runId, createdAt, privacySensitivity, privacyOrigin, docId, chunkSeq, speaker)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(eventId as string, sessionId as string, turnId as string, rawBody, nBody, prov.source, prov.observedAt, nScope, nRunId, now,
         nPrivacy === null ? null : nPrivacy.sensitivity, nPrivacy === null ? null : nPrivacy.origin,
-        nChunk === null ? null : nChunk.docId, nChunk === null ? null : nChunk.seq);
+        nChunk === null ? null : nChunk.docId, nChunk === null ? null : nChunk.seq, nSpeaker);
       const stored = budgeted(probe, config);
       db.prepare(
         `INSERT INTO operations(idempotencyKey, op, requestHash, responseJson, createdAt) VALUES (?, ?, ?, ?, ?)`,
@@ -2926,13 +2968,14 @@ export function getEvent(
             privacyOrigin: string | null;
             docId: string | null;
             chunkSeq: number | null;
+            speaker: string | null;
           }
         | undefined;
       try {
         row = db
           .prepare(
             `SELECT eventId, sessionId, turnId, source, observedAt, createdAt, body, scope,
-                    privacySensitivity, privacyOrigin, docId, chunkSeq
+                    privacySensitivity, privacyOrigin, docId, chunkSeq, speaker
              FROM raw_events WHERE eventId = ?`,
           )
           .get(eventId) as typeof row;
@@ -2956,6 +2999,7 @@ export function getEvent(
           createdAt: row.createdAt,
           privacy: privacyFromColumns(row.privacySensitivity, row.privacyOrigin),
           chunk: chunkFromColumns(row.docId, row.chunkSeq),
+          speaker: row.speaker,
           totalCp,
           offset: nOffset,
           body,
@@ -3060,9 +3104,10 @@ export function rangeEvents(
         observedAt: string;
         docId: string | null;
         chunkSeq: number | null;
+        speaker: string | null;
       }>;
       try {
-        let sql = `SELECT eventId, sessionId, turnId, body, observedAt, docId, chunkSeq
+        let sql = `SELECT eventId, sessionId, turnId, body, observedAt, docId, chunkSeq, speaker
                    FROM raw_events WHERE scope = ?`;
         const args: Array<string | number> = [nScope];
         if (nSessionId !== null) {
@@ -3101,6 +3146,7 @@ export function rangeEvents(
           turnId: r.turnId,
           observedAt: r.observedAt,
           chunk: chunkFromColumns(r.docId, r.chunkSeq),
+          speaker: r.speaker,
           totalCp: cps.length,
           snippet: cps.length <= max ? r.body : cps.slice(0, max).join(""),
           truncated: cps.length > max,
@@ -3191,12 +3237,13 @@ export function recordSources(
               scope: string;
               docId: string | null;
               chunkSeq: number | null;
+              speaker: string | null;
             }
           | undefined;
         try {
           raw = db
             .prepare(
-              `SELECT sessionId, observedAt, body, scope, docId, chunkSeq
+              `SELECT sessionId, observedAt, body, scope, docId, chunkSeq, speaker
                FROM raw_events WHERE eventId = ?`,
             )
             .get(r.eventId) as typeof raw;
@@ -3217,6 +3264,7 @@ export function recordSources(
           sessionId: raw.sessionId,
           observedAt: raw.observedAt,
           chunk: chunkFromColumns(raw.docId, raw.chunkSeq),
+          speaker: raw.speaker,
           totalCp: cps.length,
           span: hasSpan ? { start: r.spanStart as number, end: r.spanEnd as number } : null,
           segment: cps.slice(start, end),
@@ -3240,6 +3288,7 @@ export function recordSources(
             sessionId: s.sessionId,
             observedAt: s.observedAt,
             chunk: s.chunk,
+            speaker: s.speaker,
             totalCp: s.totalCp,
             span: s.span,
             excerpt: s.segment.slice(0, cap).join(""),

@@ -39,7 +39,7 @@ npm run build
 '{"v":1,"op":"record.recall","params":{"query":"persimmon harvest","scope":"personal/default","limit":10}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 
-- `event.append` の params は `eventId / sessionId / turnId / body / provenance{source, observedAt} / scope` (+任意 `runId`)。`idempotencyKey` (ASCII `A-Za-z0-9_-`、1..128文字) は必須。
+- `event.append` の params は `eventId / sessionId / turnId / body / provenance{source, observedAt} / scope` (+任意 `runId` / `privacy` / `chunk` / `speaker`)。`speaker` は `user | assistant | system` の任意値で、話者を分離して保存する (旧行は NULL のまま)。`idempotencyKey` (ASCII `A-Za-z0-9_-`、1..128文字) は必須。
 - `record.remember` の params は `body / kind / provenance / scope / tags[] / links[] / sourceRefs[]` (+任意 `runId` / `evidence`)。`kind` は `user_fact | model_inference | summary | correction`。`sourceRefs[]` は同一 scope の既存 `eventId` のみ。欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。空配列は `model_inference / summary` かつ source に派生表示がある場合のみ許容。
 - `evidence` (任意、v13) はユーザーの逐語引用で、`kind:"user_fact"` のときだけ受け付ける。NFC 正規化 + trim 後 1..400 code point、制御文字なし。他の kind は `BAD_REQUEST`、400 超過は `LIMIT_EXCEEDED`、空/非文字列/制御文字は `BAD_REQUEST` (永続化なし)。idempotency hash に含まれるため、同一キーで引用だけ変えると `CONFLICT`。`record.get / record.list / record.search / record.recall` の item は `evidence: string | null` を返す。検索索引・順位付けには使わない。`record.correct` は本文を変える `correction` 後継を作るため evidence を継承せず、`evidence` パラメータも受け付けない (`BAD_REQUEST`)。
 - `record.recall` の params は `query / scope` (+任意 `tags[] / link / since / until / limit / runId`)。応答は `recallId + items[{id, snippet, truncated, tags, createdAt, revision, kind, evidence}]`。本文先頭の有界切り出しのみで、raw 本文は返さない。
@@ -77,9 +77,9 @@ npm run build
 '{"v":1,"op":"record.sources","params":{"id":"<recordId>","scope":"personal/default"}}' | node dist/src/cli.js --config ./memory.config.json
 ```
 
-- `event.get` は raw 1 件を code point 頁で返す。params は `eventId / scope` (+任意 `offset / maxCp`)。応答は `eventId / sessionId / turnId / source / observedAt / createdAt / privacy / chunk / totalCp / offset / body / nextOffset`。`maxCp` 既定は `rawPageMaxCp`、`nextOffset` が `null` になるまで連結すると原文と一致する。`offset > totalCp` は `BAD_REQUEST`、`maxCp > rawPageMaxCp` は `LIMIT_EXCEEDED`、欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。
-- `event.range` は raw を `observedAt ASC, eventId ASC` で頁送りする。params は `scope` (+任意 `sessionId / docId / since / until / cursor / limit`)。`since` inclusive、`until` exclusive。各 item は `eventId / sessionId / turnId / observedAt / chunk / totalCp / snippet / truncated`、`nextCursor` は不透明。`limit > rangeLimitMax` は `LIMIT_EXCEEDED`、形式不正 (`cursor` 含む) は `BAD_REQUEST`。
-- `record.sources` は record の `sourceRefs` を raw に解決する。応答は `id / sources[{eventId, sessionId, observedAt, chunk, totalCp, span, excerpt, truncated} | {eventId, missing:true}]`。`span` があれば `excerpt` はその code point 範囲、legacy の文字列 ref なら本文先頭。欠落 raw は `missing:true` で捏造せず、record 欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。raw 読取りは heat・exposures を変えない。
+- `event.get` は raw 1 件を code point 頁で返す。params は `eventId / scope` (+任意 `offset / maxCp`)。応答は `eventId / sessionId / turnId / source / observedAt / createdAt / privacy / chunk / speaker / totalCp / offset / body / nextOffset`。`maxCp` 既定は `rawPageMaxCp`、`nextOffset` が `null` になるまで連結すると原文と一致する。`offset > totalCp` は `BAD_REQUEST`、`maxCp > rawPageMaxCp` は `LIMIT_EXCEEDED`、欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。
+- `event.range` は raw を `observedAt ASC, eventId ASC` で頁送りする。params は `scope` (+任意 `sessionId / docId / since / until / cursor / limit`)。`since` inclusive、`until` exclusive。各 item は `eventId / sessionId / turnId / observedAt / chunk / speaker / totalCp / snippet / truncated`、`nextCursor` は不透明。`limit > rangeLimitMax` は `LIMIT_EXCEEDED`、形式不正 (`cursor` 含む) は `BAD_REQUEST`。
+- `record.sources` は record の `sourceRefs` を raw に解決する。応答は `id / sources[{eventId, sessionId, observedAt, chunk, speaker, totalCp, span, excerpt, truncated} | {eventId, missing:true}]`。`span` があれば `excerpt` はその code point 範囲、legacy の文字列 ref なら本文先頭。欠落 raw は `missing:true` で捏造せず、record 欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。raw 読取りは heat・exposures を変えない。
 - 上限超過は `LIMIT_EXCEEDED`、それ以外の形式不正は `BAD_REQUEST` (既存の `NOT_FOUND / FORBIDDEN_SCOPE / STORE_UNAVAILABLE` はそのまま)。
 
 ## 長文取込 (チャンク・npm run ingest)
@@ -206,7 +206,7 @@ npm run ingest -- --config ./memory.config.json --scope personal/default --file 
 
 旧承認スキーマの DB (candidates 表等) は起動失敗 (stderr 固定文 + 非ゼロ終了) し、変更・削除・移行はしない。旧ファイルを退避し、`dbPath` に新しいファイルを指定すること。
 
-現行スキーマは `user_version=13`。v2〜v12 の既存 DB は単一の `BEGIN IMMEDIATE` 移行でその場で更新する（拒否しない）。v12 までは `records.evidence` の nullable 列を `ALTER TABLE ADD COLUMN` で追加し、既存行は NULL のまま保持する。v11 までは `record_importance.source` の CHECK をモデル id 付き `llm:v2:<model>` を受け付ける形へ行保持のまま再構築する。v7 で `record_importance` が、v8 で `cluster_summaries` が作成され、v7 (`record_importance` 保持) からは既存の重要度行を保ったまま `cluster_summaries` だけを追加する。v8 (`cluster_summaries` 保持) からは既存行を保ったまま回転 cursor の `consolidate_scope_state` だけを追加する。既に v13 のファイルは DDL を伴わない fast path で開く。
+現行スキーマは `user_version=14`。v2〜v13 の既存 DB は単一の `BEGIN IMMEDIATE` 移行でその場で更新する（拒否しない）。v13 までは `raw_events.speaker` の nullable 列を `ALTER TABLE ADD COLUMN` で追加し、既存行は NULL（legacy 連結イベント）のまま保持する。v12 までは `records.evidence` の nullable 列を追加し、既存行は NULL のまま保持する。v11 までは `record_importance.source` の CHECK をモデル id 付き `llm:v2:<model>` を受け付ける形へ行保持のまま再構築する。v7 で `record_importance` が、v8 で `cluster_summaries` が作成され、v7 (`record_importance` 保持) からは既存の重要度行を保ったまま `cluster_summaries` だけを追加する。v8 (`cluster_summaries` 保持) からは既存行を保ったまま回転 cursor の `consolidate_scope_state` だけを追加する。既に v14 のファイルは DDL を伴わない fast path で開く。
 
 ## テスト
 
