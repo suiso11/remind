@@ -1014,3 +1014,48 @@ describe("raw event speaker", () => {
     }
   });
 });
+
+describe("v13 -> v14 upgrade", () => {
+  it("accepts an existing v13 store and adds the nullable speaker column", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "raw-read-v13-"));
+    try {
+      const { config, configPath } = baseConfig(dir);
+      const first = initDb(config, configPath);
+      try {
+        const appended = append(first.db, config, {
+          eventId: "e-v13",
+          body: "legacy v13 row",
+        });
+        assert.equal(appended.ok, true, JSON.stringify(appended));
+        // Simulate the v13 store: no speaker column, old version stamp.
+        first.db.exec(`PRAGMA user_version = 13`);
+        first.db.exec(`ALTER TABLE raw_events DROP COLUMN speaker`);
+      } finally {
+        first.db.close();
+      }
+      const reopened = initDb(config, configPath);
+      try {
+        const version = (
+          reopened.db.prepare(`PRAGMA user_version`).get() as {
+            user_version: number;
+          }
+        ).user_version;
+        assert.equal(version, SCHEMA_VERSION);
+        const cols = (
+          reopened.db.prepare(`PRAGMA table_info(raw_events)`).all() as Array<{
+            name: string;
+          }>
+        ).map((c) => c.name);
+        assert.ok(cols.includes("speaker"));
+        const event = expectOk<{ speaker: string | null }>(
+          getEvent(reopened.db, config, { eventId: "e-v13", scope: SCOPE }),
+        );
+        assert.equal(event.speaker, null);
+      } finally {
+        reopened.db.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
