@@ -921,6 +921,10 @@ describe("legacy raw_events / record_source_refs migration", () => {
         ).map((c) => c.name);
         assert.ok(cols.includes("privacySensitivity"), `${table}.privacySensitivity`);
       }
+      const rawCols = (
+        a!.prepare(`PRAGMA table_info(raw_events)`).all() as Array<{ name: string }>
+      ).map((c) => c.name);
+      assert.ok(rawCols.includes("speaker"), "raw_events.speaker");
       const refCols = (
         a!.prepare(`PRAGMA table_info(record_source_refs)`).all() as Array<{ name: string }>
       ).map((c) => c.name);
@@ -934,6 +938,79 @@ describe("legacy raw_events / record_source_refs migration", () => {
         /* ignore */
       }
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("raw event speaker", () => {
+  it("stores user/assistant speakers, keeps legacy rows null, and rejects invalid values", () => {
+    const t = setup();
+    try {
+      appendOk(t.db, t.config, "e-user", OBS, {
+        body: "user words",
+        speaker: "user",
+      });
+      const userGet = expectOk<{ speaker: string | null }>(
+        getEvent(t.db, t.config, { eventId: "e-user", scope: SCOPE }),
+      );
+      assert.equal(userGet.speaker, "user");
+
+      appendOk(t.db, t.config, "e-assistant", "2026-09-01T00:00:01.000Z", {
+        body: "assistant words",
+        speaker: "assistant",
+      });
+      const assistantGet = expectOk<{ speaker: string | null }>(
+        getEvent(t.db, t.config, { eventId: "e-assistant", scope: SCOPE }),
+      );
+      assert.equal(assistantGet.speaker, "assistant");
+
+      // Legacy/plain append stays null (never guessed).
+      appendOk(t.db, t.config, "e-legacy", "2026-09-01T00:00:02.000Z", {
+        body: "combined legacy",
+      });
+      const legacyGet = expectOk<{ speaker: string | null }>(
+        getEvent(t.db, t.config, { eventId: "e-legacy", scope: SCOPE }),
+      );
+      assert.equal(legacyGet.speaker, null);
+
+      const range = expectOk<{
+        items: Array<{ eventId: string; speaker: string | null }>;
+      }>(
+        rangeEvents(t.db, t.config, {
+          scope: SCOPE,
+          limit: 4,
+        }),
+      );
+      assert.deepEqual(
+        range.items.map((i) => [i.eventId, i.speaker]),
+        [
+          ["e-user", "user"],
+          ["e-assistant", "assistant"],
+          ["e-legacy", null],
+        ],
+      );
+
+      const rec = remember(t.db, t.config, "raw-speaker-rec", "user fact", ["e-user"]);
+      assert.equal(rec.ok, true, JSON.stringify(rec));
+      const id = (rec.data as { record: { id: string } }).record.id;
+      const sources = expectOk<{
+        sources: Array<{ eventId: string; speaker: string | null }>;
+      }>(
+        recordSources(t.db, t.config, { id, scope: SCOPE }),
+      );
+      assert.equal(sources.sources[0]?.eventId, "e-user");
+      assert.equal(sources.sources[0]?.speaker, "user");
+
+      expectCode(
+        append(t.db, t.config, { eventId: "e-bad", speaker: "narrator" }),
+        "BAD_REQUEST",
+      );
+      expectCode(
+        getEvent(t.db, t.config, { eventId: "e-bad", scope: SCOPE }),
+        "NOT_FOUND",
+      );
+    } finally {
+      t.cleanup();
     }
   });
 });

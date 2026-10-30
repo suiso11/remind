@@ -373,7 +373,7 @@ describe("evidence quote: migration and successors", () => {
       const { db } = initDb(config, configPath);
       try {
         assert.equal((db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, SCHEMA_VERSION);
-        assert.equal(SCHEMA_VERSION, 13);
+        assert.equal(SCHEMA_VERSION, 14);
         const cols = (db.prepare(`PRAGMA table_info(records)`).all() as Array<{ name: string }>).map((c) => c.name);
         assert.ok(cols.includes("evidence"), "evidence column added");
         const legacy = db.prepare(`SELECT evidence FROM records WHERE id='rec_v12'`).get() as { evidence: string | null };
@@ -398,7 +398,7 @@ describe("evidence quote: migration and successors", () => {
       // Close/reopen through initDb: the migrated file stays current.
       const reopened = initDb(config, configPath);
       try {
-        assert.equal((reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, 13);
+        assert.equal((reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, 14);
       } finally {
         reopened.db.close();
       }
