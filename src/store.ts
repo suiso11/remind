@@ -144,6 +144,7 @@ export const LEGACY_SCHEMA_VERSION_10 = 10;
 export const LEGACY_SCHEMA_VERSION_11 = 11;
 /** Pre-evidence-quote stamp; accepted and upgraded in place. */
 export const LEGACY_SCHEMA_VERSION_12 = 12;
+export const LEGACY_SCHEMA_VERSION_13 = 13;
 
 export const RECORD_KINDS = [
   "user_fact",
