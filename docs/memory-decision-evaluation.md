@@ -84,7 +84,7 @@
   - leak: provenance（query に ID/label が入らない）、probe（単一特徴の accuracy − majority < 0.2）、count-matched は **`n/a`**（決定的スイートでサンプリング制御がない）。
 - **fit への適用**: `scripts/decision-policy-fit.ts`。
   - MAP fit、leave-one-stream-out（3 ストリーム以上）、n>=30、prevalence 2 水準以上、各 fold が best fixed action を下回らないこと、`autoApply:false`。
-  - 現行 evaluator のラベルは 8 状態・2 ストリームなので **`skipped: n=8 < 30`**（さらに LOSO には 3 ストリーム必要）。診断用であり、このデータからは学習しない。
+  - 既定 evaluator のラベルは 6 スレッド × 2 ストリーム = 12 行なので **`skipped: n=12 < 30`**。手動の 6 ストリーム実行（36 行）では LOSO が **accepted**（下記 §7）。ただし合成ラベルでの受理であり、実データへの転移を証明しない。
 - **リンク・要約品質**: consolidate model leg に「同話題だが真実ではない decoy」を入れ、`linkQuality`（precision/recall/false/miss）と `summaryQuality`（事実忠実性・重要情報・出典被覆・根拠のない追加）を report する。純粋採点は `scripts/cultivation-quality.ts`、テストは `tests/cultivation-quality.test.ts`。
 - **解釈の限界**: `linkCoverage 1.0` は cluster 被覆であり、リンクの正しさではない。`linkQuality`/`summaryQuality` は採点器であり、**実モデル／実データで品質が改善したことの証明ではない**。G2–G4 の pass はテストした条件での構造確認であり、モデル出力の毒耐性を証明しない。fit の受理は合成 fixture で確認しただけで、**受理基準そのものの妥当性と未知ストリームでの改善は未検証**。
 - **不採用**: CQS を目標指標にすること（著者自身が外部 transfer を予測しないと報告）。skill/rule の cross-level transfer は remind の scope 外。
@@ -115,7 +115,7 @@
   - lifecycle: headroom 0.088 / 0.0625、reversal 0.25、oracle keep 3 / correct 1（複数ストリーム + CI）。
   - long-horizon: 6 セッションの test で行列・指標を確認（既定 12）。
   - latency: 391 CLI calls、p50 85.8ms、total 35.2s。
-- fit: 90 行の合成 fixture は LOSO で受理、ノイズは拒否、evaluator の 8 行は `skipped: n=8 < 30`。
+- fit: 90 行の合成 fixture は LOSO で受理、ノイズは拒否。既定 evaluator の 12 行は `skipped: n=12 < 30`。手動 6 ストリーム（36 行、prevalence low/mid）では `accepted: true`、LOSO 平均 utility 0.474 vs best-fixed 0.450、loss 改善 0.511。
 - これらは評価条件内の**診断値**であり、リンク/要約の品質や production 改善の証明ではない。
 
 ## 5. 既存ドキュメントとの整合（重要な修正）
@@ -147,12 +147,24 @@
 
 ## 7. 残件・限界
 
-- **次の優先順**: (1) 実モデル／実データでのリンク・要約品質の検証、(2) スレッド間干渉を含む lifecycle と H の拡大、(3) 実ラベルでの LOSO 受理検証。U2 の保持・エクスポート・削除は方針決定が先。
+- **次の優先順**: (1) 実モデル／実データでのリンク・要約品質の検証、(2) 合成ラベルで受理された fit の実データ転移検証。lifecycle の同時決定と H=8 は実装済み（`--joint`）。U2 の保持・エクスポート・削除は方針決定が先。
 - **実モデルの品質 finding**: 9B の consolidate は同話題 decoy を summary の links と本文に含めた（link precision 0.75、unsupportedRate 1.0）。cluster membership・prompt・model の改善が必要で、採点器はこれを合格にしない。
 - 2609.06986 の長期保持 evaluator は `scripts/evaluate-long-horizon.ts` に実装したが、既定 12 セッションの有界評価で、語彙 probe のみ。実運用の長期保持を証明しない。
 - lifecycle は per-thread 分岐で他スレッドを KEEP に固定。複数ストリーム＋CI は実装したが、同時決定の干渉は未測定。CONSOLIDATE は opt-in の別構造検査で、lifecycle の効用には含めない。
 - G1 は governance では常に skipped。モデル leg は G1 の代替ではない。
-- 評価ラベルは現行 generator では `hasConflict=false` 固定、heat/exposures=0、8 状態・2 ストリーム。fit は n>=30 と 3 ストリームを要求するため、このデータからは学習しない。
+- 評価ラベルは 6 スレッド（exact/recurrent/conflict/transient/stale/meeting）× 既定 2 ストリーム = 12 行。heat/exposures は recall+feedback で決定的に作り、`hasConflict`・`kind`・`prevalence`（full horizon の oracle が keep でない割合）も可変。`ageHours`/`links` は 0 固定。fit は n>=30 と 3 ストリームを要求するため、既定 12 行は `skipped: n=12 < 30`。
+- 手動 rich-label 実行: `node dist/scripts/evaluate-memory-decisions.js --streams 6 --labels /tmp/labels.jsonl`（36 行）→ `node dist/scripts/decision-policy-fit.js --input /tmp/labels.jsonl`。実測は `accepted: true`、LOSO 平均 utility 0.474 vs best-fixed 0.450、loss 改善 0.511、prevalence buckets low/mid。合成ラベルでの受理であり、実データへの転移は未検証。
+
+| fit 定数（`decision-policy-fit.ts`） | 値 | 位置づけ |
+|---|---|---|
+| MIN_N | 30 | engineering default・未検証 |
+| MIN_HOLDOUT | 6 | engineering default・未検証 |
+| MIN_IMPROVEMENT | 1e-4 | engineering default・未検証 |
+| MIN_UTILITY_MARGIN | 1e-6 | engineering default・未検証 |
+| L2 | 0.02 | engineering default・未検証 |
+| LR | 0.5 | engineering default・未検証 |
+| ITERATIONS | 400 | engineering default・未検証 |
+
 - 実装は **本番未デプロイ**。production の保持重み learner は examples 701 / positives 29 で `minPositives:30` に届かず、`retention_weights` は空。最初の fit はまだ走っていない。
 - companion の learning proposals は 18 件すべて pending、applications 0。提案は作られるが適用されていない。
 
