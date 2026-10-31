@@ -35,6 +35,16 @@ import {
 } from "./baseline-score.js";
 import { runGovernanceSuite, type GovernanceReport, type GovernanceStore } from "./decision-governance.js";
 import { scoreLinks, scoreSummary } from "./cultivation-quality.js";
+import {
+  enumeratePlans,
+  jointReversal,
+  LIFECYCLE_ACTIONS,
+  planId,
+  scoreJoint,
+  type LifecycleAction,
+  type LifecyclePlan,
+  type PlanUtilities,
+} from "./lifecycle-joint.js";
 
 export const DECISIONS_VERSION = "memory-decisions-v1";
 export const DECISIONS_SCOPE = "personal/default";
@@ -734,7 +744,7 @@ function supportSuite(): { invariants: string[]; report: Record<string, unknown>
 /* Lifecycle: counterfactual KEEP / RETIRE / CORRECT                  */
 /* ------------------------------------------------------------------ */
 
-type Action = "keep" | "retire" | "correct";
+type Action = LifecycleAction;
 
 interface Thread {
   key: string;
@@ -748,17 +758,15 @@ interface Thread {
   eventId: string;
 }
 
-interface BranchResult {
-  utility: Record<number, number>;
-}
+type HorizonUtilities = { utilities: Record<Action, number>; oracle: Action };
+type ThreadUtilities = Record<string, { short: HorizonUtilities; full: HorizonUtilities; long: HorizonUtilities }>;
 
-type ThreadUtilities = Record<
-  string,
-  {
-    short: { utilities: Record<Action, number>; oracle: Action };
-    full: { utilities: Record<Action, number>; oracle: Action };
-  }
->;
+/** Per-stream joint (--joint) metrics. */
+interface JointStream {
+  byHorizon: Record<number, { jointHeadroom: number; independentRegret: number; interactionRate: number }>;
+  jointReversal: number;
+  jointDiversity: Record<Action, number>;
+}
 
 interface StreamResult {
   invariants: string[];
@@ -767,6 +775,16 @@ interface StreamResult {
   reversal: number;
   diversity: Record<string, number>;
   labels: Array<Record<string, unknown>>;
+  joint?: JointStream;
+}
+
+/** Future-stream lengths at which utility is measured; reversal compares first vs last. */
+const HORIZONS = [2, 4, 8];
+
+/** Single-deviation plans keep the historic `<thread>-<action>` branch directory names. */
+function planName(plan: LifecyclePlan, threads: Thread[]): string {
+  const parts = threads.filter((t) => (plan[t.key] ?? "keep") !== "keep").map((t) => `${t.key}-${plan[t.key]}`);
+  return parts.length > 0 ? parts.join("_") : "keep";
 }
 
 function checkpoint(dbPath: string): void {
@@ -785,26 +803,28 @@ function copyDb(from: string, toDir: string): string {
   return to;
 }
 
+/** Utility at each horizon of one simultaneous lifecycle plan applied to every thread. */
 function branchUtility(
   baseConfigDir: string,
   baseDbPath: string,
   threads: Thread[],
-  target: Thread,
-  action: Action,
+  plan: LifecyclePlan,
   future: string[],
-): BranchResult {
-  const branchDir = fs.mkdtempSync(path.join(baseConfigDir, `branch-${target.key}-${action}-`));
+): Record<number, number> {
+  const branchDir = fs.mkdtempSync(path.join(baseConfigDir, `branch-${planName(plan, threads)}-`));
   copyDb(baseDbPath, branchDir);
   const ws = new Workspace(branchDir, false);
   const expected: Record<string, string | null> = {};
-  for (const t of threads) expected[t.key] = t.expected.keep;
-  expected[target.key] = target.expected[action];
 
   try {
-    if (action === "retire") retire(ws, target.id);
-    if (action === "correct") {
-      const newId = correct(ws, target.id, target.replacement, "user:alice", [target.eventId]);
-      expected[target.key] = target.key === "conflict" ? newId : null;
+    for (const t of threads) {
+      const action = plan[t.key] ?? "keep";
+      expected[t.key] = t.expected[action];
+      if (action === "retire") retire(ws, t.id);
+      if (action === "correct") {
+        const newId = correct(ws, t.id, t.replacement, "user:alice", [t.eventId]);
+        expected[t.key] = t.key === "conflict" ? newId : null;
+      }
     }
 
     const utility: Record<number, number> = {};
@@ -812,13 +832,13 @@ function branchUtility(
     for (let i = 0; i < future.length; i++) {
       seedRecord(ws, `future-${i}`, future[i]!, "synthetic:evaluator");
       written += 1;
-      if (written !== 2 && written !== 4) continue;
+      if (!HORIZONS.includes(written)) continue;
       const count = activeRecords(ws.dbPath);
       if (count < 0) throw new HarnessError("active record count unavailable");
       let pass = 0;
       let total = 0;
       for (const t of threads) {
-        const queries = written === 2 ? t.probesShort : t.probesFull;
+        const queries = written === HORIZONS[0] ? t.probesShort : t.probesFull;
         for (const query of queries) {
           const r = recall(ws, query);
           const want = expected[t.key] ?? null;
@@ -828,7 +848,7 @@ function branchUtility(
       }
       utility[written] = (total > 0 ? pass / total : 0) - STORAGE_PENALTY * count;
     }
-    return { utility };
+    return utility;
   } finally {
     ws.cleanup();
     try {
@@ -839,7 +859,7 @@ function branchUtility(
   }
 }
 
-function runLifecycleStream(streamIndex: number): StreamResult {
+function runLifecycleStream(streamIndex: number, joint: boolean): StreamResult {
   const ws = new Workspace("remind-lifecycle-");
   const invariants: string[] = [];
   try {
@@ -874,62 +894,80 @@ function runLifecycleStream(streamIndex: number): StreamResult {
       "Synthetic stream event 1 about the weekly report.",
       "Synthetic stream event 2 about the lunch order.",
       "Synthetic stream event 3 about the fire drill.",
+      // Rows 4-7 lexically compete with the probes so the long horizon can reverse earlier choices.
+      "Archive note: the vault passphrase rotation guide lists ORCHID-42 style codes.",
+      "Offsite agenda: the daily standup time 9:30 slot was discussed again.",
+      "Quarterly review checklist: project deadline October planning items.",
+      "Mailroom template: courier parcel delivery log with blank entries.",
     ];
-    const actions: Action[] = ["keep", "retire", "correct"];
-    const branches: Record<string, BranchResult> = {};
-    for (const t of threads) {
-      for (const a of actions) {
-        branches[`${t.key}:${a}`] = branchUtility(ws.dir, ws.dbPath, threads, t, a, future);
-      }
+    const actions = LIFECYCLE_ACTIONS;
+    const keys = threads.map((t) => t.key);
+    const branches: PlanUtilities = {};
+    for (const plan of enumeratePlans(keys, joint)) {
+      branches[planId(plan, keys)] = branchUtility(ws.dir, ws.dbPath, threads, plan, future);
     }
+    const marginal = (t: Thread, a: Action): Record<number, number> => branches[planId({ [t.key]: a }, keys)]!;
 
-    const perThread: Record<string, { short: { utilities: Record<Action, number>; oracle: Action }; full: { utilities: Record<Action, number>; oracle: Action } }> = {};
-    const fixedByHorizon: Record<number, number> = { 2: -Infinity, 4: -Infinity };
-    const fullChoices: Action[] = [];
-    let reversals = 0;
+    const perThread: ThreadUtilities = {};
+    const fixedByHorizon: Record<number, number> = { 2: -Infinity, 4: -Infinity, 8: -Infinity };
+    const oracleAt: Record<number, Action[]> = {};
     const choose = (utils: Record<Action, number>): Action =>
       actions.reduce((a, b) => (utils[b] > utils[a] ? b : a), actions[0]!);
     for (const t of threads) {
-      const utilitiesAt = (h: number): Record<Action, number> => ({
-        keep: branches[`${t.key}:keep`]!.utility[h]!,
-        retire: branches[`${t.key}:retire`]!.utility[h]!,
-        correct: branches[`${t.key}:correct`]!.utility[h]!,
-      });
-      const shortUtilities = utilitiesAt(2);
-      const fullUtilities = utilitiesAt(4);
-      const shortOracle = choose(shortUtilities);
-      const fullOracle = choose(fullUtilities);
-      if (shortOracle !== fullOracle) reversals += 1;
-      fullChoices.push(fullOracle);
-      perThread[t.key] = {
-        short: { utilities: shortUtilities, oracle: shortOracle },
-        full: { utilities: fullUtilities, oracle: fullOracle },
-      };
+      const entry = {} as ThreadUtilities[string];
+      for (const [name, h] of [["short", 2], ["full", 4], ["long", 8]] as const) {
+        const utilities = {
+          keep: marginal(t, "keep")[h]!,
+          retire: marginal(t, "retire")[h]!,
+          correct: marginal(t, "correct")[h]!,
+        };
+        const oracle = choose(utilities);
+        (oracleAt[h] ??= []).push(oracle);
+        entry[name] = { utilities, oracle };
+      }
+      perThread[t.key] = entry;
     }
-    for (const h of [2, 4]) {
+    for (const h of HORIZONS) {
       let meanOracle = 0;
       for (const t of threads) {
         const entry = perThread[t.key]!;
-        meanOracle += h === 2 ? entry.short.utilities[entry.short.oracle] : entry.full.utilities[entry.full.oracle];
+        const e = h === 2 ? entry.short : h === 4 ? entry.full : entry.long;
+        meanOracle += e.utilities[e.oracle];
       }
       meanOracle /= threads.length;
       let bestFixed = -Infinity;
       for (const a of actions) {
         let mean = 0;
-        for (const t of threads) mean += branches[`${t.key}:${a}`]!.utility[h]!;
+        for (const t of threads) mean += marginal(t, a)[h]!;
         mean /= threads.length;
         if (mean > bestFixed) bestFixed = mean;
       }
       fixedByHorizon[h] = meanOracle - bestFixed;
     }
+    const reversals = threads.filter((_, i) => oracleAt[HORIZONS[0]!]![i] !== oracleAt[HORIZONS[HORIZONS.length - 1]!]![i]).length;
     const diversity = actions.reduce<Record<string, number>>((acc, a) => {
-      acc[a] = fullChoices.filter((c) => c === a).length;
+      acc[a] = oracleAt[4]!.filter((c) => c === a).length;
       return acc;
     }, {});
     if (Object.values(diversity).filter((n) => n > 0).length < 2) {
       invariants.push("lifecycle oracle has fewer than two distinct actions");
     }
     if ((fixedByHorizon[4] ?? 0) < -1e-9) invariants.push("lifecycle headroom is negative");
+
+    let jointReport: JointStream | undefined;
+    if (joint) {
+      const byHorizon: JointStream["byHorizon"] = {};
+      for (const h of HORIZONS) {
+        const s = scoreJoint(branches, keys, h);
+        byHorizon[h] = { jointHeadroom: s.jointHeadroom, independentRegret: s.independentRegret, interactionRate: s.interactionRate };
+        if (s.jointHeadroom < -1e-9 || s.independentRegret < -1e-9) invariants.push(`joint lifecycle metric negative at horizon ${h}`);
+      }
+      jointReport = {
+        byHorizon,
+        jointReversal: jointReversal(branches, keys, HORIZONS),
+        jointDiversity: scoreJoint(branches, keys, HORIZONS[HORIZONS.length - 1]!).jointDiversity,
+      };
+    }
 
     const labels = threads.map((t) => {
       const heat = heatOf(ws.dbPath, t.id);
@@ -960,6 +998,7 @@ function runLifecycleStream(streamIndex: number): StreamResult {
       reversal: reversals / threads.length,
       diversity,
       labels,
+      joint: jointReport,
     };
   } finally {
     ws.cleanup();
@@ -995,12 +1034,29 @@ function bootstrapCI(values: number[], seed: number): [number, number] {
   return [means[Math.floor(means.length * 0.025)]!, means[Math.floor(means.length * 0.975)]!];
 }
 
-function lifecycleSuite(streams: number): { invariants: string[]; report: Record<string, unknown> } {
+/** `{enabled:false}` unless --joint; otherwise stream-mean metrics per horizon (bounded, no per-plan output). */
+function jointSummary(results: StreamResult[]): Record<string, unknown> {
+  const js = results.flatMap((r) => (r.joint ? [r.joint] : []));
+  if (js.length === 0) return { enabled: false };
+  const horizons: Record<number, Record<string, number>> = {};
+  for (const h of HORIZONS) {
+    horizons[h] = {
+      jointHeadroom: mean(js.map((j) => j.byHorizon[h]!.jointHeadroom)),
+      independentRegret: mean(js.map((j) => j.byHorizon[h]!.independentRegret)),
+      interactionRate: mean(js.map((j) => j.byHorizon[h]!.interactionRate)),
+    };
+  }
+  const jointDiversity: Record<string, number> = { keep: 0, retire: 0, correct: 0 };
+  for (const j of js) for (const a of LIFECYCLE_ACTIONS) jointDiversity[a] = jointDiversity[a]! + j.jointDiversity[a];
+  return { enabled: true, plans: 3 ** 4, horizons, jointReversal: mean(js.map((j) => j.jointReversal)), jointDiversity };
+}
+
+function lifecycleSuite(streams: number, joint: boolean): { invariants: string[]; report: Record<string, unknown> } {
   const invariants: string[] = [];
   const results: StreamResult[] = [];
   for (let i = 0; i < streams; i++) {
     try {
-      const r = runLifecycleStream(i);
+      const r = runLifecycleStream(i, joint);
       results.push(r);
       invariants.push(...r.invariants);
     } catch (e) {
@@ -1012,7 +1068,7 @@ function lifecycleSuite(streams: number): { invariants: string[]; report: Record
   }
   const headroom: Record<number, number> = {};
   const headroomCI: Record<number, [number, number]> = {};
-  for (const h of [2, 4]) {
+  for (const h of HORIZONS) {
     const values = results.map((r) => r.headroom[h] ?? 0);
     headroom[h] = mean(values);
     headroomCI[h] = bootstrapCI(values, 0x9e3779b9 ^ h);
@@ -1040,6 +1096,7 @@ function lifecycleSuite(streams: number): { invariants: string[]; report: Record
       reversalCI: bootstrapCI(reversalValues, 0x85ebca6b),
       oracleDiversity: diversity,
       labels: results.flatMap((r) => r.labels),
+      joint: jointSummary(results),
     },
   };
 }
@@ -1297,6 +1354,7 @@ function main(): void {
   let labelsPath: string | null = null;
   let llmConfigPath: string | null = null;
   let lifecycleStreams = 2;
+  let joint = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--out" && i + 1 < args.length) outPath = args[++i]!;
     else if (args[i] === "--labels" && i + 1 < args.length) labelsPath = args[++i]!;
@@ -1308,8 +1366,9 @@ function main(): void {
         process.exit(2);
       }
       lifecycleStreams = n;
-    } else if (args[i] === "--help" || args[i] === "-h") {
-      process.stderr.write("usage: evaluate-memory-decisions [--out <json>] [--labels <jsonl>] [--llm-config <path>] [--streams <1..8>]\n");
+    } else if (args[i] === "--joint") joint = true;
+    else if (args[i] === "--help" || args[i] === "-h") {
+      process.stderr.write("usage: evaluate-memory-decisions [--out <json>] [--labels <jsonl>] [--llm-config <path>] [--streams <1..8>] [--joint]\n");
       process.stdout.write("\n");
       process.exit(0);
     } else {
@@ -1344,7 +1403,7 @@ function main(): void {
 
   let lifecycle: Record<string, unknown> = {};
   try {
-    const r = lifecycleSuite(lifecycleStreams);
+    const r = lifecycleSuite(lifecycleStreams, joint);
     lifecycle = r.report;
     invariants.push(...r.invariants);
   } catch (e) {
