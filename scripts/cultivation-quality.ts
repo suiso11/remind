@@ -43,31 +43,35 @@ export interface SummaryScore {
   factHits: string[];
   factMisses: string[];
   unsupported: string[];
+  irrelevant: string[];
   sourceHits: string[];
   sourceMisses: string[];
   factFidelity: number;
   unsupportedRate: number;
+  irrelevantRate: number;
   sourceCoverage: number;
 }
 
 const norm = (s: string): string => s.normalize("NFKC").toLowerCase();
 
-// sourceBodies is accepted for caller symmetry; matching is against expectation lists only.
+// mustExclude terms present in a cited source are irrelevant, not unsupported.
 export function scoreSummary(
   body: string,
-  _sourceBodies: string[],
+  sourceBodies: string[],
   _sourceIds: string[],
   summarySourceIds: string[],
   exp: SummaryExpectation,
 ): SummaryScore {
   const text = norm(body);
+  const sourceText = norm(sourceBodies.join("\n"));
   const include = uniq(exp.mustInclude);
   const exclude = uniq(exp.mustExclude);
   const required = uniq(exp.requiredSourceIds);
   const has = (needle: string): boolean => text.includes(norm(needle));
   const factHits = include.filter(has);
   const factMisses = include.filter((f) => !has(f));
-  const unsupported = exclude.filter(has);
+  const unsupported = exclude.filter((t) => has(t) && !sourceText.includes(norm(t)));
+  const irrelevant = exclude.filter((t) => has(t) && sourceText.includes(norm(t)));
   const have = new Set(summarySourceIds);
   const sourceHits = required.filter((id) => have.has(id));
   const sourceMisses = required.filter((id) => !have.has(id));
@@ -75,10 +79,12 @@ export function scoreSummary(
     factHits,
     factMisses,
     unsupported,
+    irrelevant,
     sourceHits,
     sourceMisses,
     factFidelity: include.length === 0 ? 1 : factHits.length / include.length,
     unsupportedRate: unsupported.length / Math.max(1, exclude.length),
+    irrelevantRate: irrelevant.length / Math.max(1, exclude.length),
     sourceCoverage: required.length === 0 ? 1 : sourceHits.length / required.length,
   };
 }

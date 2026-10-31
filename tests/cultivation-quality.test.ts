@@ -54,8 +54,10 @@ describe("scoreSummary", () => {
     assert.deepEqual(s.factHits, ["Blue Heron", "Tuesday"]);
     assert.deepEqual(s.factMisses, []);
     assert.deepEqual(s.unsupported, []);
+    assert.deepEqual(s.irrelevant, []);
     assert.equal(s.factFidelity, 1);
     assert.equal(s.unsupportedRate, 0);
+    assert.equal(s.irrelevantRate, 0);
     assert.equal(s.sourceCoverage, 1);
   });
 
@@ -65,10 +67,26 @@ describe("scoreSummary", () => {
     assert.equal(s.factFidelity, 1 / 2);
   });
 
-  it("forbidden decoy", () => {
+  it("unsupported decoy when the term is absent from cited sources", () => {
     const s = scoreSummary("Blue Heron and Green Owl on Tuesday", [], [], ["s1", "s2"], exp);
     assert.deepEqual(s.unsupported, ["Green Owl"]);
+    assert.deepEqual(s.irrelevant, []);
     assert.equal(s.unsupportedRate, 1);
+    assert.equal(s.irrelevantRate, 0);
+  });
+
+  it("grounded but irrelevant decoy when the term is in a cited source", () => {
+    const s = scoreSummary(
+      "Blue Heron and Green Owl on Tuesday",
+      ["Green Owl is a same-topic decoy."],
+      [],
+      ["s1", "s2"],
+      exp,
+    );
+    assert.deepEqual(s.unsupported, []);
+    assert.deepEqual(s.irrelevant, ["Green Owl"]);
+    assert.equal(s.unsupportedRate, 0);
+    assert.equal(s.irrelevantRate, 1);
   });
 
   it("source coverage", () => {
@@ -82,6 +100,7 @@ describe("scoreSummary", () => {
     const s = scoreSummary("", [], [], [], { mustInclude: [], mustExclude: [], requiredSourceIds: [] });
     assert.equal(s.factFidelity, 1);
     assert.equal(s.unsupportedRate, 0);
+    assert.equal(s.irrelevantRate, 0);
     assert.equal(s.sourceCoverage, 1);
     const t = scoreSummary("", [], [], [], exp);
     assert.equal(t.factFidelity, 0);
