@@ -147,7 +147,7 @@
 
 ## 7. 残件・限界
 
-- **次の優先順**: (1) 実モデル／実データでのリンク・要約品質の検証、(2) 合成ラベルで受理された fit の実データ転移検証。lifecycle の同時決定と H=8 は実装済み（`--joint`）。U2 の保持・エクスポート・削除は方針決定が先。
+- **次の優先順**: (1) 実モデル／実データでのリンク・要約品質の検証、(2) スレッド間干渉を含む lifecycle と H の拡大、(3) 実ラベルでの LOSO 受理検証。U2 の保持・エクスポート・削除は方針決定が先。
 - **実モデルの品質 finding**: 9B の consolidate は同話題 decoy を summary の links と本文に含めた（link precision 0.75、irrelevantRate 1.0、unsupportedRate 0）。grounding は成功しているが relevance は未解決で、cluster membership・prompt・model の改善が必要。採点器はこれを合格にしない。
 - 2609.06986 の長期保持 evaluator は `scripts/evaluate-long-horizon.ts` に実装したが、既定 12 セッションの有界評価で、語彙 probe のみ。実運用の長期保持を証明しない。
 - lifecycle は per-thread 分岐で他スレッドを KEEP に固定。複数ストリーム＋CI は実装したが、同時決定の干渉は未測定。CONSOLIDATE は opt-in の別構造検査で、lifecycle の効用には含めない。
