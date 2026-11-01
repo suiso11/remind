@@ -756,6 +756,7 @@ interface Thread {
   expected: Record<Action, string | null>;
   id: string;
   eventId: string;
+  kind: "user_fact" | "model_inference";
 }
 
 type HorizonUtilities = { utilities: Record<Action, number>; oracle: Action };
@@ -864,8 +865,15 @@ function runLifecycleStream(streamIndex: number, joint: boolean): StreamResult {
   const invariants: string[] = [];
   try {
     const threads: Thread[] = [];
-    const seed = (key: string, body: string, replacement: string, probesShort: string[], probesFull = probesShort): Thread => {
-      const r = seedRecord(ws, key, body, "user:alice");
+    const seed = (
+      key: string,
+      body: string,
+      replacement: string,
+      probesShort: string[],
+      probesFull = probesShort,
+      kind: Thread["kind"] = "user_fact",
+    ): Thread => {
+      const r = seedRecord(ws, key, body, "user:alice", kind);
       return {
         key,
         body,
@@ -875,6 +883,7 @@ function runLifecycleStream(streamIndex: number, joint: boolean): StreamResult {
         expected: { keep: r.id, retire: null, correct: null },
         id: r.id,
         eventId: r.eventId,
+        kind,
       };
     };
     threads.push(seed("exact", "The vault passphrase is ORCHID-42.", "The vault passphrase is TULIP-77.", ["vault passphrase ORCHID-42"]));
@@ -883,10 +892,25 @@ function runLifecycleStream(streamIndex: number, joint: boolean): StreamResult {
     conflict.expected.keep = null;
     threads.push(conflict);
     threads.push(seed("transient", "The courier will call at 3pm on Tuesday about the parcel.", "The courier will call at 5pm on Tuesday about the parcel.", [], ["courier parcel delivery log"]));
-    // Filler rows keep the recall window competitive without being probed.
-    for (let i = 0; i < 4; i++) {
+    // Alternating streams make the model-inference row keepable or stale, so
+    // the label prevalence crosses the low/mid bucket boundary.
+    const staleProbe = streamIndex % 2 === 1 ? ["obsolete toner reorder code"] : ["Zephyr relay token QX-9"];
+    threads.push(seed("stale", "The Zephyr relay token is QX-9.", "The Zephyr relay token is QX-10.", [], staleProbe, "model_inference"));
+    threads.push(seed("meeting", "The team retro is on Wednesday at 2pm.", "The team retro is on Thursday at 2pm.", ["team retro day"]));
+    // Filler rows keep the recall window competitive without being probed; the count varies by stream.
+    for (let i = 0; i < 4 + (streamIndex % 3); i++) {
       seedRecord(ws, `filler-${i}`, `Synthetic filler note ${i} about routine office supplies.`, "synthetic:evaluator");
     }
+    // Real, deterministic heat/exposures that differ by stream and thread.
+    threads.forEach((t, index) => {
+      const query = t.probesFull[0];
+      if (!query) return;
+      for (let round = 0; round < (streamIndex + index) % 3; round++) {
+        const r = recall(ws, query);
+        if (!contains(t.id, r.items)) return;
+        feedback(ws, r.recallId, t.id);
+      }
+    });
     checkpoint(ws.dbPath);
 
     const future = [
@@ -969,6 +993,7 @@ function runLifecycleStream(streamIndex: number, joint: boolean): StreamResult {
       };
     }
 
+    const prevalence = threads.filter((t) => perThread[t.key]!.full.oracle !== "keep").length / threads.length;
     const labels = threads.map((t) => {
       const heat = heatOf(ws.dbPath, t.id);
       const exposures = exposureCount(ws.dbPath, t.id);
@@ -976,18 +1001,19 @@ function runLifecycleStream(streamIndex: number, joint: boolean): StreamResult {
       return {
         stream: `lifecycle-${streamIndex}`,
         features: {
-          kind: "user_fact",
+          kind: t.kind,
           ageHours: 0,
           links: 0,
           heat,
           exposures,
-          hasConflict: false,
+          hasConflict: t.key === "conflict",
         },
         utility: {
           keep: perThread[t.key]!.full.utilities.keep,
           retire: perThread[t.key]!.full.utilities.retire,
           correct: perThread[t.key]!.full.utilities.correct,
         },
+        prevalence,
       };
     });
 

@@ -11,8 +11,9 @@ const fitScript = path.join(repoRoot, "dist", "scripts", "decision-policy-fit.js
 const labelsPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "decision-labels-")), "labels.jsonl");
 
 // The evaluator performs ~320 real CLI spawns; the single-call budget is 30 s.
-// This outer budget only needs headroom for process startup on loaded runners.
-const EVALUATOR_TIMEOUT_MS = 900000;
+// The Windows runner needs more than the old 15 min after lifecycle labels/H=8
+// expanded the default run, so keep generous headroom for process startup.
+const EVALUATOR_TIMEOUT_MS = 1_800_000;
 
 let cachedStatus: number | null | undefined;
 let cachedReport: Record<string, unknown> | null = null;
@@ -128,7 +129,7 @@ describe("memory decision evaluator", () => {
     const consolidate = objectAt(report()["consolidate"], "consolidate");
     assert.equal(consolidate["status"], "skipped");
     const lines = fs.readFileSync(labelsPath, "utf8").trim().split("\n");
-    assert.equal(lines.length, 8);
+    assert.equal(lines.length, 12);
     const rows = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
     assert.equal(new Set(rows.map((r) => r["stream"])).size, 2);
     const row = rows[0]!;
@@ -138,9 +139,14 @@ describe("memory decision evaluator", () => {
       assert.ok(key in features, `missing label feature ${key}`);
     }
     objectAt(row["utility"], "labels.utility");
+    assert.ok(typeof row["prevalence"] === "number" && row["prevalence"] >= 0 && row["prevalence"] <= 1);
+    assert.ok(new Set(rows.map((r) => r["prevalence"])).size >= 2, "prevalence does not vary");
+    const all = rows.map((r) => objectAt(r["features"], "labels.features"));
+    assert.ok(all.some((f) => (f["heat"] as number) > 0 || (f["exposures"] as number) > 0));
+    assert.ok(all.some((f) => f["hasConflict"] === true));
   });
 
-  it("rejects fitting the eight-state lifecycle labels", () => {
+  it("rejects fitting the twelve-row lifecycle labels", () => {
     const r = spawnSync(process.execPath, [fitScript, "--input", labelsPath], {
       encoding: "utf8",
       timeout: 60000,
