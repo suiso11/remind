@@ -109,7 +109,7 @@
 
 - `npm test`: **476 件成功**（132 suites。master の #41/#42 を含む）。
 - 実モデル smoke（`--llm-config ~/.config/remind/memory.config.json`）: exit 0。
-  - `maintain.consolidate`: applied 1、sentencesKept 1、sources 4、2 回目 unchanged。品質: link precision 0.75 / recall 1.0（同話題 decoy への false link 1）、summary factFidelity 1.0 / sourceCoverage 1.0 / unsupported 1.0（decoy の「9921」「gate code」を含む）。**これは合格ではなく、9B が同話題の decoy を統合に含めた finding**。
+  - `maintain.consolidate`: applied 1、sentencesKept 1、sources 4、2 回目 unchanged。品質: link precision 0.75 / recall 1.0（同話題 decoy への false link 1）、summary factFidelity 1.0 / sourceCoverage 1.0 / unsupported 0 / irrelevant 1.0（decoy の「9921」「gate code」を含む）。**これは合格ではなく、9B が同話題の decoy を統合に含めた finding**。
   - governance: 全 gate pass（G1 skipped、count-matched n/a）。
   - support: 支持失敗 0、zero-exposure 0.6。
   - lifecycle: headroom 0.088 / 0.0625、reversal 0.25、oracle keep 3 / correct 1（複数ストリーム + CI）。
@@ -136,8 +136,8 @@
 
 ### 6.2 要約
 
-- **実装**: `summaryQuality`（factHits/factMisses/unsupported/sourceCoverage）を report。mustInclude / mustExclude / requiredSourceIds を合成ケースで指定する。
-- **実測**: 9B の summary は mustInclude を全て含めた（factFidelity 1.0）一方、decoy の「9921」「gate code」も含めた（unsupportedRate 1.0）。事実忠実性と無関係情報の混入は別軸で測る必要がある。
+- **実装**: `summaryQuality`（factHits/factMisses/unsupported/irrelevant/sourceCoverage）を report。mustInclude / mustExclude / requiredSourceIds を合成ケースで指定する。`unsupported` は引用 source のどれにも存在しない語（hallucination）、`irrelevant` は引用 source に存在するが mustExclude の語（grounded だが無関係）として分ける。
+- **実測**: 9B の summary は mustInclude を全て含めた（factFidelity 1.0）。decoy の「9921」「gate code」は decoy を引用しているため **unsupported ではなく irrelevant**（irrelevantRate 1.0、unsupportedRate 0）。旧レポートはこれを unsupported と呼んでいたが、grounding の失敗ではなかった。
 - **残り**: 各文の支持判定（文単位の precision/recall）、重要情報・時点・更新順の保持、extractive fallback と model 要約の分離、実データでの確認。`unchanged` と構造検査は引き続きガードレールであり、内容の正しさではない。
 
 ### 6.3 lifecycle と fit の一般化
