@@ -1210,10 +1210,16 @@ function consolidateSuite(llmConfigPath: string | null): { invariants: string[];
     const summarySourceIds = Array.isArray(summary.sourceRefs)
       ? summary.sourceRefs.filter((v): v is string => typeof v === "string")
       : [];
+    const bodyByEventId = new Map(
+      members.map((m) => [m.eventId, bodyOf(getRecord(ws, m.id))] as const),
+    );
+    const citedSourceBodies = summarySourceIds
+      .map((id) => bodyByEventId.get(id))
+      .filter((body): body is string => typeof body === "string");
     const summaryQuality = scoreSummary(
       bodyOf(summary),
-      trueMembers.map((m) => bodyOf(getRecord(ws, m.id))),
-      trueMembers.map((m) => m.eventId),
+      citedSourceBodies,
+      summarySourceIds,
       summarySourceIds,
       {
         mustInclude: ["harvest starts on Friday", "crates arrive on Thursday", "barn is reserved for sorting"],
