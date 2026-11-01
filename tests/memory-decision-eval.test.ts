@@ -11,8 +11,9 @@ const fitScript = path.join(repoRoot, "dist", "scripts", "decision-policy-fit.js
 const labelsPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "decision-labels-")), "labels.jsonl");
 
 // The evaluator performs ~320 real CLI spawns; the single-call budget is 30 s.
-// This outer budget only needs headroom for process startup on loaded runners.
-const EVALUATOR_TIMEOUT_MS = 900000;
+// The Windows runner needs more than the old 15 min after lifecycle labels/H=8
+// expanded the default run, so keep generous headroom for process startup.
+const EVALUATOR_TIMEOUT_MS = 1_800_000;
 
 let cachedStatus: number | null | undefined;
 let cachedReport: Record<string, unknown> | null = null;
