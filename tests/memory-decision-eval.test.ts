@@ -100,6 +100,10 @@ describe("memory decision evaluator", () => {
     const headroom = objectAt(lifecycle["headroom"], "lifecycle.headroom");
     assert.ok(typeof headroom["2"] === "number" && (headroom["2"] as number) > 0);
     assert.ok(typeof headroom["4"] === "number" && (headroom["4"] as number) > 0);
+    assert.ok(typeof headroom["8"] === "number");
+    assert.deepEqual(lifecycle["joint"], { enabled: false });
+    const perThread = objectAt(lifecycle["perThread"], "lifecycle.perThread");
+    for (const thread of Object.values(perThread)) assert.ok("long" in objectAt(thread, "thread"));
     const headroomCI = objectAt(lifecycle["headroomCI"], "lifecycle.headroomCI");
     assert.ok(Array.isArray(headroomCI["2"]) && (headroomCI["2"] as unknown[]).length === 2);
     assert.ok(typeof lifecycle["horizonReversal"] === "number" && (lifecycle["horizonReversal"] as number) > 0);
