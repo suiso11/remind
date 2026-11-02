@@ -172,7 +172,7 @@ function parseCliOutput(
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return { status, stdoutBuf, stderrText, timedOut, elapsedMs, envelope: null, envelopeValid: false, jsonBytes: jsonBytes.length, invalidReason: "bad-envelope" };
   }
-  const keys = Object.keys(parsed as Record<string, unknown>).sort().join(",");
+  const keys = Object.keys(parsed as Record<string, unknown>).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
   if (keys !== "code,data,deduplicated,message,ok,v") {
     return { status, stdoutBuf, stderrText, timedOut, elapsedMs, envelope: null, envelopeValid: false, jsonBytes: jsonBytes.length, invalidReason: "bad-envelope" };
   }

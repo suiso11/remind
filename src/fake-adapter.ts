@@ -161,7 +161,7 @@ function validItem(v: unknown): v is FakeMemoryHit {
   // Adopted contract fields plus the additive F-I01-01 record-identity keys
   // (revision, kind optional) and the v13 evidence quote. Unknown extras
   // beyond that set remain rejected.
-  const keys = Object.keys(v).sort().join(",");
+  const keys = Object.keys(v).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
   if (
     keys !== "createdAt,id,snippet,tags,truncated" &&
     keys !== "createdAt,id,kind,revision,snippet,tags,truncated" &&
@@ -288,7 +288,7 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
     return degraded("STORE_UNAVAILABLE");
   }
   if (!isPlainObject(parsed)) return degraded("STORE_UNAVAILABLE");
-  const topKeys = Object.keys(parsed).sort().join(",");
+  const topKeys = Object.keys(parsed).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
   if (topKeys !== "code,data,deduplicated,message,ok,v") return degraded("STORE_UNAVAILABLE");
   if (parsed["v"] !== 1 || typeof parsed["ok"] !== "boolean" || typeof parsed["code"] !== "string") {
     return degraded("STORE_UNAVAILABLE");
@@ -309,7 +309,7 @@ export function queryMemory(opts: FakeAdapterOptions): FakeAdapterResult {
   }
   const data = parsed["data"];
   if (!isPlainObject(data)) return degraded("STORE_UNAVAILABLE");
-  const dataKeys = Object.keys(data).sort().join(",");
+  const dataKeys = Object.keys(data).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
   // F-I01-06 additive top-level `vector` availability field is accepted, but
   // only with a fixed enum state: used|disabled|unavailable. Any other value
   // is a malformed response (degraded), never passed through as data.

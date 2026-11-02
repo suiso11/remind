@@ -52,7 +52,7 @@ function invoke(cliPath: string, configPath: string, request: Record<string, unk
   try { env = JSON.parse(out); } catch { return bad("bad-json"); }
   if (typeof env !== "object" || env === null || Array.isArray(env)) return bad("bad-envelope");
   const e = env as Record<string, unknown>;
-  if (Object.keys(e).sort().join(",") !== "code,data,deduplicated,message,ok,v" || !validateEnvelopeValues(e).ok) {
+  if (Object.keys(e).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",") !== "code,data,deduplicated,message,ok,v" || !validateEnvelopeValues(e).ok) {
     return bad("bad-envelope");
   }
   if (e["ok"] !== true) return bad(`envelope-${String(e["code"])}`);

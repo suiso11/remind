@@ -201,7 +201,7 @@ export function canonicalizeTopicList(raws: string[]): string[] {
     seen.add(key);
     out.push(t);
   }
-  return out.sort();
+  return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /** Text actually embedded for a record (body + topics when topics exist). */
@@ -281,7 +281,7 @@ async function canonicalizeTopics(
       if (tv) vectors.set(result, tv);
     }
   }
-  return out.sort();
+  return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 function budgeted(res: ResponseEnvelope, config: AppConfig): ResponseEnvelope {
@@ -684,8 +684,8 @@ function topicRowsMatch(
   for (const row of rows) {
     if (row.origin !== origin) return false;
   }
-  const got = rows.map((r) => r.topic).sort();
-  const want = [...topics].sort();
+  const got = rows.map((r) => r.topic).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const want = [...topics].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   for (let i = 0; i < got.length; i++) {
     if (got[i] !== want[i]) return false;
   }
@@ -1301,7 +1301,7 @@ export function topicSet(
     topics.push(t);
   }
   if (topics.length === 0) return budgeted(bad(), config);
-  topics.sort();
+  topics.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const reqHash = requestHashFor("topic.set", { bodyHash, id, scope, topics });
 
   let saved: StoredOp | null = null;

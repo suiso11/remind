@@ -1233,7 +1233,7 @@ export function applyCultivationBatch(
             skip("BAD_REQUEST");
             continue;
           }
-          nTags = [...seen].sort();
+          nTags = [...seen].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
         } else {
           nTags = [];
         }
@@ -1279,7 +1279,7 @@ export function applyCultivationBatch(
             skip("CONFLICT");
             continue;
           }
-          nLinks = [...seen].sort();
+          nLinks = [...seen].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
         } else {
           nLinks = [];
         }

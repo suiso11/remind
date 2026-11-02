@@ -169,7 +169,7 @@ function parseCliOutput(
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return { status, stdoutBuf, stderrText, timedOut, elapsedMs, envelope: null, envelopeValid: false, jsonBytes: jsonBytes.length, invalidReason: "bad-envelope" };
   }
-  const keys = Object.keys(parsed as Record<string, unknown>).sort().join(",");
+  const keys = Object.keys(parsed as Record<string, unknown>).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
   if (keys !== "code,data,deduplicated,message,ok,v") {
     return { status, stdoutBuf, stderrText, timedOut, elapsedMs, envelope: null, envelopeValid: false, jsonBytes: jsonBytes.length, invalidReason: "bad-envelope" };
   }
@@ -441,8 +441,8 @@ function main(): void {
         else {
           const beaconId = aliasToId.get("beacon") as string;
           const chartId = aliasToId.get("chart") as string;
-          const gotLinks = [...((lensView as { links: string[] }).links)].sort();
-          const expLinks = [beaconId, chartId].sort();
+          const gotLinks = [...((lensView as { links: string[] }).links)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+          const expLinks = [beaconId, chartId].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
           const gotRefs = (lensView as { sourceRefs: string[] }).sourceRefs;
           if (JSON.stringify(gotLinks) !== JSON.stringify(expLinks)) setupFailure = `lens links identity check failed: got ${JSON.stringify(gotLinks)} exp ${JSON.stringify(expLinks)}`;
           else if (JSON.stringify(gotRefs) !== JSON.stringify(["b1-lens"])) setupFailure = `lens sourceRefs identity check failed: got ${JSON.stringify(gotRefs)}`;
