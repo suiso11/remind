@@ -286,7 +286,7 @@ function validRecallItem(v: unknown): v is RecallItem {
   // Adopted contract fields plus the additive F-I01-01 keys (revision, kind
   // optional) and the v13 evidence quote. Unknown extras beyond that set
   // remain rejected.
-  const keys = Object.keys(v).sort().join(",");
+  const keys = Object.keys(v).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
   if (
     keys !== "createdAt,id,snippet,tags,truncated" &&
     keys !== "createdAt,id,kind,revision,snippet,tags,truncated" &&
@@ -374,7 +374,7 @@ export type RecallDataCheck =
 export function validateRecallData(data: unknown): RecallDataCheck {
   if (!isPlainObject(data)) return { ok: false, reason: "bad-data" };
   // F-I01-06 additive top-level `vector` availability field is accepted.
-  const dataKeys = Object.keys(data).sort().join(",");
+  const dataKeys = Object.keys(data).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
   if (dataKeys !== "items,recallId" && dataKeys !== "items,recallId,vector") {
     return { ok: false, reason: "bad-data" };
   }

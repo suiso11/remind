@@ -1815,7 +1815,7 @@ export async function maintainEpisodes(
               p.scope,
               p.kind,
               ep.episodeKey,
-              JSON.stringify([...folded].sort()),
+              JSON.stringify([...folded].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))),
               finalSummary,
             ].join("\u0000"),
           ).slice(0, 48);

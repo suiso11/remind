@@ -1136,7 +1136,7 @@ export function bigramsOf(normalized: string): string[] {
   for (let i = 0; i + 1 < cps.length; i++) {
     out.add((cps[i] as string) + (cps[i + 1] as string));
   }
-  return [...out].sort();
+  return [...out].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 function indexBigrams(
@@ -1725,7 +1725,7 @@ function parseTags(tags: unknown, max: number): string[] | "bad" | "over" {
     if (countCp(nt) < 1 || countCp(nt) > 256) return "bad";
     seen.add(nt);
   }
-  return [...seen].sort();
+  return [...seen].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 /** Opaque outbound link refs: non-empty, bounded, control-free, case preserved. */
@@ -1743,7 +1743,7 @@ function parseLinks(links: unknown, max: number): string[] | "bad" | "over" {
     if (countCp(nl) < 1 || countCp(nl) > 256) return "bad";
     seen.add(nl);
   }
-  return [...seen].sort();
+  return [...seen].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
 function parseSourceRefs(refs: unknown, max: number): SourceRef[] | "bad" | "over" {
@@ -4538,7 +4538,7 @@ export function feedbackRecords(
     }
     seen.add(r);
   }
-  const ids = [...seen].sort();
+  const ids = [...seen].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const nScope = parseScope(scope);
   if (!nScope) return budgeted(bad(), config);
   const nRunId = parseRunId(runId);

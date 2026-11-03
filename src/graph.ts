@@ -286,7 +286,7 @@ export function buildGraphData(
     }
   }
   if (edges.length > opts.maxEdges) throw new GraphLimitError();
-  for (const list of backlinksById.values()) list.sort();
+  for (const list of backlinksById.values()) list.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
   // Deterministic layout: nodes keep query order (createdAt DESC, id ASC)
   // placed on a circle; no dependencies, no randomness, stable rebuilds.
@@ -331,7 +331,7 @@ export function buildGraphData(
     statuses,
     nodes,
     edges,
-    unresolved: [...unresolvedSet].sort().slice(0, 256),
+    unresolved: [...unresolvedSet].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).slice(0, 256),
     counts,
   };
 }

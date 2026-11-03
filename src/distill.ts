@@ -558,7 +558,7 @@ export async function maintainDistill(
     // keeps so every queue entry still resolves to done with originals kept.
     const byPair = new Map<string, StagedProposal[]>();
     for (const s of survivors) {
-      const key = [s.target.id, s.otherId].sort().join("\0");
+      const key = [s.target.id, s.otherId].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join("\0");
       const list = byPair.get(key);
       if (list) list.push(s);
       else byPair.set(key, [s]);
@@ -666,7 +666,7 @@ export async function maintainDistill(
       }
       const refs = refUnion;
       const tags = [...new Set([...loadTags(db, target.id, config.limits.tagsMax), ...loadTags(db, other.id, config.limits.tagsMax)])]
-        .sort()
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
         .slice(0, config.limits.tagsMax);
       planned.push({
         review: s.review,
@@ -680,7 +680,7 @@ export async function maintainDistill(
             body: summaryBody,
             provenance: { source: DISTILL_SUMMARY_SOURCE, observedAt: nowValid },
             tags,
-            links: [target.id, other.id].sort(),
+            links: [target.id, other.id].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
             sourceRefs: refs,
           },
         },

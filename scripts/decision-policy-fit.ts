@@ -130,7 +130,7 @@ function fitOnce(train: PolicyRow[], hold: PolicyRow[]) {
   if (new Set(ytr).size < 2) return null;
   const trainN = train.length;
 
-  const kinds = [...new Set(train.map((r) => r.features.kind))].sort();
+  const kinds = [...new Set(train.map((r) => r.features.kind))].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   const featureNames = ["bias", ...NUM_KEYS, "hasConflict", ...kinds.map((k) => `kind=${k}`)];
   const raw = (r: PolicyRow) => NUM_KEYS.map((k) => r.features[k]);
   const mu = NUM_KEYS.map((_, j) => mean(train.map((r) => raw(r)[j])));
@@ -196,7 +196,7 @@ export function fitPolicy(rows: PolicyRow[]): PolicyFitReport {
     if (g) g.push(r);
     else byStream.set(r.stream, [r]);
   }
-  const streams = [...byStream.keys()].sort();
+  const streams = [...byStream.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   if (streams.length < 3) return result("skipped: <3 streams");
 
   // Take whole streams from the end until the holdout is large enough; keep >=1 stream for train.

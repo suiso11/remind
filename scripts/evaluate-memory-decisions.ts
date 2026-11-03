@@ -169,7 +169,7 @@ function invoke(configPath: string, request: Record<string, unknown>, timeoutMs 
   if (!isObject(parsed)) {
     return { status, valid: false, ok: false, code: "ENV", data: null, invalidReason: "bad-envelope", elapsedMs };
   }
-  const keys = Object.keys(parsed).sort().join(",");
+  const keys = Object.keys(parsed).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(",");
   if (keys !== "code,data,deduplicated,message,ok,v") {
     return { status, valid: false, ok: false, code: "ENV", data: null, invalidReason: "bad-envelope", elapsedMs };
   }
