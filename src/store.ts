@@ -3511,6 +3511,73 @@ export function getClusterSummary(
   return row ?? null;
 }
 
+/** Same literal as consolidate's CLUSTER_SUMMARY_SOURCE (import would cycle). */
+const RECALL_CLUSTER_SUMMARY_SOURCE = "cultivation:llm-derived-cluster";
+
+/**
+ * Recall-time compression: map recalled member ids to a recalled cluster
+ * summary that links them.
+ *
+ * Only summaries already in the candidate pool are used, so scope/status and
+ * since/until checks have already passed. Members the summary did not cite
+ * (no link) stay literal. A summary longer than the snippet cap is used only
+ * when it links two or more recalled members: then the duplicates are worth
+ * folding, while a lone hit stays literal so its fact is not lost to
+ * truncation. Recall itself never changes record state: members stay active
+ * and remain visible to search, list and get (a later activation pass may
+ * still retire an unused member). One deterministic summary per member
+ * (id ASC); an unreadable link/records read fails open to normal recall.
+ */
+function recallClusterCoverage(
+  db: DatabaseSync,
+  scope: string,
+  candidateIds: string[],
+  snippetMaxCp: number,
+): Map<string, string> {
+  const covered = new Map<string, string>();
+  if (candidateIds.length === 0) return covered;
+  const placeholders = candidateIds.map(() => "?").join(",");
+  try {
+    const rows = db
+      .prepare(
+        `WITH coverage AS (
+           SELECT l.toRef AS memberId,
+                  l.fromId AS summaryId,
+                  length(s.body) AS summaryCp,
+                  COUNT(*) OVER (PARTITION BY l.fromId) AS linkedCandidates
+           FROM record_links l
+           JOIN records s
+             ON s.id = l.fromId AND s.scope = ? AND s.status = 'active'
+           WHERE l.toRef IN (${placeholders})
+             AND l.fromId IN (${placeholders})
+             AND l.fromId <> l.toRef
+             AND s.source = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM records n
+               WHERE n.supersedes = s.id AND n.scope = s.scope
+             )
+         )
+         SELECT memberId, summaryId
+         FROM coverage
+         WHERE summaryCp <= ? OR linkedCandidates >= 2
+         ORDER BY memberId ASC, summaryId ASC`,
+      )
+      .all(
+        scope,
+        ...candidateIds,
+        ...candidateIds,
+        RECALL_CLUSTER_SUMMARY_SOURCE,
+        snippetMaxCp,
+      ) as Array<{ memberId: string; summaryId: string }>;
+    for (const row of rows) {
+      if (!covered.has(row.memberId)) covered.set(row.memberId, row.summaryId);
+    }
+  } catch {
+    /* link/records read unavailable: normal recall, no compression */
+  }
+  return covered;
+}
+
 /** Read the last attempted cluster topic for one scope (rotation cursor). */
 export function getConsolidateCursor(db: DatabaseSync, scope: string): string | null {
   const row = db
@@ -4410,8 +4477,16 @@ export function recallRecords(
       // Candidate metadata for final ordering (createdAt for tie-break).
       // revision/kind come from the same rows: recall items carry the source
       // record identity (F-I01-01 additions, backward-compatible fields).
-      const meta = new Map<string, { createdAt: string; revision: number; kind: string }>();
       const orderIds = [...new Set<string>([...poolIds, ...graphDist.keys(), ...similarScores.keys()])];
+      // Recall is context compression: a recalled cluster summary stands in
+      // for the members it links. An explicit `link` target stays literal.
+      const covered = recallClusterCoverage(
+        db,
+        p.scope,
+        orderIds,
+        config.limits.snippetMaxCp,
+      );
+      const meta = new Map<string, { createdAt: string; revision: number; kind: string }>();
       if (orderIds.length > 0) {
         try {
           const placeholders = orderIds.map(() => "?").join(",");
@@ -4423,14 +4498,24 @@ export function recallRecords(
           throw new Error("read failed");
         }
       }
-      const ranked = orderIds
-        .filter((id) => meta.has(id))
+      const effectiveScore = new Map<string, number>();
+      let foldedCandidates = 0;
+      for (const id of orderIds) {
+        if (!meta.has(id)) continue;
+        const mapped = id === p.link ? id : covered.get(id) ?? id;
+        const target = meta.has(mapped) ? mapped : id;
+        if (target !== id) foldedCandidates += 1;
+        const s = score(id);
+        const prev = effectiveScore.get(target);
+        if (prev === undefined || s > prev) effectiveScore.set(target, s);
+      }
+      const ranked = [...effectiveScore.keys()]
         .sort((a, b) => {
-          const sa = score(a);
-          const sb = score(b);
+          const sa = effectiveScore.get(a) ?? 0;
+          const sb = effectiveScore.get(b) ?? 0;
           if (sa !== sb) return sb - sa;
-          const ca = (meta.get(a) as { createdAt: string }).createdAt;
-          const cb = (meta.get(b) as { createdAt: string }).createdAt;
+          const ca = meta.get(a)?.createdAt ?? "";
+          const cb = meta.get(b)?.createdAt ?? "";
           if (ca !== cb) return ca < cb ? 1 : -1; // createdAt DESC
           return a < b ? -1 : a > b ? 1 : 0; // id ASC
         })
@@ -4465,7 +4550,12 @@ export function recallRecords(
         throw new Error("read failed");
       }
 
-      const probe: ResponseEnvelope = ok({ recallId, items, vector: vectorState });
+      const probe: ResponseEnvelope = ok({
+        recallId,
+        items,
+        vector: vectorState,
+        ...(foldedCandidates > 0 ? { foldedCandidates } : {}),
+      });
       if (!successFits(probe, config.limits.responseMaxBytes)) throw new Error("response over budget");
       const stored = budgeted(probe, config);
       if (!stored.ok) throw new Error("response over budget");
