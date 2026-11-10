@@ -42,7 +42,8 @@ npm run build
 - `event.append` の params は `eventId / sessionId / turnId / body / provenance{source, observedAt} / scope` (+任意 `runId` / `privacy` / `chunk` / `speaker`)。`speaker` は `user | assistant | system` の任意値で、話者を分離して保存する (旧行は NULL のまま)。`idempotencyKey` (ASCII `A-Za-z0-9_-`、1..128文字) は必須。
 - `record.remember` の params は `body / kind / provenance / scope / tags[] / links[] / sourceRefs[]` (+任意 `runId` / `evidence`)。`kind` は `user_fact | model_inference | summary | correction`。`sourceRefs[]` は同一 scope の既存 `eventId` のみ。欠落は `NOT_FOUND`、他 scope は `FORBIDDEN_SCOPE`。空配列は `model_inference / summary` かつ source に派生表示がある場合のみ許容。
 - `evidence` (任意、v13) はユーザーの逐語引用で、`kind:"user_fact"` のときだけ受け付ける。NFC 正規化 + trim 後 1..400 code point、制御文字なし。他の kind は `BAD_REQUEST`、400 超過は `LIMIT_EXCEEDED`、空/非文字列/制御文字は `BAD_REQUEST` (永続化なし)。idempotency hash に含まれるため、同一キーで引用だけ変えると `CONFLICT`。`record.get / record.list / record.search / record.recall` の item は `evidence: string | null` を返す。検索索引・順位付けには使わない。`record.correct` は本文を変える `correction` 後継を作るため evidence を継承せず、`evidence` パラメータも受け付けない (`BAD_REQUEST`)。
-- `record.recall` の params は `query / scope` (+任意 `tags[] / link / since / until / limit / runId`)。応答は `recallId + items[{id, snippet, truncated, tags, createdAt, revision, kind, evidence}]`。本文先頭の有界切り出しのみで、raw 本文は返さない。
+- `record.recall` の params は `query / scope` (+任意 `tags[] / link / since / until / limit / runId`)。応答は `recallId + items[{id, snippet, truncated, tags, createdAt, revision, kind, evidence}]`。本文先頭の有界切り出しのみで、raw 本文は返さない。圧縮が 1 件以上働いたときだけ additive な `foldedCandidates` (返却された代表に畳まれた候補 member 数) を返す。
+- `record.recall` は context 圧縮として、候補に入った `maintain.consolidate` の cluster summary が link する member をその summary に畳む。元 record は active のまま `record.search/get/list` で参照でき、明示 `link` の対象は畳まない。畳んだ member は exposure に載らないため、その id への `record.feedback` は `NOT_FOUND` になる。member は usage/heat も受けないため consolidated penalty 側に寄り、`activation.apply=true` の環境では `LOW_ACTIVATION` / `CONSOLIDATED` として自動 retire され得る (recall 自体は status を変えない)。
 
 ## 読み取り・育成・保守
 
@@ -292,7 +293,7 @@ R09 (M2/M3 承認ゲート用) 公式候補提案記録 (metadata のみ、未�
 
 I01 (Companion 連携契約) と I04 (retrieval 契約) の決定 F-I01-01..08・F-I04-01..06 (decider haruka、source: companion_harness/docs/plan/decision_inputs_2026-10-18.md) を受けて、既存 op へ追加フィールドのみを実装した (新規 op・新規 error code なし、 既存の順序・上限・heat・露出・byte 予算の挙動不変):
 
-- `record.recall` の各 item は元記録の `revision` と `kind` を含む (同じ行から付加的に返す。引用が実使用 revision を固定し、`model_inference` を `user_fact` と区別できる)。`recallId + items[{..., revision, kind}]`。
+- `record.recall` の各 item は元記録の `revision` と `kind` を含む (同じ行から付加的に返す。引用が実使用 revision を固定し、`model_inference` を `user_fact` と区別できる)。`recallId + items[{..., revision, kind}]`。cluster summary 圧縮が働いた場合は summary 側の `revision`/`kind` を返すため、引用と feedback には返された id を使う。
 - `record.recall` 成功 data は必ず top-level `vector` 状態を持つ (F-I01-06): `"disabled"` (設定 `vectors` 無効/欠落)、`"used"` (クエリ埋め込みが計算されベクトル候補が実際に参加)、`"unavailable"` (有効だがモデル/索引/クエリ埋め込みが欠落または失敗で語彙+グラフ縮退で実行)。計算追加なし・順位変更なし・byte 予算 probe はそのまま正しい。
 - `record.search` の各 item も `revision` を含む (PR #15、`feat/search-item-revision`)。
 - 数値 `v` が 1 以外の JSON は `BAD_REQUEST` で固定メッセージ `unsupported protocol version` を返す (envelope は `v:1` のまま、新 error code なし)。`v` 欠落・非数値は従来どおり `bad request`。
