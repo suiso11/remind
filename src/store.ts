@@ -4499,12 +4499,10 @@ export function recallRecords(
         }
       }
       const effectiveScore = new Map<string, number>();
-      let foldedCandidates = 0;
       for (const id of orderIds) {
         if (!meta.has(id)) continue;
         const mapped = id === p.link ? id : covered.get(id) ?? id;
         const target = meta.has(mapped) ? mapped : id;
-        if (target !== id) foldedCandidates += 1;
         const s = score(id);
         const prev = effectiveScore.get(target);
         if (prev === undefined || s > prev) effectiveScore.set(target, s);
@@ -4520,6 +4518,18 @@ export function recallRecords(
           return a < b ? -1 : a > b ? 1 : 0; // id ASC
         })
         .slice(0, p.limit);
+
+      // Count folded candidates that actually contributed to the returned
+      // projection: a mapped member is not itself in `ranked` but its target is.
+      let foldedCandidates = 0;
+      if (covered.size > 0 && ranked.length > 0) {
+        const returned = new Set(ranked);
+        for (const id of orderIds) {
+          if (!meta.has(id) || returned.has(id)) continue;
+          const mapped = id === p.link ? id : covered.get(id) ?? id;
+          if (mapped !== id && returned.has(mapped)) foldedCandidates += 1;
+        }
+      }
 
       // Bounded projection: snippets only, never raw bodies. Items carry the
       // source record's revision and kind alongside the pinned snippet
