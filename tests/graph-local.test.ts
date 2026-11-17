@@ -35,7 +35,6 @@ interface LocalNode {
   label: string;
   tags: string[];
   createdAt: string;
-  episode: { kind: string; episodeKey: string; level: string } | null;
   hop: number;
 }
 
@@ -331,6 +330,66 @@ describe("graph.local: scope and status filters", () => {
       const missing = local(ctx.db, ctx.config, { scope: SCOPE, id: "rec_missing", depth: 1 });
       assert.equal(missing.code, "NOT_FOUND");
       assert.equal(local(ctx.db, ctx.config, { scope: "personal/nope", id: center }).code, "FORBIDDEN_SCOPE");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("graph.local: episode ledger exclusion", () => {
+  it("returns NOT_FOUND when the centre belongs to the episode ledger", () => {
+    const ctx = setup();
+    try {
+      raw(ctx.db, ctx.config);
+      const episodeRecord = remember(ctx.db, ctx.config, "episode record", {
+        now: "2026-09-01T00:00:01.000Z",
+      });
+      insertEpisodeSummary(ctx.db, {
+        scope: SCOPE,
+        kind: "doc",
+        episodeKey: "doc-episode",
+        level: "episode",
+        recordId: episodeRecord,
+        createdAt: "2026-09-01T00:00:09.000Z",
+      });
+      const r = local(ctx.db, ctx.config, { scope: SCOPE, id: episodeRecord, depth: 1, limit: 20 });
+      assert.equal(r.code, "NOT_FOUND");
+      assert.equal(r.data, null);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("does not traverse episode records as neighbours", () => {
+    const ctx = setup();
+    try {
+      raw(ctx.db, ctx.config);
+      const beyond = remember(ctx.db, ctx.config, "beyond episode", {
+        now: "2026-09-01T00:00:01.000Z",
+      });
+      const episodeRecord = remember(ctx.db, ctx.config, "episode record", {
+        now: "2026-09-01T00:00:02.000Z",
+        links: [beyond],
+      });
+      insertEpisodeSummary(ctx.db, {
+        scope: SCOPE,
+        kind: "session",
+        episodeKey: "s1",
+        level: "window",
+        recordId: episodeRecord,
+        createdAt: "2026-09-01T00:00:09.000Z",
+      });
+      const plain = remember(ctx.db, ctx.config, "plain neighbour", {
+        now: "2026-09-01T00:00:03.000Z",
+      });
+      const center = remember(ctx.db, ctx.config, "center", {
+        now: "2026-09-01T00:00:04.000Z",
+        links: [episodeRecord, plain],
+      });
+      const r = local(ctx.db, ctx.config, { scope: SCOPE, id: center, depth: 2, limit: 20 });
+      assert.equal(r.code, "OK", JSON.stringify(r));
+      assert.deepEqual(r.data?.nodes.map((n) => n.id).sort(), [center, plain].sort());
+      assert.deepEqual(r.data?.edges, [{ from: center, to: plain, kind: "related" }]);
     } finally {
       ctx.cleanup();
     }

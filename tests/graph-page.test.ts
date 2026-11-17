@@ -31,7 +31,6 @@ interface PageNode {
   label: string;
   tags: string[];
   createdAt: string;
-  episode: { kind: string; episodeKey: string; level: string } | null;
   out: Array<{ to: string; kind: string }>;
   danglingOut: number;
 }
@@ -268,43 +267,108 @@ describe("graph.page: paging and edges", () => {
   });
 });
 
-describe("graph.page: episode tagging and labels", () => {
-  it("tags nodes from the episode ledger, preferring level=episode", () => {
+describe("graph.page: episode ledger exclusion", () => {
+  it("omits episode records and counts links to them as dangling", () => {
     const ctx = setup();
     try {
       raw(ctx.db, ctx.config);
-      const tagged = remember(ctx.db, ctx.config, "tagged record", { now: "2026-09-01T00:00:01.000Z" });
-      const plain = remember(ctx.db, ctx.config, "plain record", { now: "2026-09-01T00:00:02.000Z" });
-      insertEpisodeSummary(ctx.db, {
-        scope: SCOPE,
-        kind: "doc",
-        episodeKey: "doc-window",
-        level: "window",
-        recordId: tagged,
-        createdAt: "2026-09-01T00:00:09.000Z",
+      const target = remember(ctx.db, ctx.config, "plain target", { now: "2026-09-01T00:00:01.000Z" });
+      const summarized = remember(ctx.db, ctx.config, "summarized record", {
+        now: "2026-09-01T00:00:02.000Z",
       });
       insertEpisodeSummary(ctx.db, {
         scope: SCOPE,
         kind: "doc",
         episodeKey: "doc-episode",
         level: "episode",
-        recordId: tagged,
-        createdAt: "2026-09-01T00:00:03.000Z",
+        recordId: summarized,
+        createdAt: "2026-09-01T00:00:09.000Z",
+      });
+      const source = remember(ctx.db, ctx.config, "linking source", {
+        now: "2026-09-01T00:00:03.000Z",
+        links: [target, summarized],
       });
       const r = page(ctx.db, ctx.config, { scope: SCOPE, limit: 20 });
       assert.equal(r.code, "OK", JSON.stringify(r));
-      const node = r.nodes.find((n) => n.id === tagged);
-      assert.deepEqual(node?.episode, {
-        kind: "doc",
-        episodeKey: "doc-episode",
-        level: "episode",
-      });
-      assert.equal(r.nodes.find((n) => n.id === plain)?.episode, null);
+      assert.equal(r.nodes.some((n) => n.id === summarized), false);
+      const src = r.nodes.find((n) => n.id === source);
+      assert.ok(src);
+      assert.deepEqual(src.out, [{ to: target, kind: "related" }]);
+      assert.equal(src.danglingOut, 1);
     } finally {
       ctx.cleanup();
     }
   });
 
+  it("drops similar edges whose target is episode-owned", () => {
+    const ctx = setup();
+    try {
+      raw(ctx.db, ctx.config);
+      const first = remember(ctx.db, ctx.config, "similar first", { now: "2026-09-01T00:00:01.000Z" });
+      const second = remember(ctx.db, ctx.config, "similar second", { now: "2026-09-01T00:00:02.000Z" });
+      const [lo, hi] = first < second ? [first, second] : [second, first];
+      insertEpisodeSummary(ctx.db, {
+        scope: SCOPE,
+        kind: "session",
+        episodeKey: "s1",
+        level: "episode",
+        recordId: hi,
+        createdAt: "2026-09-01T00:00:09.000Z",
+      });
+      ctx.db
+        .prepare(
+          `INSERT INTO similar_edges(scope, a, b, score, computedAt) VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(SCOPE, lo, hi, 0.9, "2026-09-01T00:00:09.000Z");
+      const r = page(ctx.db, ctx.config, { scope: SCOPE, limit: 20 });
+      assert.equal(r.code, "OK", JSON.stringify(r));
+      assert.equal(r.nodes.some((n) => n.id === hi), false);
+      const node = r.nodes.find((n) => n.id === lo);
+      assert.ok(node);
+      assert.deepEqual(node.out.filter((o) => o.kind === "similar"), []);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("pages across episode records without gaps or duplicates", () => {
+    const ctx = setup();
+    try {
+      raw(ctx.db, ctx.config);
+      const created: string[] = [];
+      for (let i = 0; i < 6; i++) {
+        created.push(remember(ctx.db, ctx.config, `note ${i}`, {
+          now: `2026-09-01T00:00:0${i}.000Z`,
+        }));
+      }
+      const summarized = created[2]!;
+      insertEpisodeSummary(ctx.db, {
+        scope: SCOPE,
+        kind: "session",
+        episodeKey: "s1",
+        level: "window",
+        recordId: summarized,
+        createdAt: "2026-09-01T00:00:09.000Z",
+      });
+      const seen: string[] = [];
+      let cursor: string | null | undefined;
+      let pages = 0;
+      do {
+        const r = page(ctx.db, ctx.config, { scope: SCOPE, limit: 2, ...(cursor ? { cursor } : {}) });
+        assert.equal(r.code, "OK", JSON.stringify(r));
+        seen.push(...r.nodes.map((n) => n.id));
+        cursor = r.nextCursor;
+        pages++;
+        assert.ok(pages < 10, "paging must terminate");
+      } while (cursor !== null);
+      assert.deepEqual(seen, [...created].reverse().filter((id) => id !== summarized));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("graph.page: labels", () => {
   it("labels are whitespace-collapsed and bounded to snippetMaxCp", () => {
     const ctx = setup({ snippetMaxCp: 12 });
     try {

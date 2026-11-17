@@ -2178,7 +2178,8 @@ export function episodeWindows(
       };
     });
     const last = shown.length > 0 ? shown[shown.length - 1] : null;
-    const nextCursor =
+    let kept = items;
+    let nextCursor =
       rows.length > limit && last
         ? encodeWindowsCursor({
             observedAt: last.observedAt,
@@ -2186,7 +2187,21 @@ export function episodeWindows(
             recordId: last.recordId,
           })
         : null;
-    return budgeted(ok({ items, nextCursor }), config);
+    let stored = budgeted(ok({ items: kept, nextCursor }), config);
+    // Drop the tail until the envelope fits; the cursor then points at the
+    // last kept window, so paging never loses or duplicates a window.
+    while (!stored.ok && kept.length > 1) {
+      kept = kept.slice(0, -1);
+      const tail = shown[kept.length - 1];
+      if (tail === undefined) break;
+      nextCursor = encodeWindowsCursor({
+        observedAt: tail.observedAt,
+        spanStart: tail.spanStart,
+        recordId: tail.recordId,
+      });
+      stored = budgeted(ok({ items: kept, nextCursor }), config);
+    }
+    return stored.ok ? stored : budgeted(fail("LIMIT_EXCEEDED"), config);
   } catch {
     return budgeted(fail("STORE_UNAVAILABLE"), config);
   }
