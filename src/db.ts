@@ -17,6 +17,7 @@ import {
   LEGACY_SCHEMA_VERSION_12,
   LEGACY_SCHEMA_VERSION_13,
   SCHEMA_VERSION,
+  ensureEpisodeLedgerRecordIndex,
   ensureM1Schema,
   hasLegacyApprovalSchema,
 } from "./store.js";
@@ -180,7 +181,10 @@ export function initDb(
       // every DDL statement, and every PRAGMA table_info inspection (scope
       // seeding is read-only when the configured scopes already exist). The
       // derived association tables are created by the versioned migration.
+      // The episode-ledger record index self-heals: a current file last
+      // opened by an older build of this version may lack it.
       seedScopes(false);
+      ensureEpisodeLedgerRecordIndex(db);
     } else {
       // ONE write lock spans every inspection, ALTER/TABLE rebuild, index
       // creation and the version stamp. A concurrent opener waits on
@@ -191,6 +195,7 @@ export function initDb(
         // upgrade while this connection was waiting.
         if (readUserVersion(db) === SCHEMA_VERSION) {
           seedScopes(false);
+          ensureEpisodeLedgerRecordIndex(db);
         } else {
           initialize();
           db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);

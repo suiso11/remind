@@ -237,6 +237,9 @@ export function buildGraphData(
     .prepare(
       `SELECT id, body, kind, status, source, observedAt, createdAt, revision, supersedes
        FROM records WHERE scope = ? AND status IN (${inList})
+         AND NOT EXISTS (
+           SELECT 1 FROM episode_summaries e
+           WHERE e.scope = records.scope AND e.recordId = records.id)
        ORDER BY createdAt DESC, id ASC LIMIT ?`,
     )
     .all(scope, ...statuses, opts.maxNodes + 1) as Array<Record<string, unknown>>;
@@ -368,12 +371,6 @@ export function decodeGraphPageCursor(v: unknown): GraphPageCursor | null {
   return { createdAt, id };
 }
 
-export interface GraphPageEpisode {
-  kind: string;
-  episodeKey: string;
-  level: "window" | "episode";
-}
-
 export interface GraphPageNode {
   id: string;
   status: string;
@@ -384,7 +381,6 @@ export interface GraphPageNode {
   /** Current derived topics (sorted, at most three). */
   topics: string[];
   createdAt: string;
-  episode: GraphPageEpisode | null;
   out: Array<{ to: string; kind: "related" | "consolidation" | "similar" }>;
   /** Outbound refs omitted because they are dangling or out of the filter. */
   danglingOut: number;
@@ -425,7 +421,10 @@ function readIncludedTargetIds(
     const idList = part.map(() => "?").join(",");
     const rows = db
       .prepare(
-        `SELECT id FROM records WHERE scope = ? AND status IN (${statusList}) AND id IN (${idList})`,
+        `SELECT id FROM records WHERE scope = ? AND status IN (${statusList}) AND id IN (${idList})
+           AND NOT EXISTS (
+             SELECT 1 FROM episode_summaries e
+             WHERE e.scope = records.scope AND e.recordId = records.id)`,
       )
       .all(scope, ...statuses, ...part) as Array<Record<string, unknown>>;
     for (const r of rows) included.add(str(r["id"]));
@@ -433,41 +432,10 @@ function readIncludedTargetIds(
   return included;
 }
 
-function readPageEpisodes(
-  db: GraphDb,
-  scope: string,
-  ids: string[],
-): Map<string, GraphPageEpisode> {
-  const episodes = new Map<string, GraphPageEpisode>();
-  if (ids.length === 0) return episodes;
-  const idList = ids.map(() => "?").join(",");
-  const rows = db
-    .prepare(
-      `SELECT recordId, kind, episodeKey, level
-       FROM episode_summaries
-       WHERE scope = ? AND recordId IN (${idList}) AND level IN ('episode','window')
-       ORDER BY recordId ASC,
-                CASE level WHEN 'episode' THEN 0 ELSE 1 END,
-                createdAt DESC, kind ASC, episodeKey ASC`,
-    )
-    .all(scope, ...ids) as Array<Record<string, unknown>>;
-  for (const r of rows) {
-    const recordId = str(r["recordId"]);
-    if (episodes.has(recordId)) continue;
-    const level = r["level"];
-    if (level !== "episode" && level !== "window") continue;
-    episodes.set(recordId, {
-      kind: str(r["kind"]),
-      episodeKey: str(r["episodeKey"]),
-      level,
-    });
-  }
-  return episodes;
-}
-
 /**
  * Build one bounded page of the linked-memory graph. Reads only canonical
- * records/links/tags plus the derived episode ledger. Outbound edges resolve
+ * records/links/tags; records owned by the derived episode ledger are
+ * excluded. Outbound edges resolve
  * against the whole included (scope+status) set, not just this page, so a
  * paged consumer never sees a false dangling edge; refs outside that set are
  * counted in danglingOut and omitted. Supersedes history is not returned.
@@ -476,7 +444,10 @@ export function buildGraphPage(db: GraphDb, opts: GraphPageOptions): GraphPageDa
   const statuses = graphStatuses(opts.includeRetired, false);
   const inList = statuses.map(() => "?").join(",");
   let sql = `SELECT id, body, kind, status, createdAt
-             FROM records WHERE scope = ? AND status IN (${inList})`;
+             FROM records WHERE scope = ? AND status IN (${inList})
+               AND NOT EXISTS (
+                 SELECT 1 FROM episode_summaries e
+                 WHERE e.scope = records.scope AND e.recordId = records.id)`;
   const args: Array<string | number> = [opts.scope, ...statuses];
   if (opts.cursor !== null) {
     sql += ` AND (createdAt < ? OR (createdAt = ? AND id > ?))`;
@@ -514,7 +485,6 @@ export function buildGraphPage(db: GraphDb, opts: GraphPageOptions): GraphPageDa
     ...allRefs,
     ...similarRows.map((r) => r.b),
   ]);
-  const episodes = readPageEpisodes(db, opts.scope, ids);
 
   const nodes: GraphPageNode[] = shown.map((r) => {
     const id = str(r["id"]);
@@ -536,7 +506,6 @@ export function buildGraphPage(db: GraphDb, opts: GraphPageOptions): GraphPageDa
       tags: tagsById.get(id) ?? [],
       topics: topicsById.get(id) ?? [],
       createdAt: str(r["createdAt"]),
-      episode: episodes.get(id) ?? null,
       out,
       danglingOut,
     };
@@ -637,7 +606,6 @@ export interface GraphLocalNode {
   /** Current derived topics (sorted, at most three). */
   topics: string[];
   createdAt: string;
-  episode: GraphPageEpisode | null;
   /** 0 for the centre, 1..depth for BFS hops. */
   hop: number;
 }
@@ -733,6 +701,9 @@ function readLocalNeighbors(
         `SELECT r.id, r.body, r.kind, r.status, r.createdAt
          FROM records r
          WHERE r.scope = ? AND r.status IN (${statusList})
+           AND NOT EXISTS (
+             SELECT 1 FROM episode_summaries e
+             WHERE e.scope = r.scope AND e.recordId = r.id)
            AND r.id IN (
              SELECT l.toRef FROM record_links l WHERE l.fromId IN (${idList})
              UNION
@@ -768,15 +739,21 @@ function readLocalNeighbors(
  * be in the same scope. Order: centre, then hop ascending, then
  * createdAt DESC, id ASC. Bounded by `limit` and by `maxBytes`; shrinking
  * drops the farthest/latest tail deterministically and sets truncated.
- * Returns null when the centre id does not exist; throws
- * GraphLocalScopeError when it exists in another scope.
+ * Returns null when the centre id does not exist or belongs to the episode
+ * ledger; throws GraphLocalScopeError when it exists in another scope.
  */
 export function buildGraphLocal(
   db: GraphDb,
   opts: GraphLocalOptions,
 ): GraphLocalData | null {
   const centerRows = db
-    .prepare(`SELECT id, body, kind, status, createdAt, scope FROM records WHERE id = ?`)
+    .prepare(
+      `SELECT id, body, kind, status, createdAt, scope FROM records
+       WHERE id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM episode_summaries e
+           WHERE e.scope = records.scope AND e.recordId = records.id)`,
+    )
     .all(opts.id) as Array<Record<string, unknown>>;
   if (centerRows.length === 0) return null;
   if (str(centerRows[0]["scope"]) !== opts.scope) throw new GraphLocalScopeError();
@@ -835,7 +812,6 @@ export function buildGraphLocal(
   const ids = selected.map((r) => r.id);
   const tagsById = readGraphTags(db, ids);
   const topicsById = readGraphTopics(db, ids);
-  const episodes = readPageEpisodes(db, opts.scope, ids);
   const nodes: GraphLocalNode[] = selected.map((r) => ({
     id: r.id,
     status: r.status,
@@ -844,7 +820,6 @@ export function buildGraphLocal(
     tags: tagsById.get(r.id) ?? [],
     topics: topicsById.get(r.id) ?? [],
     createdAt: r.createdAt,
-    episode: episodes.get(r.id) ?? null,
     hop: r.hop,
   }));
 

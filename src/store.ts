@@ -780,6 +780,9 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_episode
     ON episode_summaries(scope, kind, episodeKey, level)`);
+  // Graph reads exclude ledger-owned records by (scope, recordId).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_record
+    ON episode_summaries(scope, recordId)`);
   // P3 maintain.consolidate ledger (derived; rebuildable). One active
   // topic-cluster summary per (scope, topic); recordId points at the active
   // canonical summary (or its latest revision) and memberFingerprint is the
@@ -868,10 +871,75 @@ function runM1SchemaMigrations(db: DatabaseSync): void {
  * Fast path: a completed init stamps PRAGMA user_version=SCHEMA_VERSION, so an
  * already-current file takes no write lock at all.
  */
+function hasEpisodeLedgerRecordIndex(db: DatabaseSync): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 AS found FROM sqlite_master
+       WHERE type = 'index' AND name = 'idx_episode_summaries_record' LIMIT 1`,
+    )
+    .get() as { found: number } | undefined;
+  return row !== undefined;
+}
+
+/**
+ * Graph reads exclude episode-owned records through
+ * `episode_summaries(scope, recordId)`. That index was added without a schema
+ * version bump, so a current-version file last opened by an older build of the
+ * same version may lack it. The check is read-only; only a missing index takes
+ * the write lock and creates it.
+ */
+export function ensureEpisodeLedgerRecordIndex(db: DatabaseSync): void {
+  let present: boolean;
+  try {
+    present = hasEpisodeLedgerRecordIndex(db);
+  } catch {
+    // Unreadable catalog: leave the file to the normal migration path.
+    return;
+  }
+  if (present) return;
+  // A current-version file always has the ledger table; skip rather than fail
+  // startup if an older build stamped the version before the table existed.
+  try {
+    const table = db
+      .prepare(
+        `SELECT 1 AS found FROM sqlite_master
+         WHERE type = 'table' AND name = 'episode_summaries' LIMIT 1`,
+      )
+      .get() as { found: number } | undefined;
+    if (table === undefined) return;
+  } catch {
+    return;
+  }
+  const ownTransaction = !db.isTransaction;
+  if (ownTransaction) db.exec("BEGIN IMMEDIATE");
+  else db.exec(`SAVEPOINT ensure_episode_record_index`);
+  try {
+    if (!hasEpisodeLedgerRecordIndex(db)) {
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_episode_summaries_record
+        ON episode_summaries(scope, recordId)`);
+    }
+    if (ownTransaction) db.exec("COMMIT");
+    else db.exec(`RELEASE SAVEPOINT ensure_episode_record_index`);
+  } catch (e) {
+    try {
+      if (ownTransaction) {
+        db.exec("ROLLBACK");
+      } else {
+        db.exec(`ROLLBACK TO SAVEPOINT ensure_episode_record_index`);
+        db.exec(`RELEASE SAVEPOINT ensure_episode_record_index`);
+      }
+    } catch {
+      /* preserve the original error */
+    }
+    throw e;
+  }
+}
+
 export function ensureM1Schema(db: DatabaseSync): void {
   if (readSchemaVersion(db) === SCHEMA_VERSION) {
-    // Already current: no write lock, no DDL, no PRAGMA inspection. The
-    // derived association tables are part of the versioned migration below.
+    // Already current: one catalog read, and a write lock only when the
+    // derived episode-ledger record index is missing (see below).
+    ensureEpisodeLedgerRecordIndex(db);
     return;
   }
   const ownTransaction = !db.isTransaction;
@@ -3732,7 +3800,8 @@ export function listEpisodes(
       const shown = rows.slice(0, nLimit);
       const summaryStmt = db.prepare(
         `SELECT s.recordId AS recordId, s.coveredThrough AS coveredThrough,
-                s.foldedRecordIds AS foldedRecordIds, r.status AS status
+                s.foldedRecordIds AS foldedRecordIds, r.status AS status,
+                r.body AS body
          FROM episode_summaries s
          LEFT JOIN records r ON r.id = s.recordId
          WHERE s.scope = ? AND s.kind = ? AND s.episodeKey = ? AND s.level = 'episode'
@@ -3764,6 +3833,7 @@ export function listEpisodes(
           coveredThrough: string | null;
           foldedRecordIds: string | null;
           status: string | null;
+          body: string | null;
         }>;
         const summaryRecordIds = summaries
           .filter((s) => s.status === "active")
@@ -3787,6 +3857,11 @@ export function listEpisodes(
         }>;
         const unfolded = windows.some((w) => !folded.has(w.recordId));
         const stale = pending || unfolded;
+        // Summaries are newest-first, so the first active row is the latest.
+        const latestSummary = summaries.find((s) => s.status === "active");
+        const { snippet: summarySnippet, truncated: summaryTruncated } = latestSummary
+          ? snippetFor(latestSummary.body ?? "", config.limits.snippetMaxCp)
+          : { snippet: "", truncated: false };
         return {
           kind: nKind,
           episodeKey: r.episodeKey,
@@ -3795,15 +3870,27 @@ export function listEpisodes(
           eventCount: r.eventCount,
           totalCp: r.totalCp,
           summaryRecordIds,
+          summarySnippet,
+          summaryTruncated,
           stale,
         };
       });
       const last = shown.length > 0 ? shown[shown.length - 1] : null;
-      const nextCursor =
+      let kept = items;
+      let nextCursor =
         rows.length > nLimit && last
           ? encodeEpisodeCursor(last.startAt, last.episodeKey)
           : null;
-      const stored = budgeted(ok({ items, nextCursor }), config);
+      let stored = budgeted(ok({ items: kept, nextCursor }), config);
+      // Drop the tail until the envelope fits; the cursor then points at the
+      // last kept episode, so paging never loses or duplicates an entry.
+      while (!stored.ok && kept.length > 1) {
+        kept = kept.slice(0, -1);
+        const tail = shown[kept.length - 1];
+        if (tail === undefined) break;
+        nextCursor = encodeEpisodeCursor(tail.startAt, tail.episodeKey);
+        stored = budgeted(ok({ items: kept, nextCursor }), config);
+      }
       if (!stored.ok) throw new Error("response over budget");
       auditInsert(db, {
         ts: now,

@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { countCp, type AppConfig, type EpisodesConfig } from "../src/config.js";
-import { initDb } from "../src/db.js";
+import { initDb, SCHEMA_VERSION } from "../src/db.js";
 import { normalizeBody } from "../src/normalize.js";
 import { correctRecord, eventAppend, getRecord, recordSources, retireRecord } from "../src/store.js";
 import { listEpisodes } from "../src/store.js";
@@ -243,6 +243,8 @@ interface ListItem {
   eventCount: number;
   totalCp: number;
   summaryRecordIds: string[];
+  summarySnippet: string;
+  summaryTruncated: boolean;
   stale: boolean;
 }
 interface ListData {
@@ -435,12 +437,38 @@ describe("episode.list grouping, day boundary, and paging", () => {
       const after = list(ctx, { scope: SCOPE, kind: "session" });
       assert.equal(after.items[0]!.stale, false);
       assert.deepEqual(after.items[0]!.summaryRecordIds, [episodeId]);
+      assert.equal(after.items[0]!.summaryTruncated, false);
+      assert.equal(after.items[0]!.summarySnippet, rec(ctx, episodeId as string).body);
 
       append(ctx, { eventId: "ev-2", body: "beta event", observedAt: T1, createdAt: T1 });
       const newer = list(ctx, { scope: SCOPE, kind: "session" });
       assert.equal(newer.items[0]!.stale, true);
       assert.equal(newer.items[0]!.eventCount, 2);
       assert.deepEqual(newer.items[0]!.summaryRecordIds, [episodeId]);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("returns the latest active episode summary snippet, bounded by snippetMaxCp", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds();
+      ctx.config.limits.snippetMaxCp = 10;
+      append(ctx, { eventId: "ev-1", body: "alpha event", observedAt: T0, createdAt: T0 });
+
+      const before = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.equal(before.items[0]!.summarySnippet, "");
+      assert.equal(before.items[0]!.summaryTruncated, false);
+
+      const run = episodeData(await maintain(ctx, "ep-snippet-1", makeGen(), RUN1));
+      const episodeId = run.episodes[0]!.episodeRecordId as string;
+      const body = rec(ctx, episodeId).body;
+      assert.ok([...body].length > 10);
+
+      const after = list(ctx, { scope: SCOPE, kind: "session" });
+      assert.equal(after.items[0]!.summarySnippet, [...body].slice(0, 10).join(""));
+      assert.equal(after.items[0]!.summaryTruncated, true);
     } finally {
       ctx.cleanup();
     }
@@ -2003,6 +2031,156 @@ describe("PR #27 review follow-ups", () => {
       assert.equal(list(ctx, { scope: SCOPE, kind: "session" }).items[0]!.stale, false);
     } finally {
       ctx.cleanup();
+    }
+  });
+});
+
+describe("episode read pages shrink to the response budget", () => {
+  /** Canonical episode summary row + its episode-level ledger row. */
+  function seedSummary(
+    ctx: Ctx,
+    sessionId: string,
+    observedAt: string,
+    body: string,
+  ): void {
+    const id = `rec-${sessionId}`;
+    ctx.db
+      .prepare(
+        `INSERT INTO records(id, body, bodyNorm, bodyHash, kind, source, observedAt,
+                             scope, status, supersedes, revision, createdAt)
+         VALUES (?, ?, ?, ?, 'summary', ?, ?, ?, 'active', NULL, 1, ?)`,
+      )
+      .run(id, body, normalizeBody(body), "hash", "episode-test", observedAt, SCOPE, T0);
+    ctx.db
+      .prepare(
+        `INSERT INTO episode_summaries(scope, kind, episodeKey, level, recordId, createdAt)
+         VALUES (?, 'session', ?, 'episode', ?, ?)`,
+      )
+      .run(SCOPE, sessionId, id, T0);
+  }
+
+  it("shrinks episode.list and pages the dropped tail with a cursor", () => {
+    const ctx = setup();
+    try {
+      const sessions = ["s1", "s2", "s3"];
+      for (const [i, sessionId] of sessions.entries()) {
+        append(ctx, {
+          eventId: `ev-${sessionId}`,
+          sessionId,
+          body: "raw body",
+          observedAt: `2026-09-0${i + 1}T00:00:00.000Z`,
+          createdAt: T0,
+        });
+        seedSummary(ctx, sessionId, `2026-09-0${i + 1}T00:00:00.000Z`, "あ".repeat(200));
+      }
+      // Each 200-cp snippet is ~600B; one entry fits, two cannot.
+      ctx.config.limits.responseMaxBytes = 1500;
+
+      const pages: string[] = [];
+      let cursor: string | null = null;
+      let guard = 0;
+      for (;;) {
+        const page = list(ctx, {
+          scope: SCOPE,
+          kind: "session",
+          limit: 10,
+          ...(cursor === null ? {} : { cursor }),
+        });
+        assert.ok(page.items.length >= 1);
+        assert.ok(page.items.length < sessions.length);
+        assert.ok(page.items.every((i) => i.summarySnippet === "あ".repeat(200)));
+        pages.push(...page.items.map((i) => i.episodeKey));
+        cursor = page.nextCursor;
+        if (cursor === null) break;
+        guard += 1;
+        assert.ok(guard < 10);
+      }
+      assert.deepEqual(pages, sessions);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("shrinks episode.windows and pages the dropped tail with a cursor", async () => {
+    const ctx = setup();
+    try {
+      ctx.config.episodes = bounds({ windowMaxCp: 200 });
+      append(ctx, {
+        eventId: "ev-long",
+        body: longWords("omega", 100),
+        observedAt: T0,
+        createdAt: T0,
+      });
+      const run = episodeData(await maintain(ctx, "ep-budget", makeGen(), RUN1));
+      const total = run.episodes[0]!.windowsWritten;
+      assert.ok(total > 3);
+
+      // A window item is ~150B; keep the envelope under 500B.
+      ctx.config.limits.responseMaxBytes = 500;
+      const seen: number[] = [];
+      let cursor: string | null = null;
+      let guard = 0;
+      for (;;) {
+        const page = windows(ctx, {
+          scope: SCOPE,
+          kind: "session",
+          episodeKey: "s1",
+          limit: 50,
+          ...(cursor === null ? {} : { cursor }),
+        });
+        assert.ok(page.items.length >= 1);
+        assert.ok(page.items.length < total);
+        seen.push(...page.items.map((i) => i.span.start));
+        cursor = page.nextCursor;
+        if (cursor === null) break;
+        guard += 1;
+        assert.ok(guard < 30);
+      }
+      assert.equal(seen.length, total);
+      assert.deepEqual(seen, [...seen].sort((a, b) => a - b));
+    } finally {
+      ctx.cleanup();
+    }
+  });
+});
+
+describe("episode-ledger record index self-heal", () => {
+  it("recreates the graph exclusion index on a current store without a version bump", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "episodes-index-"));
+    try {
+      const { config, configPath } = baseConfig(dir);
+      const first = initDb(config, configPath);
+      try {
+        first.db.exec(`DROP INDEX IF EXISTS idx_episode_summaries_record`);
+        const stamped = (
+          first.db.prepare(`PRAGMA user_version`).get() as {
+            user_version: number;
+          }
+        ).user_version;
+        assert.equal(stamped, SCHEMA_VERSION);
+      } finally {
+        first.db.close();
+      }
+      const reopened = initDb(config, configPath);
+      try {
+        const version = (
+          reopened.db.prepare(`PRAGMA user_version`).get() as {
+            user_version: number;
+          }
+        ).user_version;
+        assert.equal(version, SCHEMA_VERSION);
+        const indexes = reopened.db
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_episode_summaries_record'`,
+          )
+          .all() as Array<{ name: string }>;
+        assert.equal(indexes.length, 1);
+      } finally {
+        reopened.db.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });

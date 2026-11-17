@@ -398,7 +398,7 @@ describe("evidence quote: migration and successors", () => {
       // Close/reopen through initDb: the migrated file stays current.
       const reopened = initDb(config, configPath);
       try {
-        assert.equal((reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, 14);
+        assert.equal((reopened.db.prepare(`PRAGMA user_version`).get() as { user_version: number }).user_version, SCHEMA_VERSION);
       } finally {
         reopened.db.close();
       }
