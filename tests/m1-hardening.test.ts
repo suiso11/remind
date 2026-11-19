@@ -318,6 +318,73 @@ describe("Markdown projection: write, retry, rebuild", () => {
     }
   });
 
+  it("real CLI write/read drains the post-response projection queue", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "m1-cli-projection-"));
+    const { config, configPath } = makeConfig(dir);
+    fs.writeFileSync(configPath, JSON.stringify(config), "utf8");
+    const cliPath = path.resolve(__dirname, "..", "src", "cli.js");
+    const runCli = (line: string) =>
+      spawnSync(process.execPath, [cliPath, "--config", configPath], {
+        input: line + "\n",
+        encoding: "utf8",
+        timeout: 15000,
+      });
+    let db: DatabaseSync | null = null;
+    try {
+      // A real write must project its Markdown before the child exits.
+      const w = runCli(
+        JSON.stringify({
+          v: 1,
+          op: "record.remember",
+          idempotencyKey: "cli-project-1",
+          params: {
+            body: "cli projection entry",
+            kind: "model_inference",
+            provenance: { source: "derived:test", observedAt: OBS },
+            scope: "personal/default",
+            sourceRefs: [],
+          },
+        }),
+      );
+      assert.equal(w.status, 0, w.stderr || "");
+      const body = JSON.parse((w.stdout || "").trim().split("\n")[0] || "") as {
+        ok: boolean;
+        data: { record: { id: string } };
+      };
+      assert.equal(body.ok, true, JSON.stringify(body));
+      const id = body.data.record.id;
+      const file = path.join(config.vaultPath, `${id}.md`);
+      assert.ok(fs.existsSync(file), "CLI write exited without projecting Markdown");
+      assert.ok(fs.readFileSync(file, "utf8").includes("cli projection entry"));
+
+      // A queued record (e.g. a production backlog) must drain on a normal
+      // CLI call, including a read-only op.
+      const opened = initDb(config, configPath);
+      const seeded = seedRecord(opened.db, config, "e-cli-backlog", "cli backlog entry", "cli-backlog");
+      opened.db.close();
+      const seededFile = path.join(config.vaultPath, `${seeded}.md`);
+      assert.equal(fs.existsSync(seededFile), false, "seeded record projected before CLI call");
+      const list = runCli(
+        JSON.stringify({ v: 1, op: "record.list", params: { scope: "personal/default" } }),
+      );
+      assert.equal(list.status, 0, list.stderr || "");
+      assert.ok(fs.existsSync(seededFile), "CLI read exited without draining queued projection");
+      db = new DatabaseSync(config.dbPath, { readOnly: true });
+      assert.equal(
+        (db.prepare(`SELECT COUNT(*) AS n FROM projection_queue`).get() as { n: number }).n,
+        0,
+        "projection queue not drained after CLI calls",
+      );
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        /* ignore */
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("projection failure keeps the queue row for retry and never hides memory", () => {
     const ctx = setup("retry");
     let brokenConfig: AppConfig | null = null;
