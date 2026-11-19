@@ -570,7 +570,16 @@ async function main(): Promise<void> {
   }
   res = preserveCommittedResult(res, timedOut, closeFailed, config.limits.responseMaxBytes);
   emitJsonLine(res);
-  process.exit(0);
+  // A committed success may still have post-response projection work in the
+  // worker. Stay alive until it finishes, bounded so a stuck vault cannot
+  // hang the CLI (the queue row remains for a later retry). Error/TIMEOUT
+  // paths keep the immediate-exit contract (their worker is terminated).
+  if (res.ok) {
+    process.exitCode = 0;
+    setTimeout(() => process.exit(0), 1000).unref();
+  } else {
+    process.exit(0);
+  }
 }
 
 // CommonJS resolves the entry module even when npm invokes a bin symlink.
