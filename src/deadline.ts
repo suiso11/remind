@@ -53,7 +53,13 @@ export interface WorkerOpRequest {
 }
 
 export type WorkerOpOutcome =
-  | { timedOut: false; res: ResponseEnvelope }
+  | {
+      timedOut: false;
+      res: ResponseEnvelope;
+      /** Resolves after the worker's post-response projection drain (or its
+       * exit). Optional for direct callers that do not need post-work. */
+      drained?: Promise<void>;
+    }
   | { timedOut: true };
 
 function workerEntryPath(): string {
@@ -102,6 +108,7 @@ export function runStoreOpWithDeadline(
   return new Promise((resolve) => {
     let settled = false;
     let worker: Worker | null = null;
+    const { promise: drained, resolve: markDrained } = Promise.withResolvers<void>();
     const done = (out: WorkerOpOutcome, keepWorker = false): void => {
       if (settled) return;
       settled = true;
@@ -111,7 +118,7 @@ export function runStoreOpWithDeadline(
         /* ignore */
       }
       // A normal envelope leaves the worker alive so its post-response
-      // projection drain can finish; the CLI bounds process lifetime.
+      // projection drain can finish; the caller bounds process lifetime.
       // Timeout/error paths still terminate: their work must not linger.
       if (!keepWorker) {
         // Best-effort terminate only: Worker.terminate() does not reliably
@@ -121,6 +128,7 @@ export function runStoreOpWithDeadline(
         } catch {
           /* ignore */
         }
+        markDrained();
       }
       resolve(out);
     };
@@ -136,25 +144,32 @@ export function runStoreOpWithDeadline(
       done({ timedOut: false, res: storeUnavailable(req) });
       return;
     }
-    worker.once("message", (msg: unknown) => {
-      const res = (msg as { res?: ResponseEnvelope } | null)?.res;
+    worker.on("message", (msg: unknown) => {
+      const m = msg as { res?: ResponseEnvelope; stage?: string } | null;
+      if (m && typeof m === "object" && m.stage === "drained") {
+        markDrained();
+        return;
+      }
+      if (settled) return;
+      const res = m?.res;
       if (res && typeof res === "object" && typeof (res as { ok?: unknown }).ok === "boolean") {
         // Keep the worker alive only for committed successes: it posts
         // before draining projections, and that drain must finish after the
         // response. Error envelopes keep the immediate-exit contract.
-        done({ timedOut: false, res: res as ResponseEnvelope }, res.ok === true);
+        done({ timedOut: false, res: res as ResponseEnvelope, drained }, res.ok === true);
       } else {
         // Worker replied without an envelope: immediate failure, not a
         // deadline expiry.
-        done({ timedOut: false, res: storeUnavailable(req) });
+        done({ timedOut: false, res: storeUnavailable(req), drained });
       }
     });
-    worker.once("error", () => done({ timedOut: false, res: storeUnavailable(req) }));
+    worker.once("error", () => done({ timedOut: false, res: storeUnavailable(req), drained }));
     worker.once("exit", () => {
       // Crash/normal exit without a usable message: immediate
       // STORE_UNAVAILABLE so the CLI never hangs and never emits a false
       // TIMEOUT. If a message already settled us, this is a no-op.
-      if (!settled) done({ timedOut: false, res: storeUnavailable(req) });
+      markDrained();
+      if (!settled) done({ timedOut: false, res: storeUnavailable(req), drained });
     });
   });
 }

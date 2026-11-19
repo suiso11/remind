@@ -237,6 +237,14 @@ async function main(): Promise<void> {
     } catch {
       /* queue retry next time */
     }
+    // Explicit completion signal: the parent exits as soon as the drain is
+    // done. Do not wait for this worker to exit; model pipelines/fetch
+    // handles can keep the thread alive after the work is finished.
+    try {
+      parentPort?.postMessage({ stage: "drained" });
+    } catch {
+      /* parent gone; ignore */
+    }
   } catch {
     try {
       const cfg = (workerData as Req).config;

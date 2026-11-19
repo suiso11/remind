@@ -484,6 +484,7 @@ async function main(): Promise<void> {
   }
 
   let res: ResponseEnvelope = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
+  let drained: Promise<void> | undefined;
   if (stdinRes.trailingNonEmpty) {
     res = applyResponseBudget(fail("BAD_REQUEST"), config.limits.responseMaxBytes);
   } else {
@@ -548,6 +549,7 @@ async function main(): Promise<void> {
                   res = applyResponseBudget(fail("TIMEOUT"), config.limits.responseMaxBytes);
                 } else {
                   res = outcome.res;
+                  drained = outcome.drained;
                 }
               } catch {
                 res = applyResponseBudget(fail("STORE_UNAVAILABLE"), config.limits.responseMaxBytes);
@@ -571,15 +573,15 @@ async function main(): Promise<void> {
   res = preserveCommittedResult(res, timedOut, closeFailed, config.limits.responseMaxBytes);
   emitJsonLine(res);
   // A committed success may still have post-response projection work in the
-  // worker. Stay alive until it finishes, bounded so a stuck vault cannot
-  // hang the CLI (the queue row remains for a later retry). Error/TIMEOUT
-  // paths keep the immediate-exit contract (their worker is terminated).
-  if (res.ok) {
-    process.exitCode = 0;
-    setTimeout(() => process.exit(0), 1000).unref();
-  } else {
-    process.exit(0);
+  // worker. Wait for its explicit drained signal (not worker exit: model
+  // pipelines may keep the thread alive), bounded so a stuck vault cannot
+  // hang the CLI. Error/TIMEOUT paths keep the immediate-exit contract.
+  if (res.ok && drained) {
+    const { promise: watchdog, resolve: markWatchdog } = Promise.withResolvers<void>();
+    setTimeout(markWatchdog, 1000).unref();
+    await Promise.race([drained, watchdog]);
   }
+  process.exit(0);
 }
 
 // CommonJS resolves the entry module even when npm invokes a bin symlink.
