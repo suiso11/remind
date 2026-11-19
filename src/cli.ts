@@ -577,8 +577,9 @@ async function main(): Promise<void> {
   // pipelines may keep the thread alive), bounded so a stuck vault cannot
   // hang the CLI. Error/TIMEOUT paths keep the immediate-exit contract.
   if (res.ok && drained) {
-    const { promise: watchdog, resolve: markWatchdog } = Promise.withResolvers<void>();
-    setTimeout(markWatchdog, 1000).unref();
+    const watchdog = new Promise<void>((resolveWatchdog) => {
+      setTimeout(resolveWatchdog, 1000).unref();
+    });
     await Promise.race([drained, watchdog]);
   }
   process.exit(0);

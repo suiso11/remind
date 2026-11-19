@@ -108,7 +108,10 @@ export function runStoreOpWithDeadline(
   return new Promise((resolve) => {
     let settled = false;
     let worker: Worker | null = null;
-    const { promise: drained, resolve: markDrained } = Promise.withResolvers<void>();
+    let markDrained!: () => void;
+    const drained = new Promise<void>((resolveDrained) => {
+      markDrained = resolveDrained;
+    });
     const done = (out: WorkerOpOutcome, keepWorker = false): void => {
       if (settled) return;
       settled = true;
