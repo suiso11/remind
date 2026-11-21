@@ -3,12 +3,33 @@
   "version": "0.1.0",
   "description": "Autonomous associative memory local CLI (M1 store).",
   "type": "commonjs",
+  "license": "MIT",
+  "author": "suiso11",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/suiso11/remind.git"
+  },
+  "keywords": [
+    "cli",
+    "memory",
+    "sqlite",
+    "local-first",
+    "llm",
+    "embeddings"
+  ],
+  "files": [
+    "dist/src",
+    "dist/scripts/provision-model.js",
+    "dist/scripts/provision-llm.js",
+    "memory.config.example.json"
+  ],
+  "prepublishOnly": "npm run build",
   "main": "dist/src/cli.js",
   "bin": {
     "memory-cli": "dist/src/cli.js"
   },
   "engines": {
-    "node": ">=26.12.0 <27"
+    "node": ">=24"
   },
   "packageManager": "npm@11.6.2",
   "scripts": {
@@ -23,8 +44,8 @@
     "eval:decisions": "npm run build && node dist/scripts/evaluate-memory-decisions.js",
     "eval:fit": "npm run build && node dist/scripts/decision-policy-fit.js",
     "clean": "node -e \"require('fs').rm('dist',{recursive:true,force:true},()=>{})\"",
-    "provision:model": "npm run build && node dist/scripts/provision-model.js",
-    "provision:llm": "npm run build && node dist/scripts/provision-llm.js",
+    "provision:model": "node dist/scripts/provision-model.js",
+    "provision:llm": "node dist/scripts/provision-llm.js",
     "ingest": "npm run build && node dist/scripts/ingest.js",
     "rebuild:vectors": "npm run build && node dist/scripts/rebuild-vectors.js",
     "rebuild:graph": "npm run build && node dist/scripts/rebuild-graph.js",
