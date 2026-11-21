@@ -250,6 +250,14 @@ async function main(): Promise<void> {
     } catch {
       /* ignore */
     }
+    // Explicit completion signal AFTER close: the parent exits on this, so
+    // the worker must already have released its DB handle. Do not wait for
+    // this thread to exit; model pipelines/fetch handles can keep it alive.
+    try {
+      parentPort?.postMessage({ stage: "drained" });
+    } catch {
+      /* parent gone; ignore */
+    }
   }
 }
 
